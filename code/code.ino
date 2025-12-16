@@ -9,11 +9,16 @@
 #define ENABLE_DEBUG
 #include <ReadyMail.h>
 #include <HTTPClient.h>
-#include <mbedtls/md.h>  // 用于钉钉签名的HMAC-SHA256
 #include <base64.h>      // Base64编码
 
 //wifi信息，需要你打开这个去改
 #include "wifi_config.h"
+
+// MQTT配置（可选功能）
+#include "mqtt_config.h"
+#ifdef ENABLE_MQTT
+#include <PubSubClient.h>
+#endif
 
 //串口映射
 #define TXD 3
@@ -25,10 +30,7 @@ enum PushType {
   PUSH_TYPE_POST_JSON = 1, // POST JSON格式 {"sender":"xxx","message":"xxx","timestamp":"xxx"}
   PUSH_TYPE_BARK = 2,      // Bark格式 POST {"title":"xxx","body":"xxx"}
   PUSH_TYPE_GET = 3,       // GET请求，参数放URL中
-  PUSH_TYPE_DINGTALK = 4,  // 钉钉机器人
-  PUSH_TYPE_PUSHPLUS = 5,  // PushPlus
-  PUSH_TYPE_SERVERCHAN = 6,// Server酱
-  PUSH_TYPE_CUSTOM = 7     // 自定义模板
+  PUSH_TYPE_CUSTOM = 4     // 自定义模板
 };
 
 // 最大推送通道数
@@ -56,6 +58,12 @@ struct Config {
   PushChannel pushChannels[MAX_PUSH_CHANNELS];  // 多推送通道
   String webUser;      // Web管理账号
   String webPass;      // Web管理密码
+  // 定时任务配置
+  bool timerEnabled;        // 是否启用定时任务
+  int timerType;            // 0=Ping, 1=短信
+  int timerInterval;        // 间隔时间（分钟）
+  String timerPhone;        // 定时短信目标号码
+  String timerMessage;      // 定时短信内容
 };
 
 // 默认Web管理账号密码
@@ -72,6 +80,10 @@ WebServer server(80);
 
 bool configValid = false;  // 配置是否有效
 unsigned long lastPrintTime = 0;  // 上次打印IP的时间
+
+// 定时任务相关变量
+unsigned long lastTimerExec = 0;  // 上次执行定时任务的时间
+unsigned long timerIntervalMs = 0;  // 定时间隔（毫秒）
 
 #define SERIAL_BUFFER_SIZE 500
 #define MAX_PDU_LENGTH 300
@@ -103,6 +115,35 @@ struct ConcatSms {
 
 ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];  // 长短信缓存
 
+// ========== MQTT相关变量和函数声明 ==========
+#ifdef ENABLE_MQTT
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+String mqttDeviceId = "";  // 设备唯一ID（基于MAC地址）
+String mqttTopicStatus = "";      // 设备状态主题
+String mqttTopicSmsReceived = ""; // 收到短信通知主题
+String mqttTopicSmsSent = "";     // 发送短信结果主题
+String mqttTopicPingResult = "";  // Ping结果主题
+String mqttTopicSmsSend = "";     // 发送短信命令订阅主题
+String mqttTopicPing = "";        // Ping命令订阅主题
+String mqttTopicCmd = "";         // 控制命令订阅主题
+
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000;  // MQTT重连间隔（毫秒）
+
+// MQTT回调函数声明
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void mqttReconnect();
+void initMqttTopics();
+String getMacSuffix();
+void publishMqttSmsReceived(const char* sender, const char* message, const char* timestamp);
+void publishMqttSmsSent(const char* phone, const char* message, bool success);
+void publishMqttPingResult(const char* host, bool success, const char* result);
+void publishMqttStatus(const char* status);
+#endif
+
+
 // 保存配置到NVS
 void saveConfig() {
   preferences.begin("sms_config", false);
@@ -126,6 +167,13 @@ void saveConfig() {
     preferences.putString((prefix + "k2").c_str(), config.pushChannels[i].key2);
     preferences.putString((prefix + "body").c_str(), config.pushChannels[i].customBody);
   }
+  
+  // 保存定时任务配置
+  preferences.putBool("timerEn", config.timerEnabled);
+  preferences.putInt("timerType", config.timerType);
+  preferences.putInt("timerInt", config.timerInterval);
+  preferences.putString("timerPhone", config.timerPhone);
+  preferences.putString("timerMsg", config.timerMessage);
   
   preferences.end();
   Serial.println("配置已保存");
@@ -165,6 +213,16 @@ void loadConfig() {
     Serial.println("已迁移旧HTTP配置到推送通道1");
   }
   
+  // 加载定时任务配置
+  config.timerEnabled = preferences.getBool("timerEn", false);
+  config.timerType = preferences.getInt("timerType", 0);
+  config.timerInterval = preferences.getInt("timerInt", 30);  // 默认30天
+  config.timerPhone = preferences.getString("timerPhone", "");
+  config.timerMessage = preferences.getString("timerMsg", "保号短信");
+  
+  // 更新定时间隔（天转毫秒）
+  timerIntervalMs = (unsigned long)config.timerInterval * 24UL * 60UL * 60UL * 1000UL;
+  
   preferences.end();
   Serial.println("配置已加载");
 }
@@ -177,12 +235,8 @@ bool isPushChannelValid(const PushChannel& ch) {
     case PUSH_TYPE_POST_JSON:
     case PUSH_TYPE_BARK:
     case PUSH_TYPE_GET:
-    case PUSH_TYPE_DINGTALK:
     case PUSH_TYPE_CUSTOM:
       return ch.url.length() > 0;
-    case PUSH_TYPE_PUSHPLUS:
-    case PUSH_TYPE_SERVERCHAN:
-      return ch.key1.length() > 0;  // 这两个主要靠key1（token/sendkey）
     default:
       return false;
   }
@@ -211,7 +265,7 @@ String getDeviceUrl() {
   return "http://" + WiFi.localIP().toString() + "/";
 }
 
-// HTML配置页面
+// HTML配置页面（精简版）
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -220,164 +274,76 @@ const char* htmlPage = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>短信转发配置</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-    .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; text-align: center; }
-    .form-group { margin-bottom: 15px; }
-    label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-    input[type="text"], input[type="password"], input[type="number"], textarea, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-    textarea { resize: vertical; min-height: 80px; }
-    button { width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-    button:hover { background: #45a049; }
-    .label-inline { display:inline; font-weight:normal; margin-left: 5px; }
-    .btn-send { background: #2196F3; }
-    .btn-send:hover { background: #1976D2; }
-    .section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
-    .section-title { font-size: 18px; color: #333; margin-bottom: 10px; }
-    .status { padding: 10px; background: #e7f3fe; border-left: 4px solid #2196F3; margin-bottom: 20px; }
-    .warning { padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; margin-bottom: 20px; font-size: 12px; }
-    .hint { font-size: 12px; color: #888; }
-    .nav { display: flex; gap: 10px; margin-bottom: 20px; }
-    .nav a { flex: 1; text-align: center; padding: 10px; background: #eee; border-radius: 5px; text-decoration: none; color: #333; }
-    .nav a.active { background: #4CAF50; color: white; }
-    .push-channel { border: 1px solid #e0e0e0; padding: 12px; margin-bottom: 15px; border-radius: 5px; background: #fafafa; }
-    .push-channel-header { display: flex; align-items: center; margin-bottom: 10px; }
-    .push-channel-header input[type="checkbox"] { width: auto; margin-right: 8px; }
-    .push-channel-header label { margin: 0; font-weight: bold; }
-    .push-channel-body { display: none; }
-    .push-channel.enabled .push-channel-body { display: block; }
-    .push-type-hint { font-size: 11px; color: #666; margin-top: 5px; padding: 8px; background: #f0f0f0; border-radius: 3px; }
+    *{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:15px;background:#fff}
+    .c{max-width:600px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+    h1{color:#333;text-align:center;margin:0 0 15px;font-size:1.4em}
+    .nav{display:flex;gap:8px;margin-bottom:15px}.nav a{flex:1;text-align:center;padding:10px;background:#f5f5f5;border-radius:4px;text-decoration:none;color:#333}.nav a.on{background:#4CAF50;color:#fff}
+    .st{padding:10px;background:#f9f9f9;border:1px solid #e0e0e0;border-radius:4px;margin-bottom:15px}
+    .st b{display:block;margin-bottom:4px;color:#333}.mqtt-on{color:#4CAF50}.mqtt-off{color:#e53935}
+    .s{border:1px solid #e5e5e5;padding:15px;margin-bottom:15px;border-radius:8px}
+    .s-t{font-size:1.1em;font-weight:600;color:#333;margin-bottom:12px}
+    .fg{margin-bottom:12px}label{display:block;margin-bottom:4px;font-weight:500;color:#555;font-size:.9em}
+    input,select,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95em}
+    textarea{resize:vertical;min-height:60px}
+    button{width:100%;padding:12px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:1em;font-weight:500}button:hover{background:#43a047}
+    .ch{border:1px solid #e0e0e0;padding:12px;margin-bottom:12px;border-radius:6px;background:#fafafa}
+    .ch-h{display:flex;align-items:center}.ch-h input{width:auto;margin-right:8px}.ch-h label{margin:0}
+    .ch-b{display:none;margin-top:10px}.ch.en .ch-b{display:block}
+    .hint{font-size:.8em;color:#888;margin-top:4px;padding:6px;background:#f5f5f5;border-radius:4px}
+    .warn{padding:8px;background:#fff3cd;border-left:3px solid #ffc107;margin-bottom:12px;font-size:.85em}
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="c">
     <h1>📱 短信转发器</h1>
-    <div class="nav">
-      <a href="/" class="active">⚙️ 系统配置</a>
-      <a href="/tools">🧰 工具箱</a>
+    <div class="nav"><a href="/" class="on">⚙️ 配置</a><a href="/tools">🧰 工具</a></div>
+    <div class="st">
+      <b>设备IP: %IP%</b>
+      <span>MQTT: <span class="%MQTT_CLASS%">%MQTT_STATUS%</span></span>
     </div>
-    <div class="status" id="status">设备IP: <strong>%IP%</strong></div>
     
     <form action="/save" method="POST">
-      <div class="section">
-        <div class="section-title">🔐 Web管理账号设置</div>
-        <div class="warning">⚠️ 首次使用请修改默认密码！默认账号: )rawliteral" DEFAULT_WEB_USER "，默认密码: " DEFAULT_WEB_PASS R"rawliteral(
-        </div>
-        <div class="form-group">
-          <label>管理账号</label>
-          <input type="text" name="webUser" value="%WEB_USER%" placeholder="admin">
-        </div>
-        <div class="form-group">
-          <label>管理密码</label>
-          <input type="password" name="webPass" value="%WEB_PASS%" placeholder="请设置复杂密码">
-        </div>
+      <div class="s">
+        <div class="s-t">🔐 Web管理账号</div>
+        <div class="warn">⚠️ 首次使用请修改默认密码！默认: admin / admin123</div>
+        <div class="fg"><label>账号</label><input name="webUser" value="%WEB_USER%"></div>
+        <div class="fg"><label>密码</label><input type="password" name="webPass" value="%WEB_PASS%"></div>
       </div>
       
-      <div class="section">
-        <div class="section-title">📧 邮件通知设置</div>
-        <div class="form-group">
-          <label>SMTP服务器</label>
-          <input type="text" name="smtpServer" value="%SMTP_SERVER%" placeholder="smtp.qq.com">
-        </div>
-        <div class="form-group">
-          <label>SMTP端口</label>
-          <input type="number" name="smtpPort" value="%SMTP_PORT%" placeholder="465">
-        </div>
-        <div class="form-group">
-          <label>邮箱账号</label>
-          <input type="text" name="smtpUser" value="%SMTP_USER%" placeholder="your@qq.com">
-        </div>
-        <div class="form-group">
-          <label>邮箱密码/授权码</label>
-          <input type="password" name="smtpPass" value="%SMTP_PASS%" placeholder="授权码">
-        </div>
-        <div class="form-group">
-          <label>接收邮件地址</label>
-          <input type="text" name="smtpSendTo" value="%SMTP_SEND_TO%" placeholder="receiver@example.com">
-        </div>
+      <div class="s">
+        <div class="s-t">📧 邮件通知</div>
+        <div class="fg"><label>SMTP服务器</label><input name="smtpServer" value="%SMTP_SERVER%" placeholder="smtp.qq.com"></div>
+        <div class="fg"><label>端口</label><input type="number" name="smtpPort" value="%SMTP_PORT%" placeholder="465"></div>
+        <div class="fg"><label>账号</label><input name="smtpUser" value="%SMTP_USER%"></div>
+        <div class="fg"><label>密码/授权码</label><input type="password" name="smtpPass" value="%SMTP_PASS%"></div>
+        <div class="fg"><label>接收邮箱</label><input name="smtpSendTo" value="%SMTP_SEND_TO%"></div>
       </div>
       
-      <div class="section">
-        <div class="section-title">🔗 HTTP推送通道设置</div>
-        <div class="hint" style="margin-bottom:15px;">可同时启用多个推送通道，每个通道独立配置。支持POST JSON、Bark、GET、钉钉、PushPlus、Server酱等多种方式。</div>
-        
+      <div class="s">
+        <div class="s-t">🔗 HTTP推送通道</div>
         %PUSH_CHANNELS%
       </div>
       
-      <div class="section">
-        <div class="section-title">👤 管理员设置</div>
-        <div class="form-group">
-          <label>管理员手机号</label>
-          <input type="text" name="adminPhone" value="%ADMIN_PHONE%" placeholder="13800138000">
-        </div>
+      <div class="s">
+        <div class="s-t">👤 管理员手机号</div>
+        <div class="fg"><input name="adminPhone" value="%ADMIN_PHONE%" placeholder="13800138000"></div>
       </div>
       
       <button type="submit">💾 保存配置</button>
     </form>
   </div>
   <script>
-    function toggleChannel(idx) {
-      var ch = document.getElementById('channel' + idx);
-      var cb = document.getElementById('push' + idx + 'en');
-      if (cb.checked) {
-        ch.classList.add('enabled');
-      } else {
-        ch.classList.remove('enabled');
-      }
-    }
-    function updateTypeHint(idx) {
-      var sel = document.getElementById('push' + idx + 'type');
-      var hint = document.getElementById('hint' + idx);
-      var extraFields = document.getElementById('extra' + idx);
-      var customFields = document.getElementById('custom' + idx);
-      var type = parseInt(sel.value);
-      
-      // 隐藏所有额外字段
-      extraFields.style.display = 'none';
-      customFields.style.display = 'none';
-      document.getElementById('key1label' + idx).innerText = '参数1';
-      document.getElementById('key2label' + idx).innerText = '参数2';
-      document.getElementById('key1' + idx).placeholder = '';
-      document.getElementById('key2' + idx).placeholder = '';
-      
-      if (type == 1) {
-        hint.innerHTML = '<b>POST JSON格式：</b><br>{"sender":"发送者号码","message":"短信内容","timestamp":"时间戳"}';
-      } else if (type == 2) {
-        hint.innerHTML = '<b>Bark格式：</b><br>POST {"title":"发送者号码","body":"短信内容"}';
-      } else if (type == 3) {
-        hint.innerHTML = '<b>GET请求格式：</b><br>URL?sender=xxx&message=xxx&timestamp=xxx';
-      } else if (type == 4) {
-        hint.innerHTML = '<b>钉钉机器人：</b><br>填写Webhook地址，如需加签请填Secret';
-        extraFields.style.display = 'block';
-        document.getElementById('key1label' + idx).innerText = 'Secret（加签密钥，可选）';
-        document.getElementById('key1' + idx).placeholder = 'SEC...';
-      } else if (type == 5) {
-        hint.innerHTML = '<b>PushPlus：</b><br>填写Token，URL留空使用默认';
-        extraFields.style.display = 'block';
-        document.getElementById('key1label' + idx).innerText = 'Token';
-        document.getElementById('key1' + idx).placeholder = 'pushplus的token';
-      } else if (type == 6) {
-        hint.innerHTML = '<b>Server酱：</b><br>填写SendKey，URL留空使用默认';
-        extraFields.style.display = 'block';
-        document.getElementById('key1label' + idx).innerText = 'SendKey';
-        document.getElementById('key1' + idx).placeholder = 'SCT...';
-      } else if (type == 7) {
-        hint.innerHTML = '<b>自定义模板：</b><br>在请求体模板中使用 {sender} {message} {timestamp} 作为占位符';
-        customFields.style.display = 'block';
-      }
-    }
-    document.addEventListener('DOMContentLoaded', function() {
-      for (var i = 0; i < 5; i++) {
-        toggleChannel(i);
-        updateTypeHint(i);
-      }
-    });
+    function tog(i){var c=document.getElementById('ch'+i),b=document.getElementById('en'+i);c.className=b.checked?'ch en':'ch'}
+    function upd(i){var t=document.getElementById('tp'+i).value,h=document.getElementById('ht'+i),cf=document.getElementById('cf'+i);
+      var m={1:'POST JSON: {"sender":"xxx","message":"xxx","timestamp":"xxx"}',2:'Bark: {"title":"xxx","body":"xxx"}',3:'GET: URL?sender=xxx&message=xxx',4:'自定义模板: 使用{sender}{message}{timestamp}占位符'};
+      h.textContent=m[t]||'';cf.style.display=t==4?'block':'none'}
+    document.addEventListener('DOMContentLoaded',function(){for(var i=0;i<5;i++){tog(i);upd(i)}})
   </script>
 </body>
 </html>
 )rawliteral";
 
-// HTML工具箱页面
+// HTML工具箱页面（精简版）
 const char* htmlToolsPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -386,148 +352,103 @@ const char* htmlToolsPage = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>工具箱</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-    .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; text-align: center; }
-    .form-group { margin-bottom: 15px; }
-    label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-    input[type="text"], textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-    textarea { resize: vertical; min-height: 100px; }
-    button { width: 100%; padding: 12px; background: #2196F3; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-    button:hover { background: #1976D2; }
-    .btn-query { background: #9C27B0; }
-    .btn-query:hover { background: #7B1FA2; }
-    .btn-ping { background: #FF9800; }
-    .btn-ping:hover { background: #F57C00; }
-    .btn-info { background: #607D8B; }
-    .btn-info:hover { background: #455A64; }
-    button:disabled { background: #ccc; cursor: not-allowed; }
-    .section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
-    .section-title { font-size: 18px; color: #333; margin-bottom: 10px; }
-    .status { padding: 10px; background: #e7f3fe; border-left: 4px solid #2196F3; margin-bottom: 20px; }
-    .nav { display: flex; gap: 10px; margin-bottom: 20px; }
-    .nav a { flex: 1; text-align: center; padding: 10px; background: #eee; border-radius: 5px; text-decoration: none; color: #333; }
-    .nav a.active { background: #2196F3; color: white; }
-    .char-count { font-size: 12px; color: #888; text-align: right; }
-    .hint { font-size: 12px; color: #888; margin-top: 5px; }
-    .result-box { margin-top: 10px; padding: 10px; border-radius: 5px; display: none; }
-    .result-success { background: #e8f5e9; border-left: 4px solid #4CAF50; color: #2e7d32; }
-    .result-error { background: #ffebee; border-left: 4px solid #f44336; color: #c62828; }
-    .result-loading { background: #fff3e0; border-left: 4px solid #FF9800; color: #e65100; }
-    .result-info { background: #e3f2fd; border-left: 4px solid #2196F3; color: #1565c0; }
-    .info-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    .info-table td { padding: 5px 8px; border-bottom: 1px solid #ddd; }
-    .info-table td:first-child { font-weight: bold; width: 40%; color: #555; }
-    .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
-    .btn-group button { flex: 1; min-width: 120px; }
+    *{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:15px;background:#fff}
+    .c{max-width:600px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+    h1{color:#333;text-align:center;margin:0 0 15px;font-size:1.4em}
+    .nav{display:flex;gap:8px;margin-bottom:15px}.nav a{flex:1;text-align:center;padding:10px;background:#f5f5f5;border-radius:4px;text-decoration:none;color:#333}.nav a.on{background:#2196F3;color:#fff}
+    .st{padding:10px;background:#f9f9f9;border:1px solid #e0e0e0;border-radius:4px;margin-bottom:15px}
+    .st b{display:block;margin-bottom:4px;color:#333}.mqtt-on{color:#4CAF50}.mqtt-off{color:#e53935}
+    .s{border:1px solid #e5e5e5;padding:15px;margin-bottom:15px;border-radius:8px}
+    .s-t{font-size:1.1em;font-weight:600;color:#333;margin-bottom:12px}
+    .fg{margin-bottom:12px}label{display:block;margin-bottom:4px;font-weight:500;color:#555;font-size:.9em}
+    input,select,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95em}textarea{resize:vertical;min-height:80px}
+    button{width:100%;padding:12px;background:#2196F3;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:1em;font-weight:500;margin-top:8px}button:hover{background:#1976D2}button:disabled{background:#ccc;cursor:not-allowed}
+    .bg{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.bg button{flex:1;min-width:100px;margin:0}
+    .bq{background:#9C27B0}.bq:hover{background:#7B1FA2}.bi{background:#607D8B}.bi:hover{background:#455A64}.bp{background:#FF9800}.bp:hover{background:#F57C00}
+    .rb{margin-top:10px;padding:10px;border-radius:6px;display:none}.rs{background:#e8f5e9;border-left:3px solid #4CAF50;color:#2e7d32}.re{background:#ffebee;border-left:3px solid #f44336;color:#c62828}.rl{background:#fff3e0;border-left:3px solid #FF9800;color:#e65100}.ri{background:#e3f2fd;border-left:3px solid #2196F3;color:#1565c0}
+    .it{width:100%;border-collapse:collapse;margin-top:8px}.it td{padding:5px 8px;border-bottom:1px solid #eee}.it td:first-child{font-weight:600;width:40%;color:#555}
+    .hint{font-size:.8em;color:#888;margin-top:4px}
+    .timer-box{background:#e8f5e9;padding:12px;border-radius:6px;margin-bottom:12px;text-align:center}
+    .timer-off{background:#f5f5f5}.countdown{font-size:1.5em;font-weight:bold;color:#4CAF50}
+    .sms-fields{display:none}
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="c">
     <h1>📱 短信转发器</h1>
-    <div class="nav">
-      <a href="/">⚙️ 系统配置</a>
-      <a href="/tools" class="active">🧰 工具箱</a>
+    <div class="nav"><a href="/">⚙️ 配置</a><a href="/tools" class="on">🧰 工具</a></div>
+    <div class="st">
+      <b>设备IP: %IP%</b>
+      <span>MQTT: <span class="%MQTT_CLASS%">%MQTT_STATUS%</span></span>
     </div>
-    <div class="status" id="status">设备IP: <strong>%IP%</strong></div>
     
     <form action="/sendsms" method="POST">
-      <div class="section">
-        <div class="section-title">📤 发送短信</div>
-        <div class="form-group">
-          <label>目标号码</label>
-          <input type="text" name="phone" placeholder="13800138000" required>
-        </div>
-        <div class="form-group">
-          <label>短信内容</label>
-          <textarea name="content" placeholder="请输入短信内容..." required oninput="updateCount(this)"></textarea>
-          <div class="char-count">已输入 <span id="charCount">0</span> 字符</div>
-        </div>
+      <div class="s">
+        <div class="s-t">📤 发送短信</div>
+        <div class="fg"><label>目标号码</label><input name="phone" placeholder="13800138000" required></div>
+        <div class="fg"><label>短信内容</label><textarea name="content" placeholder="请输入短信内容..." required oninput="document.getElementById('cc').textContent=this.value.length"></textarea><div class="hint">已输入 <span id="cc">0</span> 字符</div></div>
         <button type="submit">📨 发送短信</button>
       </div>
     </form>
     
-    <div class="section">
-      <div class="section-title">📊 模组信息查询</div>
-      <div class="btn-group">
-        <button type="button" class="btn-query" onclick="queryInfo('ati')">📋 固件信息</button>
-        <button type="button" class="btn-query" onclick="queryInfo('signal')">📶 信号质量</button>
+    <div class="s">
+      <div class="s-t">⏰ 定时任务</div>
+      <div class="timer-box %TIMER_BOX_CLASS%" id="timerBox">
+        <div id="timerStatus">%TIMER_STATUS%</div>
+        <div class="countdown" id="countdown">%TIMER_COUNTDOWN%</div>
       </div>
-      <div class="btn-group">
-        <button type="button" class="btn-info" onclick="queryInfo('siminfo')">💳 SIM卡信息</button>
-        <button type="button" class="btn-info" onclick="queryInfo('network')">🌍 网络状态</button>
+      <div class="fg"><label><input type="checkbox" id="timerEn" %TIMER_CHECKED% style="width:auto;margin-right:6px">启用定时任务</label></div>
+      <div class="fg"><label>任务类型</label>
+        <select id="timerType" onchange="toggleSmsFields()">
+          <option value="0" %TIMER_TYPE0%>定时Ping（消耗少量流量）</option>
+          <option value="1" %TIMER_TYPE1%>定时发送短信</option>
+        </select>
       </div>
-      <div class="btn-group">
-        <button type="button" class="btn-info" onclick="queryInfo('wifi')" style="background:#00BCD4;">📡 WiFi状态</button>
+      <div class="fg"><label>间隔时间（天）</label><input type="number" id="timerInt" value="%TIMER_INTERVAL%" min="1" max="365"></div>
+      <div class="sms-fields" id="smsFields">
+        <div class="fg"><label>目标号码</label><input id="timerPhone" value="%TIMER_PHONE%" placeholder="13800138000"></div>
+        <div class="fg"><label>短信内容</label><input id="timerMsg" value="%TIMER_MSG%" placeholder="保号短信"></div>
       </div>
-      <div class="result-box" id="queryResult"></div>
+      <button style="background:#4CAF50" onclick="saveTimer()">💾 保存定时任务</button>
+      <div class="rb" id="timerResult"></div>
     </div>
     
-    <div class="section">
-      <div class="section-title">🌐 网络测试</div>
-      <button type="button" class="btn-ping" id="pingBtn" onclick="doPing()">📡 点我消耗一点流量</button>
-      <div class="hint">将向 8.8.8.8 进行 ping 操作，一次性消耗极少流量费用</div>
-      <div class="result-box" id="pingResult"></div>
+    <div class="s">
+      <div class="s-t">📊 模组信息</div>
+      <div class="bg"><button class="bq" onclick="q('ati')">📋 固件</button><button class="bq" onclick="q('signal')">📶 信号</button></div>
+      <div class="bg"><button class="bi" onclick="q('siminfo')">💳 SIM卡</button><button class="bi" onclick="q('network')">🌍 网络</button><button class="bi" onclick="q('wifi')" style="background:#00BCD4">📡 WiFi</button></div>
+      <div class="rb" id="qr"></div>
+    </div>
+    
+    <div class="s">
+      <div class="s-t">🌐 网络测试</div>
+      <button class="bp" id="pb" onclick="p()">📡 Ping测试(消耗少量流量)</button>
+      <div class="rb" id="pr"></div>
     </div>
   </div>
   <script>
-    function updateCount(el) {
-      document.getElementById('charCount').textContent = el.value.length;
-    }
-    
-    function queryInfo(type) {
-      var result = document.getElementById('queryResult');
-      result.className = 'result-box result-loading';
-      result.style.display = 'block';
-      result.textContent = '正在查询，请稍候...';
-      
-      fetch('/query?type=' + type)
-        .then(response => response.json())
-        .then(data => {
-          if (data.success) {
-            result.className = 'result-box result-info';
-            result.innerHTML = data.message;
-          } else {
-            result.className = 'result-box result-error';
-            result.innerHTML = '❌ 查询失败<br>' + data.message;
-          }
-        })
-        .catch(error => {
-          result.className = 'result-box result-error';
-          result.textContent = '❌ 请求失败: ' + error;
-        });
-    }
-    
-    function doPing() {
-      var btn = document.getElementById('pingBtn');
-      var result = document.getElementById('pingResult');
-      
-      btn.disabled = true;
-      btn.textContent = '⏳ 正在 Ping...';
-      result.className = 'result-box result-loading';
-      result.style.display = 'block';
-      result.textContent = '正在执行 Ping 操作，请稍候（最长等待30秒）...';
-      
-      fetch('/ping', { method: 'POST' })
-        .then(response => response.json())
-        .then(data => {
-          btn.disabled = false;
-          btn.textContent = '📡 点我消耗一点流量';
-          if (data.success) {
-            result.className = 'result-box result-success';
-            result.innerHTML = '✅ Ping 成功！<br>' + data.message;
-          } else {
-            result.className = 'result-box result-error';
-            result.innerHTML = '❌ Ping 失败<br>' + data.message;
-          }
-        })
-        .catch(error => {
-          btn.disabled = false;
-          btn.textContent = '📡 点我消耗一点流量';
-          result.className = 'result-box result-error';
-          result.textContent = '❌ 请求失败: ' + error;
-        });
-    }
+    var timerRemain=%TIMER_REMAIN%;
+    function updateCountdown(){
+      if(timerRemain<=0){document.getElementById('countdown').textContent='--';return}
+      timerRemain--;var d=Math.floor(timerRemain/86400),h=Math.floor((timerRemain%86400)/3600),m=Math.floor((timerRemain%3600)/60);
+      document.getElementById('countdown').textContent=(d>0?d+'天':'')+(h>0?h+'时':'')+(m>0?m+'分':'')+'后执行';
+      setTimeout(updateCountdown,1000)}
+    function toggleSmsFields(){document.getElementById('smsFields').style.display=document.getElementById('timerType').value=='1'?'block':'none'}
+    function saveTimer(){
+      var r=document.getElementById('timerResult');r.className='rb rl';r.style.display='block';r.textContent='保存中...';
+      var data={enabled:document.getElementById('timerEn').checked,type:parseInt(document.getElementById('timerType').value),
+        interval:parseInt(document.getElementById('timerInt').value),phone:document.getElementById('timerPhone').value,
+        message:document.getElementById('timerMsg').value};
+      fetch('/timer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+        .then(x=>x.json()).then(d=>{r.className='rb '+(d.success?'rs':'re');r.textContent=d.success?'✅ 保存成功':'❌ '+d.message;
+          if(d.success){timerRemain=d.remain;updateCountdown();document.getElementById('timerBox').className='timer-box '+(data.enabled?'':'timer-off');
+            document.getElementById('timerStatus').textContent=data.enabled?(data.type==0?'定时Ping':'定时短信'):'已禁用'}})
+        .catch(e=>{r.className='rb re';r.textContent='❌ '+e})}
+    function q(t){var r=document.getElementById('qr');r.className='rb rl';r.style.display='block';r.textContent='查询中...';
+      fetch('/query?type='+t).then(x=>x.json()).then(d=>{r.className='rb '+(d.success?'ri':'re');r.innerHTML=d.success?d.message:'❌ '+d.message}).catch(e=>{r.className='rb re';r.textContent='❌ '+e})}
+    function p(){var b=document.getElementById('pb'),r=document.getElementById('pr');b.disabled=true;b.textContent='⏳ Ping中...';r.className='rb rl';r.style.display='block';r.textContent='请稍候(最长30秒)...';
+      fetch('/ping',{method:'POST'}).then(x=>x.json()).then(d=>{b.disabled=false;b.textContent='📡 Ping测试(消耗少量流量)';r.className='rb '+(d.success?'rs':'re');r.innerHTML=(d.success?'✅ ':'❌ ')+d.message}).catch(e=>{b.disabled=false;b.textContent='📡 Ping测试(消耗少量流量)';r.className='rb re';r.textContent='❌ '+e})}
+    toggleSmsFields();updateCountdown();
   </script>
 </body>
 </html>
@@ -548,6 +469,16 @@ void handleRoot() {
   
   String html = String(htmlPage);
   html.replace("%IP%", WiFi.localIP().toString());
+  
+  // MQTT状态
+  #ifdef ENABLE_MQTT
+  html.replace("%MQTT_STATUS%", mqttClient.connected() ? "已连接 ✓" : "未连接");
+  html.replace("%MQTT_CLASS%", mqttClient.connected() ? "mqtt-on" : "mqtt-off");
+  #else
+  html.replace("%MQTT_STATUS%", "未启用");
+  html.replace("%MQTT_CLASS%", "mqtt-off");
+  #endif
+  
   html.replace("%WEB_USER%", config.webUser);
   html.replace("%WEB_PASS%", config.webPass);
   html.replace("%SMTP_SERVER%", config.smtpServer);
@@ -557,66 +488,34 @@ void handleRoot() {
   html.replace("%SMTP_SEND_TO%", config.smtpSendTo);
   html.replace("%ADMIN_PHONE%", config.adminPhone);
   
-  // 生成推送通道HTML
+  // 生成推送通道HTML（精简版）
   String channelsHtml = "";
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String idx = String(i);
-    String enabledClass = config.pushChannels[i].enabled ? " enabled" : "";
+    String enabledClass = config.pushChannels[i].enabled ? " en" : "";
     String checked = config.pushChannels[i].enabled ? " checked" : "";
     
-    channelsHtml += "<div class=\"push-channel" + enabledClass + "\" id=\"channel" + idx + "\">";
-    channelsHtml += "<div class=\"push-channel-header\">";
-    channelsHtml += "<input type=\"checkbox\" name=\"push" + idx + "en\" id=\"push" + idx + "en\" onchange=\"toggleChannel(" + idx + ")\"" + checked + ">";
-    channelsHtml += "<label for=\"push" + idx + "en\" class=\"label-inline\">启用推送通道 " + String(i + 1) + "</label>";
-    channelsHtml += "</div>";
-    channelsHtml += "<div class=\"push-channel-body\">";
+    channelsHtml += "<div class=\"ch" + enabledClass + "\" id=\"ch" + idx + "\">";
+    channelsHtml += "<div class=\"ch-h\"><input type=\"checkbox\" name=\"push" + idx + "en\" id=\"en" + idx + "\" onchange=\"tog(" + idx + ")\"" + checked + "><label>通道 " + String(i + 1) + "</label></div>";
+    channelsHtml += "<div class=\"ch-b\">";
     
     // 通道名称
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>通道名称</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "name\" value=\"" + config.pushChannels[i].name + "\" placeholder=\"自定义名称\">";
-    channelsHtml += "</div>";
+    channelsHtml += "<div class=\"fg\"><label>名称</label><input name=\"push" + idx + "name\" value=\"" + config.pushChannels[i].name + "\" placeholder=\"自定义名称\"></div>";
     
-    // 推送类型
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>推送方式</label>";
-    channelsHtml += "<select name=\"push" + idx + "type\" id=\"push" + idx + "type\" onchange=\"updateTypeHint(" + idx + ")\">";
-    channelsHtml += "<option value=\"1\"" + String(config.pushChannels[i].type == PUSH_TYPE_POST_JSON ? " selected" : "") + ">POST JSON（通用格式）</option>";
-    channelsHtml += "<option value=\"2\"" + String(config.pushChannels[i].type == PUSH_TYPE_BARK ? " selected" : "") + ">Bark（iOS推送）</option>";
-    channelsHtml += "<option value=\"3\"" + String(config.pushChannels[i].type == PUSH_TYPE_GET ? " selected" : "") + ">GET请求（参数在URL中）</option>";
-    channelsHtml += "<option value=\"4\"" + String(config.pushChannels[i].type == PUSH_TYPE_DINGTALK ? " selected" : "") + ">钉钉机器人</option>";
-    channelsHtml += "<option value=\"5\"" + String(config.pushChannels[i].type == PUSH_TYPE_PUSHPLUS ? " selected" : "") + ">PushPlus</option>";
-    channelsHtml += "<option value=\"6\"" + String(config.pushChannels[i].type == PUSH_TYPE_SERVERCHAN ? " selected" : "") + ">Server酱</option>";
-    channelsHtml += "<option value=\"7\"" + String(config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? " selected" : "") + ">自定义模板</option>";
-    channelsHtml += "</select>";
-    channelsHtml += "<div class=\"push-type-hint\" id=\"hint" + idx + "\"></div>";
-    channelsHtml += "</div>";
+    // 推送类型（精简为4种）
+    channelsHtml += "<div class=\"fg\"><label>推送方式</label>";
+    channelsHtml += "<select name=\"push" + idx + "type\" id=\"tp" + idx + "\" onchange=\"upd(" + idx + ")\">";
+    channelsHtml += "<option value=\"1\"" + String(config.pushChannels[i].type == PUSH_TYPE_POST_JSON ? " selected" : "") + ">POST JSON</option>";
+    channelsHtml += "<option value=\"2\"" + String(config.pushChannels[i].type == PUSH_TYPE_BARK ? " selected" : "") + ">Bark</option>";
+    channelsHtml += "<option value=\"3\"" + String(config.pushChannels[i].type == PUSH_TYPE_GET ? " selected" : "") + ">GET请求</option>";
+    channelsHtml += "<option value=\"4\"" + String(config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? " selected" : "") + ">自定义模板</option>";
+    channelsHtml += "</select><div class=\"hint\" id=\"ht" + idx + "\"></div></div>";
     
     // URL
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>推送URL/Webhook</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "url\" value=\"" + config.pushChannels[i].url + "\" placeholder=\"http://your-server.com/api 或 webhook地址\">";
-    channelsHtml += "</div>";
-    
-    // 额外参数区域（钉钉/PushPlus/Server酱等需要）
-    channelsHtml += "<div id=\"extra" + idx + "\" style=\"display:none;\">";
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label id=\"key1label" + idx + "\">参数1</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "key1\" id=\"key1" + idx + "\" value=\"" + config.pushChannels[i].key1 + "\">";
-    channelsHtml += "</div>";
-    channelsHtml += "<div class=\"form-group\" style=\"display:none;\">";
-    channelsHtml += "<label id=\"key2label" + idx + "\">参数2</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "key2\" id=\"key2" + idx + "\" value=\"" + config.pushChannels[i].key2 + "\">";
-    channelsHtml += "</div>";
-    channelsHtml += "</div>";
+    channelsHtml += "<div class=\"fg\"><label>推送URL</label><input name=\"push" + idx + "url\" value=\"" + config.pushChannels[i].url + "\" placeholder=\"http://...\"></div>";
     
     // 自定义模板区域
-    channelsHtml += "<div id=\"custom" + idx + "\" style=\"display:none;\">";
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>请求体模板（使用 {sender} {message} {timestamp} 占位符）</label>";
-    channelsHtml += "<textarea name=\"push" + idx + "body\" rows=\"4\" style=\"width:100%;font-family:monospace;\">" + config.pushChannels[i].customBody + "</textarea>";
-    channelsHtml += "</div>";
-    channelsHtml += "</div>";
+    channelsHtml += "<div id=\"cf" + idx + "\" style=\"display:none\"><div class=\"fg\"><label>请求体模板</label><textarea name=\"push" + idx + "body\" rows=\"3\">" + config.pushChannels[i].customBody + "</textarea></div></div>";
     
     channelsHtml += "</div></div>";
   }
@@ -631,6 +530,50 @@ void handleToolsPage() {
   
   String html = String(htmlToolsPage);
   html.replace("%IP%", WiFi.localIP().toString());
+  
+  // MQTT状态
+  #ifdef ENABLE_MQTT
+  html.replace("%MQTT_STATUS%", mqttClient.connected() ? "已连接 ✓" : "未连接");
+  html.replace("%MQTT_CLASS%", mqttClient.connected() ? "mqtt-on" : "mqtt-off");
+  #else
+  html.replace("%MQTT_STATUS%", "未启用");
+  html.replace("%MQTT_CLASS%", "mqtt-off");
+  #endif
+  
+  // 定时任务状态
+  unsigned long remainMs = 0;
+  if (config.timerEnabled && timerIntervalMs > 0) {
+    unsigned long elapsed = millis() - lastTimerExec;
+    if (elapsed < timerIntervalMs) {
+      remainMs = timerIntervalMs - elapsed;
+    }
+  }
+  int remainSec = remainMs / 1000;
+  
+  html.replace("%TIMER_BOX_CLASS%", config.timerEnabled ? "" : "timer-off");
+  html.replace("%TIMER_STATUS%", config.timerEnabled ? (config.timerType == 0 ? "定时Ping" : "定时短信") : "已禁用");
+  
+  // 格式化剩余时间
+  String countdown = "--";
+  if (config.timerEnabled && remainSec > 0) {
+    int d = remainSec / 86400;
+    int h = (remainSec % 86400) / 3600;
+    int m = (remainSec % 3600) / 60;
+    countdown = "";
+    if (d > 0) countdown += String(d) + "天";
+    if (h > 0) countdown += String(h) + "时";
+    if (m > 0) countdown += String(m) + "分";
+    countdown += "后执行";
+  }
+  html.replace("%TIMER_COUNTDOWN%", countdown);
+  html.replace("%TIMER_REMAIN%", String(remainSec));
+  html.replace("%TIMER_CHECKED%", config.timerEnabled ? "checked" : "");
+  html.replace("%TIMER_TYPE0%", config.timerType == 0 ? "selected" : "");
+  html.replace("%TIMER_TYPE1%", config.timerType == 1 ? "selected" : "");
+  html.replace("%TIMER_INTERVAL%", String(config.timerInterval));
+  html.replace("%TIMER_PHONE%", config.timerPhone);
+  html.replace("%TIMER_MSG%", config.timerMessage);
+  
   server.send(200, "text/html", html);
 }
 
@@ -1184,6 +1127,73 @@ void handlePing() {
   server.send(200, "application/json", json);
 }
 
+// 处理定时任务配置保存
+void handleTimer() {
+  if (!checkAuth()) return;
+  
+  String body = server.arg("plain");
+  Serial.println("收到定时任务配置: " + body);
+  
+  // 简单解析JSON
+  bool enabled = body.indexOf("\"enabled\":true") >= 0;
+  
+  int typeIdx = body.indexOf("\"type\":");
+  int timerType = 0;
+  if (typeIdx >= 0) {
+    timerType = body.substring(typeIdx + 7, typeIdx + 8).toInt();
+  }
+  
+  int intervalIdx = body.indexOf("\"interval\":");
+  int interval = 30;  // 默认30天
+  if (intervalIdx >= 0) {
+    int endIdx = body.indexOf(",", intervalIdx + 11);
+    if (endIdx < 0) endIdx = body.indexOf("}", intervalIdx + 11);
+    interval = body.substring(intervalIdx + 11, endIdx).toInt();
+    if (interval < 1) interval = 1;
+    if (interval > 365) interval = 365; // 最大365天
+  }
+  
+  int phoneIdx = body.indexOf("\"phone\":\"");
+  String phone = "";
+  if (phoneIdx >= 0) {
+    int endIdx = body.indexOf("\"", phoneIdx + 9);
+    phone = body.substring(phoneIdx + 9, endIdx);
+  }
+  
+  int msgIdx = body.indexOf("\"message\":\"");
+  String message = "保号短信";
+  if (msgIdx >= 0) {
+    int endIdx = body.indexOf("\"", msgIdx + 11);
+    message = body.substring(msgIdx + 11, endIdx);
+  }
+  
+  // 更新配置
+  config.timerEnabled = enabled;
+  config.timerType = timerType;
+  config.timerInterval = interval;
+  config.timerPhone = phone;
+  config.timerMessage = message;
+  
+  // 更新定时间隔（天转毫秒）
+  timerIntervalMs = (unsigned long)interval * 24UL * 60UL * 60UL * 1000UL;
+  
+  // 重置执行时间
+  lastTimerExec = millis();
+  
+  // 保存配置
+  saveConfig();
+  
+  // 计算剩余时间
+  int remainSec = timerIntervalMs / 1000;
+  
+  String json = "{\"success\":true,\"remain\":" + String(remainSec) + "}";
+  server.send(200, "application/json", json);
+  
+  Serial.println("定时任务配置已保存: " + String(enabled ? "启用" : "禁用") + 
+                 ", 类型: " + String(timerType) + 
+                 ", 间隔: " + String(interval) + "分钟");
+}
+
 // 处理保存配置请求
 void handleSave() {
   if (!checkAuth()) return;
@@ -1590,23 +1600,6 @@ String urlEncode(const String& str) {
   return encoded;
 }
 
-// 钉钉签名函数
-String dingtalkSign(const String& secret, long timestamp) {
-  String stringToSign = String(timestamp) + "\n" + secret;
-  
-  uint8_t hmacResult[32];
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)secret.c_str(), secret.length());
-  mbedtls_md_hmac_update(&ctx, (const unsigned char*)stringToSign.c_str(), stringToSign.length());
-  mbedtls_md_hmac_finish(&ctx, hmacResult);
-  mbedtls_md_free(&ctx);
-  
-  String base64Encoded = base64::encode(hmacResult, 32);
-  return urlEncode(base64Encoded);
-}
-
 // JSON转义函数
 String jsonEscape(const String& str) {
   String result = "";
@@ -1625,12 +1618,7 @@ String jsonEscape(const String& str) {
 // 发送单个推送通道
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
   if (!channel.enabled) return;
-  
-  // 对于某些推送方式，URL可以为空（使用默认URL）
-  bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK || 
-                  channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK || 
-                  channel.type == PUSH_TYPE_CUSTOM);
-  if (needUrl && channel.url.length() == 0) return;
+  if (channel.url.length() == 0) return;
   
   HTTPClient http;
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
@@ -1664,7 +1652,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       jsonData += "\"title\":\"" + senderEscaped + "\",";
       jsonData += "\"body\":\"" + messageEscaped + "\"";
       jsonData += "}";
-      Serial.println("BARK JSON: " + jsonData);
+      Serial.println("BARK: " + jsonData);
       httpCode = http.POST(jsonData);
       break;
     }
@@ -1680,69 +1668,9 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       getUrl += "sender=" + urlEncode(String(sender));
       getUrl += "&message=" + urlEncode(String(message));
       getUrl += "&timestamp=" + urlEncode(String(timestamp));
-      Serial.println("GET URL: " + getUrl);
+      Serial.println("GET: " + getUrl);
       http.begin(getUrl);
       httpCode = http.GET();
-      break;
-    }
-    
-    case PUSH_TYPE_DINGTALK: {
-      // 钉钉机器人
-      String webhookUrl = channel.url;
-      
-      // 如果配置了secret，需要添加签名
-      if (channel.key1.length() > 0) {
-        long ts = millis() / 1000 + 1609459200; // 近似时间戳（2021-01-01起）
-        // 尝试获取更准确的时间戳
-        struct timeval tv;
-        if (gettimeofday(&tv, NULL) == 0) {
-          ts = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-        } else {
-          ts = millis() + 1609459200000; // 毫秒级近似
-        }
-        String sign = dingtalkSign(channel.key1, ts);
-        if (webhookUrl.indexOf('?') == -1) {
-          webhookUrl += "?";
-        } else {
-          webhookUrl += "&";
-        }
-        webhookUrl += "timestamp=" + String(ts) + "&sign=" + sign;
-      }
-      
-      http.begin(webhookUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
-      jsonData += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
-      jsonData += "\"}}";
-      Serial.println("钉钉: " + jsonData);
-      httpCode = http.POST(jsonData);
-      break;
-    }
-    
-    case PUSH_TYPE_PUSHPLUS: {
-      // PushPlus
-      String pushUrl = channel.url.length() > 0 ? channel.url : "http://www.pushplus.plus/send";
-      http.begin(pushUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"token\":\"" + channel.key1 + "\",";
-      jsonData += "\"title\":\"短信来自: " + senderEscaped + "\",";
-      jsonData += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\"";
-      jsonData += "}";
-      Serial.println("PushPlus: " + jsonData);
-      httpCode = http.POST(jsonData);
-      break;
-    }
-    
-    case PUSH_TYPE_SERVERCHAN: {
-      // Server酱
-      String scUrl = channel.url.length() > 0 ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
-      http.begin(scUrl);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      String postData = "title=" + urlEncode("短信来自: " + String(sender));
-      postData += "&desp=" + urlEncode("**发送者:** " + String(sender) + "\n\n**时间:** " + String(timestamp) + "\n\n**内容:**\n\n" + String(message));
-      Serial.println("Server酱: " + postData);
-      httpCode = http.POST(postData);
       break;
     }
     
@@ -1868,6 +1796,12 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
 
   // 发送通知http（推送到所有启用的通道）
   sendSMSToServer(sender, text, timestamp);
+  
+  // 发送MQTT通知
+  #ifdef ENABLE_MQTT
+  publishMqttSmsReceived(sender, text, timestamp);
+  #endif
+  
   // 发送通知邮件
   String subject = ""; subject+="短信";subject+=sender;subject+=",";subject+=text;
   String body = ""; body+="来自：";body+=sender;body+="，时间：";body+=timestamp;body+="，内容：";body+=text;
@@ -2050,6 +1984,7 @@ void setup() {
   server.on("/sms", handleToolsPage);  // 兼容旧链接
   server.on("/sendsms", HTTP_POST, handleSendSms);
   server.on("/ping", HTTP_POST, handlePing);
+  server.on("/timer", HTTP_POST, handleTimer);
   server.on("/query", handleQuery);
   server.begin();
   Serial.println("HTTP服务器已启动");
@@ -2087,6 +2022,19 @@ void setup() {
     String body = "设备已启动\n设备地址: " + getDeviceUrl();
     sendEmailNotification(subject.c_str(), body.c_str());
   }
+  
+  // ========== MQTT初始化 ==========
+  #ifdef ENABLE_MQTT
+  Serial.println("初始化MQTT...");
+  initMqttTopics();
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(1024);  // 增加缓冲区大小以支持较长消息
+  
+  // 首次连接MQTT
+  mqttReconnect();
+  Serial.println("MQTT初始化完成");
+  #endif
 }
 
 void loop() {
@@ -2100,6 +2048,54 @@ void loop() {
       Serial.println("⚠️ 请访问 " + getDeviceUrl() + " 配置系统参数");
     }
   }
+  // 检查定时任务执行
+  if (config.timerEnabled && timerIntervalMs > 0 && configValid) {
+    if (millis() - lastTimerExec >= timerIntervalMs) {
+      Serial.println("⏰ 执行定时任务...");
+      lastTimerExec = millis();
+      
+      if (config.timerType == 0) {
+        // 定时Ping
+        Serial.println("开始定时Ping...");
+        if (sendATandWaitOK("AT+CGACT=1,1", 10000)) {
+          // 这里简化处理，直接执行Ping，不解析详细结果，因为没有前端等待
+          sendATandWaitOK("AT+MPING=1,\"8.8.8.8\",4,32,255", 30000);
+          delay(2000);
+          sendATandWaitOK("AT+CGACT=0,1", 5000);
+          Serial.println("定时Ping完成");
+          
+          #ifdef ENABLE_MQTT
+          publishMqttStatus("active_ping");
+          #endif
+        }
+      } else if (config.timerType == 1 && config.timerPhone.length() > 0 && config.timerMessage.length() > 0) {
+        // 定时发送短信
+        Serial.println("发送保号短信...");
+        sendSMS(config.timerPhone.c_str(), config.timerMessage.c_str());
+        
+        #ifdef ENABLE_MQTT
+        publishMqttSmsSent(config.timerPhone.c_str(), config.timerMessage.c_str(), true);
+        #endif
+      }
+    }
+  }
+  
+  // ========== MQTT处理 ==========
+  #ifdef ENABLE_MQTT
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      // 定期尝试重连
+      unsigned long now = millis();
+      if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
+        lastMqttReconnectAttempt = now;
+        mqttReconnect();
+      }
+    } else {
+      // MQTT已连接，处理消息
+      mqttClient.loop();
+    }
+  }
+  #endif
   
   // 检查长短信超时
   checkConcatTimeout();
@@ -2109,3 +2105,328 @@ void loop() {
   // 检查URC和解析
   checkSerial1URC();
 }
+
+// ========== MQTT功能实现 ==========
+#ifdef ENABLE_MQTT
+
+// 获取MAC地址后缀作为设备唯一ID
+String getMacSuffix() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  mac.toLowerCase();
+  return mac.substring(6);  // 取后6位
+}
+
+// 初始化MQTT主题
+void initMqttTopics() {
+  mqttDeviceId = getMacSuffix();
+  String prefix = String(MQTT_TOPIC_PREFIX) + "/" + mqttDeviceId;
+  
+  // 发布主题
+  mqttTopicStatus = prefix + "/status";
+  mqttTopicSmsReceived = prefix + "/sms/received";
+  mqttTopicSmsSent = prefix + "/sms/sent";
+  mqttTopicPingResult = prefix + "/ping/result";
+  
+  // 订阅主题
+  mqttTopicSmsSend = prefix + "/sms/send";
+  mqttTopicPing = prefix + "/ping";
+  mqttTopicCmd = prefix + "/cmd";
+  
+  Serial.println("MQTT设备ID: " + mqttDeviceId);
+  Serial.println("MQTT主题前缀: " + prefix);
+}
+
+// MQTT重连函数
+void mqttReconnect() {
+  if (mqttClient.connected()) return;
+  
+  String clientId = String(MQTT_CLIENT_ID_PREFIX) + mqttDeviceId;
+  Serial.println("连接MQTT服务器: " + String(MQTT_SERVER));
+  Serial.println("客户端ID: " + clientId);
+  
+  bool connected = false;
+  
+  // 配置遗嘱消息（设备离线时自动发送）
+  String willMessage = "{\"status\":\"offline\",\"device\":\"" + mqttDeviceId + "\"}";
+  
+  if (strlen(MQTT_USER) > 0) {
+    connected = mqttClient.connect(
+      clientId.c_str(),
+      MQTT_USER,
+      MQTT_PASS,
+      mqttTopicStatus.c_str(),
+      1,  // QoS
+      true,  // retain
+      willMessage.c_str()
+    );
+  } else {
+    connected = mqttClient.connect(
+      clientId.c_str(),
+      mqttTopicStatus.c_str(),
+      1,  // QoS
+      true,  // retain
+      willMessage.c_str()
+    );
+  }
+  
+  if (connected) {
+    Serial.println("✅ MQTT连接成功");
+    
+    // 订阅命令主题
+    mqttClient.subscribe(mqttTopicSmsSend.c_str());
+    mqttClient.subscribe(mqttTopicPing.c_str());
+    mqttClient.subscribe(mqttTopicCmd.c_str());
+    Serial.println("已订阅主题:");
+    Serial.println("  - " + mqttTopicSmsSend);
+    Serial.println("  - " + mqttTopicPing);
+    Serial.println("  - " + mqttTopicCmd);
+    
+    // 发布上线状态
+    publishMqttStatus("online");
+  } else {
+    Serial.print("❌ MQTT连接失败, 错误码: ");
+    Serial.println(mqttClient.state());
+  }
+}
+
+// MQTT消息回调处理
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // 转换payload为字符串
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.println("=== MQTT消息接收 ===");
+  Serial.println("主题: " + String(topic));
+  Serial.println("内容: " + message);
+  Serial.println("====================");
+  
+  // 处理发送短信命令
+  if (String(topic) == mqttTopicSmsSend) {
+    // 解析JSON: {"phone":"xxx","message":"xxx"}
+    int phoneStart = message.indexOf("\"phone\"");
+    int msgStart = message.indexOf("\"message\"");
+    
+    if (phoneStart >= 0 && msgStart >= 0) {
+      // 提取phone值
+      int phoneValStart = message.indexOf(":", phoneStart) + 1;
+      int phoneValEnd = message.indexOf(",", phoneValStart);
+      if (phoneValEnd < 0) phoneValEnd = message.indexOf("}", phoneValStart);
+      String phoneRaw = message.substring(phoneValStart, phoneValEnd);
+      phoneRaw.trim();
+      // 去除引号
+      if (phoneRaw.startsWith("\"")) phoneRaw = phoneRaw.substring(1);
+      if (phoneRaw.endsWith("\"")) phoneRaw = phoneRaw.substring(0, phoneRaw.length() - 1);
+      
+      // 提取message值
+      int msgValStart = message.indexOf(":", msgStart) + 1;
+      int msgValEnd = message.lastIndexOf("\"");
+      String msgRaw = message.substring(msgValStart, msgValEnd + 1);
+      msgRaw.trim();
+      // 去除首尾引号
+      if (msgRaw.startsWith("\"")) msgRaw = msgRaw.substring(1);
+      if (msgRaw.endsWith("\"")) msgRaw = msgRaw.substring(0, msgRaw.length() - 1);
+      
+      Serial.println("MQTT发送短信命令:");
+      Serial.println("  目标: " + phoneRaw);
+      Serial.println("  内容: " + msgRaw);
+      
+      bool success = sendSMS(phoneRaw.c_str(), msgRaw.c_str());
+      publishMqttSmsSent(phoneRaw.c_str(), msgRaw.c_str(), success);
+    } else {
+      Serial.println("❌ 短信命令格式错误");
+      publishMqttSmsSent("", "", false);
+    }
+  }
+  // 处理Ping命令
+  else if (String(topic) == mqttTopicPing) {
+    String host = "8.8.8.8";  // 默认目标
+    
+    // 解析JSON: {"host":"xxx"} 或 {}
+    int hostStart = message.indexOf("\"host\"");
+    if (hostStart >= 0) {
+      int hostValStart = message.indexOf(":", hostStart) + 1;
+      int hostValEnd = message.indexOf("\"", hostValStart + 2);
+      if (hostValEnd > hostValStart) {
+        String hostRaw = message.substring(hostValStart, hostValEnd + 1);
+        hostRaw.trim();
+        if (hostRaw.startsWith("\"")) hostRaw = hostRaw.substring(1);
+        if (hostRaw.endsWith("\"")) hostRaw = hostRaw.substring(0, hostRaw.length() - 1);
+        if (hostRaw.length() > 0) host = hostRaw;
+      }
+    }
+    
+    Serial.println("MQTT Ping命令: " + host);
+    
+    // 执行Ping操作
+    // 激活数据连接
+    String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
+    delay(500);
+    
+    // 发送Ping命令
+    String pingCmd = "AT+MPING=\"" + host + "\",30,1";
+    while (Serial1.available()) Serial1.read();
+    Serial1.println(pingCmd);
+    
+    unsigned long start = millis();
+    String resp = "";
+    bool gotResult = false;
+    String resultMsg = "";
+    bool pingSuccess = false;
+    
+    while (millis() - start < 35000) {
+      while (Serial1.available()) {
+        char c = Serial1.read();
+        resp += c;
+        
+        int mpingIdx = resp.indexOf("+MPING:");
+        if (mpingIdx >= 0) {
+          int lineEnd = resp.indexOf('\n', mpingIdx);
+          if (lineEnd >= 0) {
+            String mpingLine = resp.substring(mpingIdx, lineEnd);
+            mpingLine.trim();
+            
+            int colonIdx = mpingLine.indexOf(':');
+            if (colonIdx >= 0) {
+              String params = mpingLine.substring(colonIdx + 1);
+              params.trim();
+              
+              int commaIdx = params.indexOf(',');
+              int result = params.substring(0, commaIdx > 0 ? commaIdx : params.length()).toInt();
+              
+              gotResult = true;
+              pingSuccess = (result == 0 || result == 1) || (params.indexOf(',') >= 0 && params.length() > 5);
+              
+              if (pingSuccess && commaIdx > 0) {
+                // 解析详细信息
+                resultMsg = params;
+              } else {
+                resultMsg = "错误码: " + String(result);
+              }
+            }
+            break;
+          }
+        }
+        
+        if (resp.indexOf("ERROR") >= 0) {
+          gotResult = true;
+          pingSuccess = false;
+          resultMsg = "模组错误";
+          break;
+        }
+      }
+      if (gotResult) break;
+      delay(10);
+    }
+    
+    // 关闭数据连接
+    sendATCommand("AT+CGACT=0,1", 5000);
+    
+    if (!gotResult) {
+      resultMsg = "超时";
+    }
+    
+    publishMqttPingResult(host.c_str(), pingSuccess, resultMsg.c_str());
+  }
+  // 处理控制命令
+  else if (String(topic) == mqttTopicCmd) {
+    // 解析JSON: {"action":"xxx"}
+    int actionStart = message.indexOf("\"action\"");
+    if (actionStart >= 0) {
+      int actionValStart = message.indexOf(":", actionStart) + 1;
+      int actionValEnd = message.indexOf("\"", actionValStart + 2);
+      String actionRaw = message.substring(actionValStart, actionValEnd + 1);
+      actionRaw.trim();
+      if (actionRaw.startsWith("\"")) actionRaw = actionRaw.substring(1);
+      if (actionRaw.endsWith("\"")) actionRaw = actionRaw.substring(0, actionRaw.length() - 1);
+      
+      Serial.println("MQTT控制命令: " + actionRaw);
+      
+      if (actionRaw == "restart" || actionRaw == "reset") {
+        Serial.println("执行重启命令...");
+        publishMqttStatus("restarting");
+        delay(500);
+        ESP.restart();
+      }
+      else if (actionRaw == "status") {
+        // 发送详细状态信息
+        String statusJson = "{";
+        statusJson += "\"status\":\"online\",";
+        statusJson += "\"device\":\"" + mqttDeviceId + "\",";
+        statusJson += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+        statusJson += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+        statusJson += "\"uptime\":" + String(millis() / 1000) + ",";
+        statusJson += "\"free_heap\":" + String(ESP.getFreeHeap());
+        statusJson += "}";
+        mqttClient.publish(mqttTopicStatus.c_str(), statusJson.c_str(), true);
+        Serial.println("已发送状态信息");
+      }
+      else {
+        Serial.println("未知命令: " + actionRaw);
+      }
+    }
+  }
+}
+
+// 发布收到短信通知
+void publishMqttSmsReceived(const char* sender, const char* message, const char* timestamp) {
+  if (!mqttClient.connected()) return;
+  
+  String json = "{";
+  json += "\"sender\":\"" + jsonEscape(String(sender)) + "\",";
+  json += "\"message\":\"" + jsonEscape(String(message)) + "\",";
+  json += "\"timestamp\":\"" + jsonEscape(String(timestamp)) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\"";
+  json += "}";
+  
+  mqttClient.publish(mqttTopicSmsReceived.c_str(), json.c_str());
+  Serial.println("📤 MQTT发布收到短信通知");
+}
+
+// 发布发送短信结果
+void publishMqttSmsSent(const char* phone, const char* message, bool success) {
+  if (!mqttClient.connected()) return;
+  
+  String json = "{";
+  json += "\"success\":" + String(success ? "true" : "false") + ",";
+  json += "\"phone\":\"" + jsonEscape(String(phone)) + "\",";
+  json += "\"message\":\"" + jsonEscape(String(message)) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\"";
+  json += "}";
+  
+  mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
+  Serial.println("📤 MQTT发布发送短信结果: " + String(success ? "成功" : "失败"));
+}
+
+// 发布Ping测试结果
+void publishMqttPingResult(const char* host, bool success, const char* result) {
+  if (!mqttClient.connected()) return;
+  
+  String json = "{";
+  json += "\"success\":" + String(success ? "true" : "false") + ",";
+  json += "\"host\":\"" + String(host) + "\",";
+  json += "\"result\":\"" + jsonEscape(String(result)) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\"";
+  json += "}";
+  
+  mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
+  Serial.println("📤 MQTT发布Ping结果: " + String(success ? "成功" : "失败"));
+}
+
+// 发布设备状态
+void publishMqttStatus(const char* status) {
+  if (!mqttClient.connected() && String(status) != "online") return;
+  
+  String json = "{";
+  json += "\"status\":\"" + String(status) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+  
+  mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);  // retain=true
+  Serial.println("📤 MQTT发布状态: " + String(status));
+}
+
+#endif  // ENABLE_MQTT
