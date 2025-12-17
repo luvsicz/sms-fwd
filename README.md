@@ -136,9 +136,10 @@
 ### 5. 上传程序
 
 1. 用 USB 线连接 ESP32C3 到电脑
-2. 选择开发板：**工具 → 开发板 → MakerGO ESP32 C3 SuperMini**
-3. 选择端口：**工具 → 端口 → （选择出现的COM口）**
-4. 点击上传按钮 ➡️
+2. 选择开发板：**工具 → 开发板 → esp32 → MakerGO ESP32 C3 SuperMini**
+3. 更改存储分配：**工具 → Partition Scheme:xxxx → Huge app**
+4. 选择端口：**工具 → 端口 → （选择出现的COM口）**
+5. 点击上传按钮 ➡️
 
 ### 6. 开始使用
 
