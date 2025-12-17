@@ -71,6 +71,10 @@ void saveConfig() {
   preferences.putString("mqttPass", config.mqttPass);
   preferences.putString("mqttPrefix", config.mqttPrefix);
   
+  // 保存 HA 自动发现配置
+  preferences.putBool("mqttHaDisc", config.mqttHaDiscovery);
+  preferences.putString("mqttHaPre", config.mqttHaPrefix);
+  
   esp_task_wdt_reset();
   
   // 保存黑白名单配置
@@ -139,6 +143,10 @@ void loadConfig() {
   config.mqttUser = preferences.getString("mqttUser", "");
   config.mqttPass = preferences.getString("mqttPass", "");
   config.mqttPrefix = preferences.getString("mqttPrefix", "sms");
+  
+  // 加载 HA 自动发现配置（默认启用）
+  config.mqttHaDiscovery = preferences.getBool("mqttHaDisc", true);
+  config.mqttHaPrefix = preferences.getString("mqttHaPre", "homeassistant");
   
   // 加载黑白名单配置
   config.filterEnabled = preferences.getBool("filterEn", false);

@@ -254,6 +254,21 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
             <div id="mqCoSw" class="sw %MQTT_CO_SW%"></div>
             <input type="hidden" id="mqCo" name="mqttCtrlOnly" value="%MQTT_CO_VAL%">
          </div>
+         
+         <div style="border-top:1px solid var(--border);margin:12px 0 8px;padding-top:12px">
+           <div style="font-weight:600;margin-bottom:8px">Home Assistant 自动发现</div>
+           <div class="sw-row" onclick="xToggle('mqHa')">
+              <span>启用 HA 自动发现</span>
+              <div id="mqHaSw" class="sw %MQTT_HA_SW%"></div>
+              <input type="hidden" id="mqHa" name="mqttHaDiscovery" value="%MQTT_HA_VAL%">
+           </div>
+           <div id="mqHaBox" style="display:%MQTT_HA_DISP%">
+             <div class="fg"><label>HA 发现前缀</label><input name="mqttHaPrefix" value="%MQTT_HA_PREFIX%" placeholder="homeassistant"></div>
+             <div style="font-size:0.85em;color:var(--text-light);margin-top:4px">
+               💡 启用后设备将自动注册到 Home Assistant，无需手动配置 YAML 文件。
+             </div>
+           </div>
+         </div>
       </div>
     </div>
   </details>
@@ -378,6 +393,7 @@ function xToggle(id){
   // 联动显示
   if(id==='smEn')$('smBox').style.display=i.value==='true'?'block':'none';
   if(id==='mqEn')$('mqBox').style.display=i.value==='true'?'block':'none';
+  if(id==='mqHa')$('mqHaBox').style.display=i.value==='true'?'block':'none';
 }
 function fd(i){
   var b=$('chb'+i),s=$('chi'+i);

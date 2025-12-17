@@ -67,6 +67,7 @@ WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
 
 String mqttDeviceId = "";
+// 用户自定义前缀主题
 String mqttTopicStatus = "";
 String mqttTopicSmsReceived = "";
 String mqttTopicSmsSent = "";
@@ -74,6 +75,9 @@ String mqttTopicPingResult = "";
 String mqttTopicSmsSend = "";
 String mqttTopicPing = "";
 String mqttTopicCmd = "";
+// Home Assistant 自动发现主题
+String mqttHaStatusTopic = "";
+String mqttHaSmsReceivedTopic = "";
 
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastMqttStatusReport = 0;

@@ -11,6 +11,8 @@ extern WiFiClient mqttWifiClient;
 extern PubSubClient mqttClient;
 
 extern String mqttDeviceId;
+
+// 用户自定义前缀主题
 extern String mqttTopicStatus;
 extern String mqttTopicSmsReceived;
 extern String mqttTopicSmsSent;
@@ -18,6 +20,10 @@ extern String mqttTopicPingResult;
 extern String mqttTopicSmsSend;
 extern String mqttTopicPing;
 extern String mqttTopicCmd;
+
+// Home Assistant 自动发现主题
+extern String mqttHaStatusTopic;      // HA 状态发布主题
+extern String mqttHaSmsReceivedTopic; // HA 短信接收事件主题
 
 extern unsigned long lastMqttReconnectAttempt;
 extern unsigned long lastMqttStatusReport;
@@ -34,5 +40,8 @@ void publishMqttSmsSent(const char* phone, const char* message, bool success);
 void publishMqttPingResult(const char* host, bool success, const char* result);
 void publishMqttStatus(const char* status);
 void publishMqttDeviceStatus();
+
+// Home Assistant 自动发现
+void publishHaDiscoveryConfig();     // 发布 HA 自动发现配置
 
 #endif // MQTT_HANDLER_H

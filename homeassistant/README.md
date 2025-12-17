@@ -17,11 +17,54 @@
 
 ---
 
-## 第一步：添加传感器
+## 🆕 MQTT 自动发现模式（推荐）
+
+**从当前版本开始**，短信转发器支持 Home Assistant MQTT 自动发现功能。启用后，设备会自动注册到 Home Assistant，**无需手动配置任何 YAML 文件**！
+
+### 如何启用
+
+1. 在短信转发器 Web 界面，进入 **配置 → MQTT 设置**
+2. 启用 **MQTT** 功能
+3. 启用 **Home Assistant 自动发现**（默认已启用）
+4. HA 发现前缀保持默认 `homeassistant` 即可
+5. 保存配置并重启设备
+
+### 自动创建的实体
+
+启用后，Home Assistant 会自动创建以下实体：
+
+| 实体 | 类型 | 说明 |
+|------|------|------|
+| 状态 | sensor | 设备在线状态 |
+| WiFi信号 | sensor | WiFi 信号强度 (dBm) |
+| 4G信号 | sensor | 4G RSRP 信号强度 (dBm) |
+| IP地址 | sensor | 设备当前 IP |
+| 运行时间 | sensor | 设备运行时间（小时） |
+| 在线 | binary_sensor | 设备连接状态 |
+| 重启 | button | 远程重启设备 |
+| 最近短信发送者 | sensor | 最后收到短信的号码 |
+| 最近短信内容 | sensor | 最后收到的短信内容 |
+
+### 双主题同步
+
+设备会同时向两类 MQTT 主题发送数据：
+
+1. **用户自定义前缀**：`<你的前缀>/<设备ID>/...`（如 `sms/a1b2c3/status`）
+2. **HA 自动发现主题**：`homeassistant/sensor/sms_forwarder_<设备ID>/state`
+
+这意味着即使启用了自动发现，你仍然可以使用自定义主题进行其他集成。
+
+---
+
+## 手动配置模式（传统方式）
+
+如果你不想使用自动发现，或者需要更精细的控制，可以使用下面的手动配置方式。
+
+### 第一步：添加传感器
 
 这一步让 HA 能够显示短信转发器的状态信息。
 
-### 方法一：直接修改 configuration.yaml（简单）
+#### 方法一：直接修改 configuration.yaml（简单）
 
 1. 用文件编辑器打开 Home Assistant 的 `configuration.yaml` 文件
    - 如果用 HA OS：文件编辑器插件 → 浏览到 `/config/configuration.yaml`
@@ -33,7 +76,7 @@
 
 4. 重启 Home Assistant：设置 → 系统 → 右上角三个点 → 重启
 
-### 方法二：使用 packages（推荐，配置更整洁）
+#### 方法二：使用 packages（推荐，配置更整洁）
 
 1. 在 `configuration.yaml` 中添加这一行：
 ```yaml
@@ -196,7 +239,7 @@ data:
 
 把 `a1b2c3` 换成你的设备 ID，`13800138000` 换成目标手机号。
 
-### 方法三：在自动化中发送
+### 方法二：在自动化中发送
 
 比如门铃响了发短信通知：
 

@@ -81,7 +81,6 @@ void blink_short(unsigned long gap_time) {
 }
 
 // 处理配置页面请求
-// 处理配置页面请求
 void handleRoot() {
   if (!checkAuth()) return;
   
@@ -158,7 +157,13 @@ void handleRoot() {
   
   html.replace("%MQTT_CO_VAL%", config.mqttControlOnly ? "true" : "false");
   html.replace("%MQTT_CO_SW%", config.mqttControlOnly ? "on" : "");
-
+  
+  // 4.5 Home Assistant 自动发现配置
+  html.replace("%MQTT_HA_VAL%", config.mqttHaDiscovery ? "true" : "false");
+  html.replace("%MQTT_HA_SW%", config.mqttHaDiscovery ? "on" : "");
+  html.replace("%MQTT_HA_DISP%", config.mqttHaDiscovery ? "block" : "none");
+  html.replace("%MQTT_HA_PREFIX%", config.mqttHaPrefix.length() > 0 ? config.mqttHaPrefix : "homeassistant");
+  
   // 5. 黑白名单配置 (Js 对象初始化)
   html.replace("%FILTER_EN_VAL%", config.filterEnabled ? "true" : "false");
   html.replace("%FILTER_EN_BOOL%", config.filterEnabled ? "true" : "false"); // JS bool
@@ -244,7 +249,6 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-// 处理工具箱页面请求
 // 处理工具箱页面请求 (重定向到首页)
 void handleToolsPage() {
   server.sendHeader("Location", "/", true);
@@ -331,8 +335,11 @@ void handleSave() {
   config.mqttPrefix = server.arg("mqttPrefix");
   if (config.mqttPrefix.length() == 0) config.mqttPrefix = "sms";
   config.mqttControlOnly = server.arg("mqttCtrlOnly") == "on" || server.arg("mqttCtrlOnly") == "true"; 
-  // 注意：Checkbox 如果是原生的，选中发 "on"，没选中不发。如果是 Hidden input wrapper 则发 "true"/"false"
-  // 新前端 mqttCtrlOnly 用的是原生 checkbox (在 check-row 里)
+  
+  // HA 自动发现配置
+  config.mqttHaDiscovery = server.arg("mqttHaDiscovery") == "true";
+  config.mqttHaPrefix = server.arg("mqttHaPrefix");
+  if (config.mqttHaPrefix.length() == 0) config.mqttHaPrefix = "homeassistant";
   
   esp_task_wdt_reset();
   yield();

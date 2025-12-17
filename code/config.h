@@ -101,6 +101,10 @@ struct Config {
   String mqttPass;
   String mqttPrefix;
   
+  // Home Assistant MQTT 自动发现
+  bool mqttHaDiscovery;     // 启用 HA 自动发现
+  String mqttHaPrefix;      // HA 发现前缀，默认 "homeassistant"
+  
   // 黑白名单配置
   bool filterEnabled;          // 是否启用过滤
   bool filterIsWhitelist;      // true=白名单, false=黑名单
