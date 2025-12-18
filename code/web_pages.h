@@ -63,20 +63,58 @@ details[open] summary{border-bottom:1px solid var(--border)}
 .sw.on{background:var(--primary)}
 .sw.on:after{left:22px}
 
-/* 历史记录 */
-.log-list{display:flex;flex-direction:column;gap:8px}
-.log-item{padding:12px;background:#f8fafc;border-radius:10px;border-left:4px solid var(--primary);font-size:0.9em}
-.log-h{display:flex;justify-content:space-between;margin-bottom:4px;color:var(--text-light);font-size:0.85em}
-.log-m{line-height:1.4;word-break:break-all}
+/* 历史记录 - 聊天界面风格 */
+.sms-container{display:flex;height:calc(100vh - 190px);gap:0;overflow:hidden;border:1px solid var(--border);background:#fff}
+.contact-list{width:250px;min-width:180px;border-right:1px solid var(--border);overflow-y:auto;background:#fafbfc;flex-shrink:0}
+.contact-list::-webkit-scrollbar{width:4px}
+.contact-list::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:2px}
+.contact-item{padding:12px 14px;cursor:pointer;border-bottom:1px solid #f1f5f9;transition:all .2s;position:relative;display:flex;align-items:center;gap:12px}
+.contact-item:hover{background:#f1f5f9}
+.contact-item.active{background:#eff6ff}
+.contact-avatar{width:40px;height:40px;border-radius:50%;background:#e2e8f0;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:1em;flex-shrink:0;text-transform:uppercase}
+.contact-info{flex:1;overflow:hidden;display:flex;flex-direction:column;justify-content:center}
+.contact-name-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
+.contact-name{font-size:0.95em;font-weight:600;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.contact-time{font-size:0.75em;color:#94a3b8;flex-shrink:0;margin-left:8px}
+.contact-preview-row{display:flex;justify-content:space-between;align-items:center}
+.contact-preview{font-size:0.8em;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.contact-badge{background:#f1f5f9;color:#64748b;border-radius:99px;font-size:0.75em;padding:2px 8px;margin-left:8px;flex-shrink:0;font-weight:500}
+
+.chat-area{flex:1;display:flex;flex-direction:column;min-width:0;background:#fff}
+.chat-header{padding:12px 16px;border-bottom:1px solid var(--border);background:#fff;display:flex;align-items:center;justify-content:space-between;z-index:10}
+.chat-title{font-weight:700;font-size:1em;color:#1e293b;display:flex;align-items:center;gap:8px}
+.chat-msg-count{font-size:0.75em;color:#94a3b8;background:#f1f5f9;padding:2px 8px;border-radius:12px}
+.chat-messages{flex:1;overflow-y:auto;padding:16px;background:#fff}
+.chat-messages::-webkit-scrollbar{width:4px}
+.chat-messages::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:2px}
+.chat-empty{text-align:center;padding:60px 20px;color:#94a3b8;font-size:0.9em;display:flex;flex-direction:column;align-items:center;gap:12px}
+.chat-day{text-align:center;margin:20px 0 16px;position:relative}
+.chat-day::before{content:'';position:absolute;top:50%;left:0;right:0;height:1px;background:#f1f5f9;z-index:0}
+.chat-day span{position:relative;background:#fff;padding:4px 12px;font-size:0.75em;color:#cbd5e1;border:1px solid #f1f5f9;border-radius:99px;z-index:1}
+.msg-bubble{max-width:80%;padding:10px 14px;margin-bottom:12px;border-radius:18px;position:relative;font-size:0.95em;line-height:1.6;word-break:break-word;box-shadow:0 1px 2px rgba(0,0,0,0.02)}
+.msg-in{background:#f1f5f9;color:#334155;border-bottom-left-radius:4px;margin-right:auto}
+.msg-time{font-size:0.7em;color:rgba(0,0,0,0.3);margin-top:4px;display:block;text-align:right}
 
 /* 消息提示 */
-.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.8);color:#fff;padding:10px 20px;border-radius:99px;font-size:0.9em;z-index:9999;transition:opacity .3s;opacity:0;pointer-events:none}
-.toast.show{opacity:1;top:24px}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.8);color:#fff;padding:8px 16px;border-radius:99px;font-size:0.85em;z-index:9999;transition:all .3s cubic-bezier(0.18, 0.89, 0.32, 1.28);opacity:0;transform:translate(-50%, -20px);pointer-events:none}
+.toast.show{opacity:1;transform:translate(-50%, 0)}
 
 /* 信息表格 */
-.info-table{width:100%;font-size:0.85em}
-.info-table td{padding:4px 0;border-bottom:1px solid #f1f5f9}
-.info-table td:first-child{color:var(--text-light);width:40%}
+.info-table{width:100%;font-size:0.85em;border-collapse:collapse}
+.info-table td{padding:8px 0;border-bottom:1px solid #f8fafc}
+.info-table td:first-child{color:var(--text-light);width:35%}
+
+/* 移动端适配 */
+.chat-back{display:none}
+@media(max-width:600px){
+  .sms-container{position:relative}
+  .contact-list{width:100%;border-right:none}
+  .chat-area{position:absolute;top:0;left:100%;width:100%;height:100%;transition:left .3s ease;z-index:20}
+  .chat-area.show{left:0}
+  .chat-back{display:flex;align-items:center;justify-content:center;width:32px;height:32px;margin-right:4px;cursor:pointer;border-radius:50%}
+  .chat-back:active{background:#f1f5f9}
+  .contact-item.active{background:transparent} /* 移动端取消列表选中高亮 */
+}
 </style>
 <script>
 const $=id=>document.getElementById(id);
@@ -185,10 +223,31 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
 
 <!-- ============ 历史页 ============ -->
 <div class="page">
-  <div class="card">
-    <div class="card-t">短信历史 <div class="badge b-wait" onclick="loadHist()">刷新</div></div>
-    <div id="hList" class="log-list">
-      <div style="text-align:center;padding:20px;color:#94a3b8">加载中...</div>
+  <div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:#fafbfc">
+      <span style="font-weight:700;font-size:1.1em">短信历史</span>
+      <div class="badge b-wait" onclick="loadHist()" style="cursor:pointer">刷新</div>
+    </div>
+    <div class="sms-container" id="smsContainer">
+      <div class="contact-list" id="contactList">
+        <div style="text-align:center;padding:20px;color:#94a3b8;font-size:0.85em">加载中...</div>
+      </div>
+      <div class="chat-area">
+        <div class="chat-header" id="chatHeader" style="display:none">
+          <div>
+            <div class="chat-title" id="chatTitle">
+               <div class="chat-back" onclick="backToList()">
+                 <svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/></svg>
+               </div>
+               <span id="chatName">选择联系人</span>
+            </div>
+            <div class="chat-msg-count" id="chatCount" style="margin-left:36px"></div>
+          </div>
+        </div>
+        <div class="chat-messages" id="chatMessages">
+          <div class="chat-empty">👈 选择左侧号码查看短信</div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -462,21 +521,124 @@ function act(t){
 }
 
 
+// 短信历史数据和当前选中的联系人
+var smsData=[];
+var curContact=null;
+// 颜色池
+const colors=['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#6366f1','#14b8a6'];
+function getAvatarColor(name){
+  let hash=0;
+  for(let i=0;i<name.length;i++)hash=name.charCodeAt(i)+((hash<<5)-hash);
+  return colors[Math.abs(hash)%colors.length];
+}
+
 function loadHist(){
-  $('hList').innerHTML='<div style="text-align:center;padding:20px;color:#94a3b8">加载中...</div>';
+  $('contactList').innerHTML='<div style="text-align:center;padding:20px;color:#94a3b8;font-size:0.85em">加载中...</div>';
+  $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">💬</div><div>加载中...</div></div>';
   fetch('/history').then(r=>r.json()).then(d=>{
-    var h='';
-    if(!d.history||d.history.length==0)h='<div style="text-align:center;padding:40px;color:#cbd5e1">暂无记录</div>';
-    else{
-       d.history.forEach(i=>{
-         h+=`<div class="log-item">
-           <div class="log-h"><span>${i.s}</span><span>${i.t}</span></div>
-           <div class="log-m">${i.m}</div>
-         </div>`;
-       });
+    smsData=d.history||[];
+    if(smsData.length==0){
+      $('contactList').innerHTML='<div style="text-align:center;padding:30px 10px;color:#94a3b8;font-size:0.85em">暂无短信</div>';
+      $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">📭</div><div>暂无短信记录</div></div>';
+      return;
     }
-    $('hList').innerHTML=h;
+    // 按发送者分组
+    var contacts={};
+    smsData.forEach(i=>{
+      if(!contacts[i.s])contacts[i.s]={name:i.s,msgs:[],lastTime:i.t};
+      contacts[i.s].msgs.push(i);
+      if(i.t>contacts[i.s].lastTime)contacts[i.s].lastTime=i.t;
+    });
+    // 按最新消息时间排序联系人
+    var sortedContacts=Object.values(contacts).sort((a,b)=>b.lastTime.localeCompare(a.lastTime));
+    // 渲染联系人列表
+    var h='';
+    sortedContacts.forEach((c,idx)=>{
+      var preview=c.msgs[0].m.substring(0,20)+(c.msgs[0].m.length>20?'...':'');
+      var shortTime=c.lastTime.substring(5,16);
+      var avColor=getAvatarColor(c.name);
+      var avText=c.name.replace('+','').substring(0,1);
+      avText = c.name.length > 2 ? c.name.substring(0,1) : c.name;
+
+      h+=`<div class="contact-item${idx===0?' active':''}" onclick="selContact('${c.name.replace(/'/g,"\\'")}')" data-name="${c.name}">
+        <div class="contact-avatar" style="background:${avColor}">${avText}</div>
+        <div class="contact-info">
+          <div class="contact-name-row">
+             <div class="contact-name">${c.name}</div>
+             <div class="contact-time">${shortTime}</div>
+          </div>
+          <div class="contact-preview-row">
+             <div class="contact-preview">${preview}</div>
+             ${c.msgs.length>1 ? '<div class="contact-badge">'+c.msgs.length+'</div>' : ''}
+          </div>
+        </div>
+      </div>`;
+    });
+    $('contactList').innerHTML=h;
+    // 默认选中第一个联系人
+    if(sortedContacts.length>0)selContact(sortedContacts[0].name);
+  }).catch(e=>{
+    console.error('加载短信失败',e);
+    $('contactList').innerHTML='<div style="text-align:center;padding:20px;color:#b91c1c;font-size:0.85em">加载失败</div>';
   });
+}
+
+function selContact(name){
+  curContact=name;
+  // 更新联系人列表高亮
+  document.querySelectorAll('.contact-item').forEach(e=>{
+    e.classList.toggle('active',e.dataset.name===name);
+  });
+  // 过滤该联系人的消息
+  var msgs=smsData.filter(i=>i.s===name);
+  if(msgs.length===0){
+    $('chatMessages').innerHTML='<div class="chat-empty">无消息</div>';
+    return;
+  }
+  // 按时间正序排列（旧的在上）
+  msgs.sort((a,b)=>a.t.localeCompare(b.t));
+  
+  // 显示聊天头部
+  $('chatHeader').style.display='flex';
+  var avColor=getAvatarColor(name);
+  var avText=name.length > 2 ? name.substring(0,1) : name;
+  
+  // 移动端显示返回按钮和名字
+  var backBtn='<div class="chat-back" onclick="backToList()"><svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="#64748b"/></svg></div>';
+  $('chatTitle').innerHTML=`${backBtn}<div class="contact-avatar" style="width:28px;height:28px;font-size:0.8em;background:${avColor}">${avText}</div> ${name}`;
+  $('chatCount').innerText=msgs.length+'条短信';
+  $('chatCount').style.marginLeft='36px'; // 对齐调整
+  
+  // 移动端切换视图
+  if(window.innerWidth<=600){
+    $s('.chat-area').classList.add('show');
+    $s('.contact-list').style.display='none'; // 隐藏列表防止滚动冲突
+  }
+  
+  // 渲染消息，按日期分组
+  var h='';
+  var lastDay='';
+  msgs.forEach(m=>{
+    var day=m.t.substring(0,10);
+    if(day!==lastDay){
+      h+='<div class="chat-day"><span>'+day+'</span></div>';
+      lastDay=day;
+    }
+    var time=m.t.substring(11,16);
+    h+=`<div class="msg-bubble msg-in">
+      <div>${m.m}</div>
+      <span class="msg-time">${time}</span>
+    </div>`;
+  });
+  $('chatMessages').innerHTML=h;
+  // 滚动到底部
+  var chatBox=$('chatMessages');
+  requestAnimationFrame(()=>chatBox.scrollTop=chatBox.scrollHeight);
+}
+
+function backToList(){
+  $s('.chat-area').classList.remove('show');
+  setTimeout(()=>$s('.contact-list').style.display='block', 300); // 动画结束后显示列表
 }
 
 function saveFilter(){

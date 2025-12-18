@@ -49,20 +49,74 @@ String cleanSmsContent(const String& text) {
   return cleaned;
 }
 
-// 格式化时间戳（从 PDU 格式转为可读格式）
-// 输入: 25121615142600 (YYMMDDHHMMSSZZ)
+// 格式化时间戳（从 PDU 格式转为可读格式，转换为中国时区 UTC+8）
+// 输入: 25121615142620 (YYMMDDHHMMSSZZ) 其中 ZZ 是时区偏移（以15分钟为单位）
 // 输出: 2025-12-16 15:14:26
 String formatTimestamp(const String& pduTimestamp) {
   if (pduTimestamp.length() < 12) return pduTimestamp;
   
-  String year = "20" + pduTimestamp.substring(0, 2);
-  String month = pduTimestamp.substring(2, 4);
-  String day = pduTimestamp.substring(4, 6);
-  String hour = pduTimestamp.substring(6, 8);
-  String minute = pduTimestamp.substring(8, 10);
-  String second = pduTimestamp.substring(10, 12);
+  int year = 2000 + pduTimestamp.substring(0, 2).toInt();
+  int month = pduTimestamp.substring(2, 4).toInt();
+  int day = pduTimestamp.substring(4, 6).toInt();
+  int hour = pduTimestamp.substring(6, 8).toInt();
+  int minute = pduTimestamp.substring(8, 10).toInt();
+  int second = pduTimestamp.substring(10, 12).toInt();
   
-  return year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second;
+  // 解析时区偏移（最后两位，以15分钟为单位，可能带符号）
+  // PDU 时区格式：正数表示 UTC+，负数表示 UTC-
+  int tzOffset = 0;
+  if (pduTimestamp.length() >= 14) {
+    String tzStr = pduTimestamp.substring(12, 14);
+    tzOffset = tzStr.toInt();
+    // 检查是否为负数（最高位为1表示负数，但通常以十六进制表示）
+    // 一般情况下直接用整数值，中国是 +8 小时 = +32（32*15=480分钟=8小时）
+  }
+  
+  // 中国时区目标偏移：UTC+8 = 32 (32 * 15分钟 = 480分钟 = 8小时)
+  const int TARGET_TZ = 32;
+  int tzDiff = TARGET_TZ - tzOffset;  // 需要调整的时区差（以15分钟为单位）
+  
+  // 如果时区偏移不是中国时区，进行转换
+  if (tzDiff != 0) {
+    // 转换为总分钟数进行计算
+    int totalMinutes = hour * 60 + minute;
+    totalMinutes += tzDiff * 15;  // 加上时区差异（分钟）
+    
+    // 处理日期进位/退位
+    while (totalMinutes < 0) {
+      totalMinutes += 24 * 60;
+      day--;
+    }
+    while (totalMinutes >= 24 * 60) {
+      totalMinutes -= 24 * 60;
+      day++;
+    }
+    
+    // 简单处理月份边界（不做完整的日期计算）
+    int daysInMonth[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    // 闰年判断
+    if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
+      daysInMonth[2] = 29;
+    }
+    
+    if (day < 1) {
+      month--;
+      if (month < 1) { month = 12; year--; }
+      day = daysInMonth[month];
+    } else if (day > daysInMonth[month]) {
+      day = 1;
+      month++;
+      if (month > 12) { month = 1; year++; }
+    }
+    
+    hour = totalMinutes / 60;
+    minute = totalMinutes % 60;
+  }
+  
+  // 格式化输出
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, second);
+  return String(buf);
 }
 
 // 提取验证码（用于邮件主题）
