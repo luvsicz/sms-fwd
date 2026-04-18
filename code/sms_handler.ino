@@ -53,6 +53,11 @@ String cleanSmsContent(const String& text) {
 // 输入: 25121615142620 (YYMMDDHHMMSSZZ) 其中 ZZ 是时区偏移（以15分钟为单位）
 // 输出: 2025-12-16 15:14:26
 String formatTimestamp(const String& pduTimestamp) {
+  // 已经是可读格式（如 2026-04-18 12:34:56）时直接返回
+  if (pduTimestamp.indexOf('-') >= 0 && pduTimestamp.indexOf(':') >= 0) {
+    return pduTimestamp;
+  }
+
   if (pduTimestamp.length() < 12) return pduTimestamp;
   
   int year = 2000 + pduTimestamp.substring(0, 2).toInt();

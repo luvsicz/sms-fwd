@@ -477,6 +477,7 @@ void saveStats() {
   preferences.begin("sms_stats", false);
   preferences.putULong("received", stats.smsReceived);
   preferences.putULong("sent", stats.smsSent);
+  preferences.putULong("calls", stats.callsReceived);
   preferences.putULong("pushOk", stats.pushSuccess);
   preferences.putULong("pushFail", stats.pushFailed);
   preferences.putULong("boots", stats.bootCount);
@@ -488,6 +489,7 @@ void loadStats() {
   preferences.begin("sms_stats", true);
   stats.smsReceived = preferences.getULong("received", 0);
   stats.smsSent = preferences.getULong("sent", 0);
+  stats.callsReceived = preferences.getULong("calls", 0);
   stats.pushSuccess = preferences.getULong("pushOk", 0);
   stats.pushFailed = preferences.getULong("pushFail", 0);
   stats.bootCount = preferences.getULong("boots", 0) + 1;

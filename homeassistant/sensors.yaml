@@ -100,10 +100,25 @@ mqtt:
         {
           "message": {{ value_json.message | default('') | tojson }},
           "sender": {{ value_json.sender | default('') | tojson }},
+          "timestamp": {{ value_json.timestamp | default(value_json.time | default('')) | tojson }},
           "time": {{ value_json.time | default('') | tojson }}
         }
       icon: mdi:message-text
-      
+
+    # 最近来电号码
+    - name: "最近来电号码"
+      unique_id: sms_forwarder_last_caller
+      state_topic: "sms/a1b2c3/call/received"
+      value_template: "{{ value_json.caller }}"
+      json_attributes_topic: "sms/a1b2c3/call/received"
+      json_attributes_template: >-
+        {
+          "caller": {{ value_json.caller | default('') | tojson }},
+          "time": {{ value_json.timestamp | default('') | tojson }},
+          "event_type": {{ value_json.event_type | default('incoming_call') | tojson }}
+        }
+      icon: mdi:phone-in-talk
+
   # 二进制传感器 - 在线状态
   binary_sensor:
     - name: "短信转发器在线"
@@ -123,6 +138,22 @@ mqtt:
       command_topic: "sms/a1b2c3/cmd"
       payload_press: '{"action":"restart"}'
       icon: mdi:restart
+
+  # 事件实体（手工配置示例，自动发现启用时通常无需手工添加）
+  event:
+    - name: "短信转发器短信事件"
+      unique_id: sms_forwarder_sms_event
+      state_topic: "homeassistant/event/sms_forwarder_a1b2c3_sms/event"
+      event_types:
+        - sms_received
+      icon: mdi:message-badge
+
+    - name: "短信转发器来电事件"
+      unique_id: sms_forwarder_call_event
+      state_topic: "homeassistant/event/sms_forwarder_a1b2c3_call/event"
+      event_types:
+        - incoming_call
+      icon: mdi:phone-ring
 
 # ===========================================
 # Lovelace 仪表板卡片配置示例
@@ -153,4 +184,13 @@ template:
           time: "{{ state_attr('sensor.zui_jin_duan_xin_nei_rong', 'time') }}"
           message: "{{ state_attr('sensor.zui_jin_duan_xin_nei_rong', 'message') }}"
         icon: mdi:message-text-outline
+
+      - name: "来电详情"
+        unique_id: sms_forwarder_last_call
+        state: "{{ states('sensor.zui_jin_lai_dian_hao_ma') }}"
+        attributes:
+          caller: "{{ state_attr('sensor.zui_jin_lai_dian_hao_ma', 'caller') }}"
+          time: "{{ state_attr('sensor.zui_jin_lai_dian_hao_ma', 'time') }}"
+          event_type: "{{ state_attr('sensor.zui_jin_lai_dian_hao_ma', 'event_type') }}"
+        icon: mdi:phone-ring
 

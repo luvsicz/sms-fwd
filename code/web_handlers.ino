@@ -120,7 +120,7 @@ void handleRoot() {
   // MQTT 主题列表
   String mqttTopicsHtml = "";
   if (config.mqttEnabled && config.mqttServer.length() > 0) {
-    mqttTopicsHtml = mqttTopicStatus + "<br>" + mqttTopicSmsReceived;
+    mqttTopicsHtml = mqttTopicStatus + "<br>" + mqttTopicSmsReceived + "<br>" + mqttTopicCallReceived;
   } else {
     mqttTopicsHtml = "未配置";
   }

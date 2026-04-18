@@ -24,6 +24,7 @@ void initMqttTopics() {
   // 用户自定义前缀 - 发布主题
   mqttTopicStatus = prefix + "/status";
   mqttTopicSmsReceived = prefix + "/sms/received";
+  mqttTopicCallReceived = prefix + "/call/received";
   mqttTopicSmsSent = prefix + "/sms/sent";
   mqttTopicPingResult = prefix + "/ping/result";
   
@@ -37,7 +38,8 @@ void initMqttTopics() {
   if (haPrefix.length() == 0) haPrefix = "homeassistant";
   mqttHaStatusTopic = haPrefix + "/sensor/sms_forwarder_" + mqttDeviceId + "/state";
   mqttHaSmsReceivedTopic = haPrefix + "/event/sms_forwarder_" + mqttDeviceId + "_sms/event";
-  
+  mqttHaCallReceivedTopic = haPrefix + "/event/sms_forwarder_" + mqttDeviceId + "_call/event";
+
   Serial.println("MQTT设备ID: " + mqttDeviceId);
   Serial.println("用户主题前缀: " + prefix);
   if (config.mqttHaDiscovery) {
@@ -177,7 +179,33 @@ void publishHaDiscoveryConfig() {
   messageConfig += deviceInfo;
   messageConfig += "}";
   mqttClient.publish(messageConfigTopic.c_str(), messageConfig.c_str(), true);
-  
+
+  // 10. 最近来电号码传感器
+  String lastCallerConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_caller/config";
+  String lastCallerConfig = "{";
+  lastCallerConfig += "\"name\":\"最近来电号码\",";
+  lastCallerConfig += "\"unique_id\":\"" + nodeId + "_last_caller\",";
+  lastCallerConfig += "\"state_topic\":\"" + mqttTopicCallReceived + "\",";
+  lastCallerConfig += "\"value_template\":\"{{ value_json.caller }}\",";
+  lastCallerConfig += "\"json_attributes_topic\":\"" + mqttTopicCallReceived + "\",";
+  lastCallerConfig += "\"icon\":\"mdi:phone-in-talk\",";
+  lastCallerConfig += deviceInfo;
+  lastCallerConfig += "}";
+  mqttClient.publish(lastCallerConfigTopic.c_str(), lastCallerConfig.c_str(), true);
+
+  // 11. 来电事件实体
+  String callEventConfigTopic = haPrefix + "/event/" + nodeId + "_call/config";
+  String callEventConfig = "{";
+  callEventConfig += "\"name\":\"来电通知\",";
+  callEventConfig += "\"unique_id\":\"" + nodeId + "_call_event\",";
+  callEventConfig += "\"state_topic\":\"" + mqttHaCallReceivedTopic + "\",";
+  callEventConfig += "\"event_types\":[\"incoming_call\"],";
+  callEventConfig += "\"device_class\":\"button\",";
+  callEventConfig += "\"icon\":\"mdi:phone-ring\",";
+  callEventConfig += deviceInfo;
+  callEventConfig += "}";
+  mqttClient.publish(callEventConfigTopic.c_str(), callEventConfig.c_str(), true);
+
   Serial.println("HA自动发现配置已发布");
 }
 
@@ -437,8 +465,10 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   Serial.println("MQTT推送短信...");
   
   String json = "{";
+  json += "\"event_type\":\"sms_received\",";
   json += "\"sender\":\"" + jsonEscape(String(sender)) + "\",";
   json += "\"message\":\"" + jsonEscape(String(message)) + "\",";
+  json += "\"time\":\"" + jsonEscape(String(timestamp)) + "\",";
   json += "\"timestamp\":\"" + jsonEscape(String(timestamp)) + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
@@ -457,6 +487,46 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
     Serial.println("MQTT短信推送完成");
   } else {
     Serial.println("MQTT短信推送失败");
+  }
+}
+
+// 发布收到来电通知（双主题）
+void publishMqttCallReceived(const char* caller, const char* timestamp) {
+  if (!config.mqttEnabled) {
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT未连接，跳过来电推送");
+    return;
+  }
+
+  if (config.mqttControlOnly) {
+    Serial.println("MQTT仅控制模式，跳过来电推送");
+    return;
+  }
+
+  Serial.println("MQTT推送来电通知...");
+
+  String json = "{";
+  json += "\"event_type\":\"incoming_call\",";
+  json += "\"caller\":\"" + jsonEscape(String(caller)) + "\",";
+  json += "\"timestamp\":\"" + jsonEscape(String(timestamp)) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\"";
+  json += "}";
+
+  Serial.println(" 主题1: " + mqttTopicCallReceived);
+  bool success1 = mqttClient.publish(mqttTopicCallReceived.c_str(), json.c_str());
+
+  if (config.mqttHaDiscovery) {
+    Serial.println(" 主题2 (HA): " + mqttHaCallReceivedTopic);
+    mqttClient.publish(mqttHaCallReceivedTopic.c_str(), json.c_str());
+  }
+
+  if (success1) {
+    Serial.println("MQTT来电推送完成");
+  } else {
+    Serial.println("MQTT来电推送失败");
   }
 }
 

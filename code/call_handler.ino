@@ -4,6 +4,7 @@
 
 #include "call_handler.h"
 #include "config.h"
+#include "mqtt_handler.h"
 #include "push_service.h"
 
 // 从 +CLIP URC 中提取来电号码
@@ -95,6 +96,7 @@ void processIncomingCall(const char* caller) {
 
   String pushMessage = "[来电通知] 来电号码: " + callerStr;
   sendSMSToServer(callerStr.c_str(), pushMessage.c_str(), timestamp.c_str());
+  publishMqttCallReceived(callerStr.c_str(), timestamp.c_str());
 
   String subject = "来电通知：" + callerStr;
   String body = "检测到新的来电\n来电号码：" + callerStr + "\n时间：" + timestamp + "\n";

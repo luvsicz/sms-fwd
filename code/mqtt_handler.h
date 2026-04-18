@@ -15,6 +15,7 @@ extern String mqttDeviceId;
 // 用户自定义前缀主题
 extern String mqttTopicStatus;
 extern String mqttTopicSmsReceived;
+extern String mqttTopicCallReceived;
 extern String mqttTopicSmsSent;
 extern String mqttTopicPingResult;
 extern String mqttTopicSmsSend;
@@ -24,6 +25,7 @@ extern String mqttTopicCmd;
 // Home Assistant 自动发现主题
 extern String mqttHaStatusTopic;      // HA 状态发布主题
 extern String mqttHaSmsReceivedTopic; // HA 短信接收事件主题
+extern String mqttHaCallReceivedTopic; // HA 来电事件主题
 
 extern unsigned long lastMqttReconnectAttempt;
 extern unsigned long lastMqttStatusReport;
@@ -36,6 +38,7 @@ void mqttReconnect();
 void initMqttTopics();
 String getMacSuffix();
 void publishMqttSmsReceived(const char* sender, const char* message, const char* timestamp);
+void publishMqttCallReceived(const char* caller, const char* timestamp);
 void publishMqttSmsSent(const char* phone, const char* message, bool success);
 void publishMqttPingResult(const char* host, bool success, const char* result);
 void publishMqttStatus(const char* status);
