@@ -179,11 +179,14 @@ void addSmsToHistory(const char* sender, const char* message, const char* timest
 String getSmsHistory();
 void addCallToHistory(const char* caller, const char* timestamp);
 String getCallHistory();
+void clearSmsHistory();
+void clearCallHistory();
 String normalizePhoneNumber(const String& rawNumber);
 bool phoneNumbersMatch(const String& senderNum, const String& filterNum);
 bool isNumberFiltered(const char* number);
 bool isContentFiltered(const char* content);
 void saveStats();
 void loadStats();
+void resetStats(bool preserveBootCount = true);
 
 #endif // CONFIG_H

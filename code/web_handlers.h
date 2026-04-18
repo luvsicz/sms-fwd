@@ -21,6 +21,9 @@ void handleSave();
 void handleRestart();
 void handleSmsHistory();
 void handleStats();
+void handleResetStats();
+void handleClearSmsHistory();
+void handleClearCallHistory();
 void handleFilterSave();
 void handleContentFilterSave();
 

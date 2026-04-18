@@ -567,6 +567,34 @@ void handleStats() {
   server.send(200, "application/json", json);
 }
 
+// 重置统计信息
+void handleResetStats() {
+  if (!checkAuth()) return;
+
+  resetStats(true);
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"统计数据已重置（已保留启动次数）\"}");
+}
+
+// 清空短信历史记录
+void handleClearSmsHistory() {
+  if (!checkAuth()) return;
+
+  clearSmsHistory();
+  stats.smsReceived = 0;
+  saveStats();
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"短信记录已清空，对应统计已归零\"}");
+}
+
+// 清空来电历史记录
+void handleClearCallHistory() {
+  if (!checkAuth()) return;
+
+  clearCallHistory();
+  stats.callsReceived = 0;
+  saveStats();
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"来电记录已清空，对应统计已归零\"}");
+}
+
 // 保存黑白名单配置
 void handleFilterSave() {
   if (!checkAuth()) return;

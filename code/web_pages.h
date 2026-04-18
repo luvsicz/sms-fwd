@@ -182,6 +182,9 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div class="stat-box"><div class="stat-num" id="ssBoot">-</div><div class="stat-tag">重启</div></div>
       <div class="stat-box"><div class="stat-num" id="ssPushOk">-</div><div class="stat-tag">推送成功</div></div>
     </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-w" onclick="if(confirm('确定要重置统计数据吗？\n将清零收信、发信、来电、推送统计，保留启动次数。'))act('resetStats')">重置统计数据</button>
+    </div>
   </div>
 
   <div class="card">
@@ -247,6 +250,8 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div style="display:flex;gap:8px;align-items:center">
         <div class="badge b-ok" id="histModeSms" onclick="setHistMode('sms')" style="cursor:pointer">短信</div>
         <div class="badge b-wait" id="histModeCall" onclick="setHistMode('call')" style="cursor:pointer">来电</div>
+        <div class="badge b-warn" onclick="clearHistory('sms')" style="cursor:pointer">清空短信</div>
+        <div class="badge b-warn" onclick="clearHistory('call')" style="cursor:pointer">清空来电</div>
         <div class="badge b-wait" onclick="loadHist()" style="cursor:pointer">刷新</div>
       </div>
     </div>
@@ -672,6 +677,10 @@ function autoLoad(){
 
 function act(t){
   if(t==='reboot'){postJ('/restart',{},d=>toast(d.message));return}
+  if(t==='resetStats'){
+    postJ('/resetstats',{},d=>{toast(d.message);autoLoad()});
+    return
+  }
   if(t==='sms'){
     var p=$('sPh').value,x=$('sTx').value;
     if(!p||!x)return toast('请填写号码和内容');
@@ -684,6 +693,24 @@ function act(t){
         l.innerText=d.message;l.style.color=d.success?'#15803d':'#b91c1c';
     });
   }
+}
+
+function clearHistory(type){
+  var isCall=type==='call';
+  var targetText=isCall?'来电记录':'短信记录';
+  var api=isCall?'/clearcallhistory':'/clearsmshistory';
+  if(!confirm('确定要清空'+targetText+'吗？\n此操作不可恢复。')) return;
+  postJ(api,{},d=>{
+    toast(d.message||('已清空'+targetText));
+    if(isCall){
+      callData=[];
+    }else{
+      smsData=[];
+    }
+    curContact=null;
+    loadHist();
+    autoLoad();
+  });
 }
 
 

@@ -299,6 +299,26 @@ String getSmsHistory() {
   return result;
 }
 
+// 清空短信历史记录
+void clearSmsHistory() {
+  if (SPIFFS.exists("/sms.txt")) {
+    SPIFFS.remove("/sms.txt");
+  }
+
+  File f = SPIFFS.open("/sms.txt", "w");
+  if (f) {
+    f.close();
+  }
+
+  for (int i = 0; i < MAX_SMS_HISTORY; i++) {
+    smsHistory[i].valid = false;
+    smsHistory[i].sender = "";
+    smsHistory[i].message = "";
+    smsHistory[i].timestamp = "";
+  }
+  smsHistoryIndex = 0;
+}
+
 // 添加来电到历史记录（SPIFFS 存储）
 void addCallToHistory(const char* caller, const char* timestamp) {
   stats.callsReceived++;
@@ -358,6 +378,18 @@ String getCallHistory() {
   }
   result += "]";
   return result;
+}
+
+// 清空来电历史记录
+void clearCallHistory() {
+  if (SPIFFS.exists("/calls.txt")) {
+    SPIFFS.remove("/calls.txt");
+  }
+
+  File f = SPIFFS.open("/calls.txt", "w");
+  if (f) {
+    f.close();
+  }
 }
 
 // 标准化号码（去除 +、空格、-，以及开头的国家区号 86）
@@ -500,3 +532,18 @@ void loadStats() {
   preferences.putULong("boots", stats.bootCount);
   preferences.end();
 }
+
+// 重置统计数据，可选择保留启动次数
+void resetStats(bool preserveBootCount) {
+  unsigned long bootCount = preserveBootCount ? stats.bootCount : 0;
+
+  stats.smsReceived = 0;
+  stats.smsSent = 0;
+  stats.callsReceived = 0;
+  stats.pushSuccess = 0;
+  stats.pushFailed = 0;
+  stats.bootCount = bootCount;
+
+  saveStats();
+}
+
