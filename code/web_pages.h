@@ -250,6 +250,8 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div style="display:flex;gap:8px;align-items:center">
         <div class="badge b-ok" id="histModeSms" onclick="setHistMode('sms')" style="cursor:pointer">短信</div>
         <div class="badge b-wait" id="histModeCall" onclick="setHistMode('call')" style="cursor:pointer">来电</div>
+          <div class="badge b-warn" onclick="cleanupHistory('sms')" style="cursor:pointer">清洗短信</div>
+          <div class="badge b-warn" onclick="cleanupHistory('call')" style="cursor:pointer">清洗来电</div>
         <div class="badge b-warn" onclick="clearHistory('sms')" style="cursor:pointer">清空短信</div>
         <div class="badge b-warn" onclick="clearHistory('call')" style="cursor:pointer">清空来电</div>
         <div class="badge b-wait" onclick="loadHist()" style="cursor:pointer">刷新</div>
@@ -711,6 +713,20 @@ function clearHistory(type){
     loadHist();
     autoLoad();
   });
+}
+
+function cleanupHistory(type){
+  var isCall=type==='call';
+  var targetText=isCall?'来电记录':'短信记录';
+  if(!confirm('确定要清洗'+targetText+'中的损坏历史行吗？\n会保留看起来合法的记录，删除无法解析的旧脏数据。')) return;
+  fetch('/cleanhistory?type='+encodeURIComponent(type),{method:'POST'})
+  .then(r=>r.json())
+  .then(d=>{
+    toast((d.message||('已清洗'+targetText))+'，保留'+(d.kept||0)+'条，删除'+(d.removed||0)+'条');
+    loadHist();
+    autoLoad();
+  })
+  .catch(e=>toast('清洗失败: '+e));
 }
 
 

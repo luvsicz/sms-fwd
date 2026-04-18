@@ -11,24 +11,19 @@
 // URL 编码辅助函数
 String urlEncode(const String& str) {
   String encoded = "";
-  char c;
-  char code0;
-  char code1;
   for (unsigned int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
+    uint8_t c = (uint8_t)str.charAt(i);
     if (c == ' ') {
       encoded += '+';
-    } else if (isalnum(c)) {
-      encoded += c;
+    } else if ((c >= 'A' && c <= 'Z') ||
+               (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') ||
+               c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
     } else {
-      code1 = (c & 0xf) + '0';
-      if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
-      c = (c >> 4) & 0xf;
-      code0 = c + '0';
-      if (c > 9) code0 = c - 10 + 'A';
       encoded += '%';
-      encoded += code0;
-      encoded += code1;
+      encoded += "0123456789ABCDEF"[(c >> 4) & 0x0F];
+      encoded += "0123456789ABCDEF"[c & 0x0F];
     }
   }
   return encoded;
@@ -38,13 +33,21 @@ String urlEncode(const String& str) {
 String jsonEscape(const String& str) {
   String result = "";
   for (unsigned int i = 0; i < str.length(); i++) {
-    char c = str.charAt(i);
+    uint8_t c = (uint8_t)str.charAt(i);
     if (c == '"') result += "\\\"";
     else if (c == '\\') result += "\\\\";
     else if (c == '\n') result += "\\n";
     else if (c == '\r') result += "\\r";
     else if (c == '\t') result += "\\t";
-    else result += c;
+    else if (c == '\b') result += "\\b";
+    else if (c == '\f') result += "\\f";
+    else if (c < 0x20) {
+      char buf[7];
+      snprintf(buf, sizeof(buf), "\\u%04X", c);
+      result += buf;
+    } else {
+      result += (char)c;
+    }
   }
   return result;
 }

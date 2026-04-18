@@ -595,6 +595,34 @@ void handleClearCallHistory() {
   server.send(200, "application/json", "{\"success\":true,\"message\":\"来电记录已清空，对应统计已归零\"}");
 }
 
+// 清洗旧历史记录中的损坏行
+void handleCleanupHistory() {
+  if (!checkAuth()) return;
+
+  String type = server.arg("type");
+  HistoryCleanupResult result = {0, 0};
+  String targetName = "";
+
+  if (type == "sms") {
+    result = cleanupSmsHistory();
+    targetName = "短信历史";
+  } else if (type == "call") {
+    result = cleanupCallHistory();
+    targetName = "来电历史";
+  } else {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"参数错误：type 仅支持 sms 或 call\"}");
+    return;
+  }
+
+  String json = "{";
+  json += "\"success\":true,";
+  json += "\"message\":\"" + targetName + "清洗完成\",";
+  json += "\"kept\":" + String(result.kept) + ",";
+  json += "\"removed\":" + String(result.removed);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 // 保存黑白名单配置
 void handleFilterSave() {
   if (!checkAuth()) return;

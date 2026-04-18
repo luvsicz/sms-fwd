@@ -62,6 +62,11 @@ struct Statistics {
   unsigned long bootCount;      // 启动次数
 };
 
+struct HistoryCleanupResult {
+  int kept;
+  int removed;
+};
+
 // WiFi 配置结构
 #define MAX_WIFI_NETWORKS 3
 struct WifiNetwork {
@@ -179,6 +184,8 @@ void addSmsToHistory(const char* sender, const char* message, const char* timest
 String getSmsHistory();
 void addCallToHistory(const char* caller, const char* timestamp);
 String getCallHistory();
+HistoryCleanupResult cleanupSmsHistory();
+HistoryCleanupResult cleanupCallHistory();
 void clearSmsHistory();
 void clearCallHistory();
 String normalizePhoneNumber(const String& rawNumber);

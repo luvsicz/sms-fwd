@@ -49,6 +49,26 @@ String cleanSmsContent(const String& text) {
   return cleaned;
 }
 
+// 清理可能破坏 JSON / Web / MQTT 的控制字符，尽量保留可见文本
+String sanitizeTextPayload(const String& text) {
+  String sanitized = "";
+  sanitized.reserve(text.length());
+
+  for (unsigned int i = 0; i < text.length(); i++) {
+    uint8_t c = (uint8_t)text.charAt(i);
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n' || c == '\t' || c >= 0x20) {
+      sanitized += (char)c;
+    }
+  }
+
+  return sanitized;
+}
+
 // 格式化时间戳（从 PDU 格式转为可读格式，转换为中国时区 UTC+8）
 // 输入: 25121615142620 (YYMMDDHHMMSSZZ) 其中 ZZ 是时区偏移（以15分钟为单位）
 // 输出: 2025-12-16 15:14:26
@@ -336,7 +356,7 @@ bool sendSMS(const char* phoneNumber, const char* message) {
 // 处理最终的短信内容（管理员命令检查和转发）
 void processSmsContent(const char* sender, const char* text, const char* timestamp) {
   // 清理短信内容和格式化时间
-  String cleanedText = cleanSmsContent(String(text));
+  String cleanedText = sanitizeTextPayload(cleanSmsContent(String(text)));
   String formattedTime = formatTimestamp(String(timestamp));
   String verifyCode = extractVerifyCode(cleanedText);
   
@@ -422,6 +442,47 @@ bool isHexString(const String& str) {
 }
 
 // ===== PDU fallback 解析辅助 =====
+bool isLikelyValidUtf8(const String& text) {
+  int expectedContinuation = 0;
+
+  for (unsigned int i = 0; i < text.length(); i++) {
+    uint8_t c = (uint8_t)text.charAt(i);
+
+    if (expectedContinuation == 0) {
+      if (c <= 0x7F) {
+        continue;
+      }
+      if (c >= 0xC2 && c <= 0xDF) {
+        expectedContinuation = 1;
+      } else if (c >= 0xE0 && c <= 0xEF) {
+        expectedContinuation = 2;
+      } else if (c >= 0xF0 && c <= 0xF4) {
+        expectedContinuation = 3;
+      } else {
+        return false;
+      }
+    } else {
+      if ((c & 0xC0) != 0x80) {
+        return false;
+      }
+      expectedContinuation--;
+    }
+  }
+
+  return expectedContinuation == 0;
+}
+
+bool containsReplacementCharUtf8(const String& text) {
+  for (unsigned int i = 0; i + 2 < text.length(); i++) {
+    if ((uint8_t)text.charAt(i) == 0xEF &&
+        (uint8_t)text.charAt(i + 1) == 0xBF &&
+        (uint8_t)text.charAt(i + 2) == 0xBD) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int hexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -465,8 +526,136 @@ String decodeUcs2Hex(const String& hex) {
   String out = "";
   for (int i = 0; i + 3 < hex.length(); i += 4) {
     uint16_t cp = ((uint16_t)hexByteAt(hex, i) << 8) | hexByteAt(hex, i + 2);
+    if (cp >= 0xD800 && cp <= 0xDFFF) {
+      out += "?";
+      continue;
+    }
     appendUtf8(out, cp);
   }
+  return out;
+}
+
+String gsm7ToUtf8(uint8_t septet) {
+  switch (septet) {
+    case 0x00: return "@";
+    case 0x01: return "£";
+    case 0x02: return "$";
+    case 0x03: return "¥";
+    case 0x04: return "è";
+    case 0x05: return "é";
+    case 0x06: return "ù";
+    case 0x07: return "ì";
+    case 0x08: return "ò";
+    case 0x09: return "Ç";
+    case 0x0A: return "\n";
+    case 0x0B: return "Ø";
+    case 0x0C: return "ø";
+    case 0x0D: return "\r";
+    case 0x0E: return "Å";
+    case 0x0F: return "å";
+    case 0x10: return "Δ";
+    case 0x11: return "_";
+    case 0x12: return "Φ";
+    case 0x13: return "Γ";
+    case 0x14: return "Λ";
+    case 0x15: return "Ω";
+    case 0x16: return "Π";
+    case 0x17: return "Ψ";
+    case 0x18: return "Σ";
+    case 0x19: return "Θ";
+    case 0x1A: return "Ξ";
+    case 0x1B: return "";
+    case 0x1C: return "Æ";
+    case 0x1D: return "æ";
+    case 0x1E: return "ß";
+    case 0x1F: return "É";
+    case 0x20: return " ";
+    case 0x21: return "!";
+    case 0x22: return "\"";
+    case 0x23: return "#";
+    case 0x24: return "¤";
+    case 0x25: return "%";
+    case 0x26: return "&";
+    case 0x27: return "'";
+    case 0x28: return "(";
+    case 0x29: return ")";
+    case 0x2A: return "*";
+    case 0x2B: return "+";
+    case 0x2C: return ",";
+    case 0x2D: return "-";
+    case 0x2E: return ".";
+    case 0x2F: return "/";
+    case 0x3A: return ":";
+    case 0x3B: return ";";
+    case 0x3C: return "<";
+    case 0x3D: return "=";
+    case 0x3E: return ">";
+    case 0x3F: return "?";
+    case 0x40: return "¡";
+    case 0x5B: return "Ä";
+    case 0x5C: return "Ö";
+    case 0x5D: return "Ñ";
+    case 0x5E: return "Ü";
+    case 0x5F: return "§";
+    case 0x60: return "¿";
+    case 0x7B: return "ä";
+    case 0x7C: return "ö";
+    case 0x7D: return "ñ";
+    case 0x7E: return "ü";
+    case 0x7F: return "à";
+    default:
+      return String((char)septet);
+  }
+}
+
+String gsm7ExtToUtf8(uint8_t septet) {
+  switch (septet) {
+    case 0x0A: return "\f";
+    case 0x14: return "^";
+    case 0x28: return "{";
+    case 0x29: return "}";
+    case 0x2F: return "\\";
+    case 0x3C: return "[";
+    case 0x3D: return "~";
+    case 0x3E: return "]";
+    case 0x40: return "|";
+    case 0x65: return "€";
+    default: return "?";
+  }
+}
+
+String decodeGsm7Bit(const String& hex, int septetCount, int skipSeptets) {
+  String out = "";
+  int totalBytes = hex.length() / 2;
+  int bitOffset = skipSeptets * 7;
+  bool escapeNext = false;
+
+  for (int i = 0; i < septetCount; i++) {
+    int bitIndex = bitOffset + i * 7;
+    int byteIndex = bitIndex / 8;
+    int shift = bitIndex % 8;
+
+    if (byteIndex >= totalBytes) break;
+
+    uint16_t chunk = hexByteAt(hex, byteIndex * 2);
+    if (byteIndex + 1 < totalBytes) {
+      chunk |= ((uint16_t)hexByteAt(hex, (byteIndex + 1) * 2) << 8);
+    }
+
+    uint8_t septet = (chunk >> shift) & 0x7F;
+    if (escapeNext) {
+      out += gsm7ExtToUtf8(septet);
+      escapeNext = false;
+      continue;
+    }
+
+    if (septet == 0x1B) {
+      escapeNext = true;
+      continue;
+    }
+    out += gsm7ToUtf8(septet);
+  }
+
   return out;
 }
 
@@ -482,7 +671,7 @@ String decodeScts(const String& sctsHex) {
   return "20" + yy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss;
 }
 
-// fallback 解析 SMS-DELIVER PDU（主要支持 DCS=08 / UCS2）
+// fallback 解析 SMS-DELIVER PDU（支持 DCS=00 / GSM7 及 DCS=08 / UCS2）
 bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   out.sender = "";
   out.timestamp = "";
@@ -538,8 +727,7 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   int udl = hexByteAt(pduHex, pos);
   pos += 2;
 
-  // 当前 fallback 仅支持 UCS2
-  if (dcs != 0x08) {
+  if (dcs != 0x00 && dcs != 0x08) {
     Serial.printf("fallback parser: 暂不支持 DCS=0x%02X\n", dcs);
     return false;
   }
@@ -551,9 +739,10 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   bool hasUdh = (fo & 0x40) != 0;
   int textStart = 0;
 
+  int udhTotalBytes = 0;
   if (hasUdh) {
     int udhl = hexByteAt(udHex, 0);  // 不含自身长度字节
-    int udhTotalBytes = 1 + udhl;
+    udhTotalBytes = 1 + udhl;
     textStart = udhTotalBytes * 2;
 
     int p = 2; // 跳过 UDHL
@@ -580,10 +769,29 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   }
 
   if (textStart > udHex.length()) return false;
-  String textHex = udHex.substring(textStart);
-  out.text = decodeUcs2Hex(textHex);
+
+  if (dcs == 0x08) {
+    String textHex = udHex.substring(textStart);
+    out.text = decodeUcs2Hex(textHex);
+  } else {
+    int skipSeptets = 0;
+    if (hasUdh) {
+      skipSeptets = (udhTotalBytes * 8 + 6) / 7;
+    }
+    int textSeptets = udl - skipSeptets;
+    if (textSeptets < 0) textSeptets = 0;
+    out.text = decodeGsm7Bit(udHex, textSeptets, skipSeptets);
+  }
 
   return true;
+}
+
+bool shouldUseFallbackDecodedText(const String& pdulibText, const String& fallbackText) {
+  if (fallbackText.length() == 0) return false;
+  if (pdulibText.length() == 0) return true;
+  if (!isLikelyValidUtf8(pdulibText) && isLikelyValidUtf8(fallbackText)) return true;
+  if (containsReplacementCharUtf8(pdulibText) && !containsReplacementCharUtf8(fallbackText)) return true;
+  return false;
 }
 
 // 处理 URC 和 PDU
@@ -628,6 +836,9 @@ void checkSerial1URC() {
       int partNumber = 0;
       int totalParts = 1;
 
+      bool fallbackDecoded = false;
+      DecodedPDU fallbackSms;
+
       // 先尝试 pdulib
       if (pdu.decodePDU(line.c_str())) {
         decoded = true;
@@ -641,20 +852,39 @@ void checkSerial1URC() {
         totalParts = concatInfo[2];
 
         Serial.println("✓ pdulib PDU解析成功");
+        if (!isLikelyValidUtf8(text) || containsReplacementCharUtf8(text)) {
+          Serial.println("⚠️ pdulib文本疑似乱码，尝试fallback复核...");
+          if (decodeDeliverPDUFallback(line, fallbackSms)) {
+            fallbackDecoded = true;
+            if (shouldUseFallbackDecodedText(text, fallbackSms.text)) {
+              sender = fallbackSms.sender.length() > 0 ? fallbackSms.sender : sender;
+              timestamp = fallbackSms.timestamp.length() > 0 ? fallbackSms.timestamp : timestamp;
+              text = fallbackSms.text;
+              refNumber = fallbackSms.refNumber;
+              partNumber = fallbackSms.partNumber;
+              totalParts = fallbackSms.totalParts;
+              Serial.println("✓ 使用fallback文本替换pdulib结果");
+            }
+          }
+        }
       } else {
         // fallback
         Serial.println("⚠️ pdulib解析失败，尝试fallback解析...");
-        DecodedPDU sms;
-        if (decodeDeliverPDUFallback(line, sms)) {
+        if (decodeDeliverPDUFallback(line, fallbackSms)) {
+          fallbackDecoded = true;
           decoded = true;
-          sender = sms.sender;
-          timestamp = sms.timestamp;
-          text = sms.text;
-          refNumber = sms.refNumber;
-          partNumber = sms.partNumber;
-          totalParts = sms.totalParts;
+          sender = fallbackSms.sender;
+          timestamp = fallbackSms.timestamp;
+          text = fallbackSms.text;
+          refNumber = fallbackSms.refNumber;
+          partNumber = fallbackSms.partNumber;
+          totalParts = fallbackSms.totalParts;
           Serial.println("✓ fallback PDU解析成功");
         }
+      }
+
+      if (decoded && !fallbackDecoded && (!isLikelyValidUtf8(text) || containsReplacementCharUtf8(text))) {
+        Serial.println("⚠️ 当前解码文本仍疑似包含乱码，请关注模块编码设置或补充更多 DCS fallback 支持");
       }
 
       if (!decoded) {

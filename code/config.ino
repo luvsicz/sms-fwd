@@ -2,6 +2,8 @@
  * config.ino - 配置相关函数实现
  */
 
+#include "push_service.h"
+
 // 短信历史和统计的全局变量定义
 SmsRecord smsHistory[MAX_SMS_HISTORY];
 int smsHistoryIndex = 0;
@@ -226,20 +228,85 @@ void initSmsStorage() {
   }
 }
 
+bool isLikelyValidHistoryJsonLine(const String& line) {
+  String trimmed = line;
+  trimmed.trim();
+  if (trimmed.length() < 6) return false;
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+
+  int quoteCount = 0;
+  bool escaping = false;
+  for (unsigned int i = 0; i < trimmed.length(); i++) {
+    char c = trimmed.charAt(i);
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaping = true;
+      continue;
+    }
+    if (c == '"') quoteCount++;
+    if ((uint8_t)c < 0x20 && c != '\t') return false;
+  }
+
+  return (quoteCount % 2) == 0;
+}
+
+HistoryCleanupResult cleanupHistoryFile(const char* path) {
+  HistoryCleanupResult result = {0, 0};
+
+  File src = SPIFFS.open(path, "r");
+  if (!src) {
+    return result;
+  }
+
+  String tempPath = String(path) + ".tmp";
+  File dst = SPIFFS.open(tempPath, "w");
+  if (!dst) {
+    src.close();
+    Serial.println("历史清洗失败：无法创建临时文件");
+    return result;
+  }
+
+  while (src.available()) {
+    String line = src.readStringUntil('\n');
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (isLikelyValidHistoryJsonLine(line)) {
+      dst.println(line);
+      result.kept++;
+    } else {
+      result.removed++;
+    }
+  }
+
+  src.close();
+  dst.close();
+
+  SPIFFS.remove(path);
+  if (!SPIFFS.rename(tempPath, path)) {
+    Serial.println("历史清洗失败：无法替换原文件");
+    SPIFFS.remove(tempPath);
+    result.kept = 0;
+    result.removed = 0;
+  }
+
+  return result;
+}
+
 // 添加短信到历史记录（SPIFFS 存储）
 void addSmsToHistory(const char* sender, const char* message, const char* timestamp) {
   stats.smsReceived++;
   
   // 构建 JSON 行
-  String line = "{\"t\":\"" + String(timestamp) + "\",\"s\":\"" + String(sender) + "\",\"m\":\"";
-  // 转义消息内容中的引号和换行
-  String msg = String(message);
-  msg.replace("\\", "\\\\");
-  msg.replace("\"", "\\\"");
-  msg.replace("\n", "\\n");
-  msg.replace("\r", "");
-  line += msg.substring(0, 200) + "\"}\n";  // 限制消息长度
-  
+  String safeTimestamp = jsonEscape(String(timestamp));
+  String safeSender = jsonEscape(String(sender));
+  String safeMessage = jsonEscape(String(message).substring(0, 200));
+  String line = "{\"t\":\"" + safeTimestamp + "\",\"s\":\"" + safeSender + "\",\"m\":\"" + safeMessage + "\"}\n";
+
   // 检查文件大小，超过 50KB 则清理旧数据
   File f = SPIFFS.open("/sms.txt", "r");
   size_t fileSize = f ? f.size() : 0;
@@ -282,8 +349,10 @@ String getSmsHistory() {
   std::vector<String> lines;
   while (f.available()) {
     String line = f.readStringUntil('\n');
-    if (line.length() > 10) {
+    if (line.length() > 10 && isLikelyValidHistoryJsonLine(line)) {
       lines.push_back(line);
+    } else if (line.length() > 0) {
+      Serial.println("跳过损坏的短信历史行");
     }
   }
   f.close();
@@ -323,11 +392,10 @@ void clearSmsHistory() {
 void addCallToHistory(const char* caller, const char* timestamp) {
   stats.callsReceived++;
 
-  String safeCaller = String(caller);
-  safeCaller.replace("\\", "\\\\");
-  safeCaller.replace("\"", "\\\"");
+  String safeTimestamp = jsonEscape(String(timestamp));
+  String safeCaller = jsonEscape(String(caller));
 
-  String line = "{\"t\":\"" + String(timestamp) + "\",\"n\":\"" + safeCaller + "\"}\n";
+  String line = "{\"t\":\"" + safeTimestamp + "\",\"n\":\"" + safeCaller + "\"}\n";
 
   File f = SPIFFS.open("/calls.txt", "r");
   size_t fileSize = f ? f.size() : 0;
@@ -364,8 +432,10 @@ String getCallHistory() {
   std::vector<String> lines;
   while (f.available()) {
     String line = f.readStringUntil('\n');
-    if (line.length() > 8) {
+    if (line.length() > 8 && isLikelyValidHistoryJsonLine(line)) {
       lines.push_back(line);
+    } else if (line.length() > 0) {
+      Serial.println("跳过损坏的来电历史行");
     }
   }
   f.close();
@@ -378,6 +448,14 @@ String getCallHistory() {
   }
   result += "]";
   return result;
+}
+
+HistoryCleanupResult cleanupSmsHistory() {
+  return cleanupHistoryFile("/sms.txt");
+}
+
+HistoryCleanupResult cleanupCallHistory() {
+  return cleanupHistoryFile("/calls.txt");
 }
 
 // 清空来电历史记录
