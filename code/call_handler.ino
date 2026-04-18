@@ -91,6 +91,8 @@ void processIncomingCall(const char* caller) {
   }
 
   String timestamp = getCurrentTimeString();
+  addCallToHistory(callerStr.c_str(), timestamp.c_str());
+
   String pushMessage = "[来电通知] 来电号码: " + callerStr;
   sendSMSToServer(callerStr.c_str(), pushMessage.c_str(), timestamp.c_str());
 

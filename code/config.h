@@ -56,6 +56,7 @@ struct SmsRecord {
 struct Statistics {
   unsigned long smsReceived;    // 收到短信数
   unsigned long smsSent;        // 发送短信数
+  unsigned long callsReceived;  // 收到来电数
   unsigned long pushSuccess;    // 推送成功数
   unsigned long pushFailed;     // 推送失败数
   unsigned long bootCount;      // 启动次数
@@ -176,6 +177,8 @@ String getDeviceUrl();
 void initSmsStorage();
 void addSmsToHistory(const char* sender, const char* message, const char* timestamp);
 String getSmsHistory();
+void addCallToHistory(const char* caller, const char* timestamp);
+String getCallHistory();
 String normalizePhoneNumber(const String& rawNumber);
 bool phoneNumbersMatch(const String& senderNum, const String& filterNum);
 bool isNumberFiltered(const char* number);

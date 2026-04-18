@@ -87,8 +87,28 @@ void handleRoot() {
   String html = String(htmlPage);
   html.replace("%COMMON_CSS%", commonCss);
   // html.replace("%COMMON_JS%", commonJs); // JS 已合并
-  html.replace("%IP%", WiFi.localIP().toString());
-  
+  wifi_mode_t wifiMode = WiFi.getMode();
+  bool apActive = (wifiMode & WIFI_AP) != 0;
+  bool staConnected = WiFi.status() == WL_CONNECTED;
+  String displayIp = apActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  String wifiModeBadge = apActive ? "<span class=\"badge b-warn\">AP模式</span>" : "<span class=\"badge b-ok\">STA模式</span>";
+  String wifiInfoLine = "";
+
+  if (apActive) {
+    wifiInfoLine = "热点名: SMS-Forwarder-AP<br>热点IP: " + WiFi.softAPIP().toString();
+    if (staConnected) {
+      wifiInfoLine += "<br>上游WiFi: " + WiFi.SSID();
+    }
+  } else if (staConnected) {
+    wifiInfoLine = "已连接WiFi: " + WiFi.SSID() + "<br>设备IP: " + WiFi.localIP().toString();
+  } else {
+    wifiInfoLine = "WiFi未连接";
+  }
+
+  html.replace("%IP%", displayIp);
+  html.replace("%WIFI_MODE_BADGE%", wifiModeBadge);
+  html.replace("%WIFI_INFO_LINE%", wifiInfoLine);
+
   // 1. MQTT 状态 (概览页用)
   String mqttStatusText = config.mqttEnabled ? (mqttClient.connected() ? "已连接" : "未连接") : "未启用";
   String mqttClass = config.mqttEnabled ? (mqttClient.connected() ? "b-ok" : "b-err") : "b-wait";
@@ -274,14 +294,27 @@ void handleSave() {
   // 喂狗防止超时
   esp_task_wdt_reset();
   yield();
-  
+
+  bool wifiChanged = false;
+
   // WiFi 网络配置
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
     String prefix = "wifi" + String(i);
     String newSsid = server.arg(prefix + "ssid");
     String newPass = server.arg(prefix + "pass");
     String newEn = server.arg(prefix + "en");
-    
+    bool nextEnabled = (newEn == "true");
+
+    if (newSsid.length() > 0 && newSsid != config.wifiNetworks[i].ssid) {
+      wifiChanged = true;
+    }
+    if (newPass.length() > 0 && newPass != config.wifiNetworks[i].password) {
+      wifiChanged = true;
+    }
+    if (nextEnabled != config.wifiNetworks[i].enabled) {
+      wifiChanged = true;
+    }
+
     // 只有当 SSID 非空时才更新（避免清空已保存的配置）
     if (newSsid.length() > 0) {
       config.wifiNetworks[i].ssid = newSsid;
@@ -291,8 +324,8 @@ void handleSave() {
       config.wifiNetworks[i].password = newPass;
     }
     // enabled 状态始终更新
-    config.wifiNetworks[i].enabled = (newEn == "true");
-    
+    config.wifiNetworks[i].enabled = nextEnabled;
+
     // 调试输出
     Serial.printf("WiFi%d: SSID=%s, Pass=%s, En=%d\n", 
       i, config.wifiNetworks[i].ssid.c_str(), 
@@ -383,9 +416,11 @@ void handleSave() {
   esp_task_wdt_reset();
   yield();
   configValid = isConfigValid();
-  
+
+  bool needRestart = wifiChanged || (WiFi.getMode() == WIFI_AP);
+
   // 返回成功响应，让前端询问用户是否重启
-  String json = "{\"success\":true,\"message\":\"配置已保存\",\"needRestart\":true}";
+  String json = "{\"success\":true,\"message\":\"配置已保存\",\"needRestart\":" + String(needRestart ? "true" : "false") + "}";
   server.send(200, "application/json", json);
 }
 
@@ -503,8 +538,13 @@ void handleSmsHistory() {
   if (!checkAuth()) return;
   
   String historyJson = getSmsHistory();
-  String json = "{\"history\":" + historyJson + "}";
-  
+  String callHistoryJson = getCallHistory();
+  String json = "{";
+  json += "\"history\":" + historyJson + ",";
+  json += "\"smsHistory\":" + historyJson + ",";
+  json += "\"callHistory\":" + callHistoryJson;
+  json += "}";
+
   server.send(200, "application/json", json);
 }
 
@@ -515,6 +555,7 @@ void handleStats() {
   String json = "{";
   json += "\"received\":" + String(stats.smsReceived) + ",";
   json += "\"sent\":" + String(stats.smsSent) + ",";
+  json += "\"calls\":" + String(stats.callsReceived) + ",";
   json += "\"pushOk\":" + String(stats.pushSuccess) + ",";
   json += "\"pushFail\":" + String(stats.pushFailed) + ",";
   json += "\"boots\":" + String(stats.bootCount) + ",";

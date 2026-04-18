@@ -123,16 +123,39 @@ void setup() {
   }
   
   Serial.println("连接WiFi...");
-  while (WiFiMulti.run() != WL_CONNECTED) blink_short();
-  Serial.printf("WiFi已连接: %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  
+  WiFi.mode(WIFI_STA);
+  unsigned long wifiStart = millis();
+  bool wifiConnected = false;
+  while (millis() - wifiStart < 30000) {
+    if (WiFiMulti.run() == WL_CONNECTED) {
+      wifiConnected = true;
+      break;
+    }
+    blink_short();
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (wifiConnected) {
+    Serial.printf("WiFi已连接: %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("WiFi连接超时，切换到AP模式...");
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_AP);
+    String apName = "SMS-Forwarder-AP";
+    WiFi.softAP(apName.c_str());
+    Serial.printf("AP已启动: %s, IP: %s\n", apName.c_str(), WiFi.softAPIP().toString().c_str());
+  }
+
   // 启动 mDNS 服务
-  if (MDNS.begin(MDNS_HOSTNAME)) {
+  if (wifiConnected && MDNS.begin(MDNS_HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);  // 注册 HTTP 服务
     Serial.println("mDNS 已启动");
     Serial.printf("访问地址: http://%s.local 或 http://%s\n", MDNS_HOSTNAME, WiFi.localIP().toString().c_str());
-  } else {
+  } else if (wifiConnected) {
     Serial.println("mDNS 启动失败，请使用 IP 访问");
+  } else {
+    Serial.printf("请连接到热点后访问: http://%s\n", WiFi.softAPIP().toString().c_str());
   }
   
   // 启动 HTTP 服务器

@@ -176,7 +176,11 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
     <div class="grid-3">
       <div class="stat-box"><div class="stat-num" id="ssRecv">-</div><div class="stat-tag">收信</div></div>
       <div class="stat-box"><div class="stat-num" id="ssSent">-</div><div class="stat-tag">发信</div></div>
+      <div class="stat-box"><div class="stat-num" id="ssCall">-</div><div class="stat-tag">来电</div></div>
+    </div>
+    <div class="grid-2" style="margin-top:12px">
       <div class="stat-box"><div class="stat-num" id="ssBoot">-</div><div class="stat-tag">重启</div></div>
+      <div class="stat-box"><div class="stat-num" id="ssPushOk">-</div><div class="stat-tag">推送成功</div></div>
     </div>
   </div>
 
@@ -186,7 +190,11 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div class="stat-box" style="text-align:left">
         <div class="stat-tag">WiFi 信号</div>
         <div style="font-weight:700" id="wifiS">- dBm</div>
-        <div class="badge b-ok" id="ipStr">%IP%</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px">
+          <div class="badge b-ok" id="ipStr">%IP%</div>
+          %WIFI_MODE_BADGE%
+        </div>
+        <div style="font-size:0.8em;color:var(--text-light);margin-top:6px;word-break:break-all" id="wifiInfo">%WIFI_INFO_LINE%</div>
       </div>
       <div class="stat-box" style="text-align:left">
         <div class="stat-tag">MQTT 状态</div>
@@ -236,7 +244,11 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
   <div class="card" style="padding:0;overflow:hidden">
     <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:#fafbfc">
       <span style="font-weight:700;font-size:1.1em">短信历史</span>
-      <div class="badge b-wait" onclick="loadHist()" style="cursor:pointer">刷新</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <div class="badge b-ok" id="histModeSms" onclick="setHistMode('sms')" style="cursor:pointer">短信</div>
+        <div class="badge b-wait" id="histModeCall" onclick="setHistMode('call')" style="cursor:pointer">来电</div>
+        <div class="badge b-wait" onclick="loadHist()" style="cursor:pointer">刷新</div>
+      </div>
     </div>
     <div class="sms-container" id="smsContainer">
       <div class="contact-list" id="contactList">
@@ -633,7 +645,11 @@ function upd(i){
 // 自动加载函数
 function autoLoad(){
   fetch('/stats').then(r=>r.json()).then(d=>{
-    $('ssRecv').innerText=d.received;$('ssSent').innerText=d.sent;$('ssBoot').innerText=d.boots;
+    $('ssRecv').innerText=d.received;
+    $('ssSent').innerText=d.sent;
+    $('ssCall').innerText=d.calls||0;
+    $('ssBoot').innerText=d.boots;
+    $('ssPushOk').innerText=d.pushOk||0;
     $('wifiS').innerText=d.wifiRssi+' dBm';
     var h=Math.floor(d.uptime/3600);
     $('upT').innerText='运行 '+h+' 小时 / 内存 '+(d.freeHeap/1024).toFixed(0)+'K';
@@ -673,7 +689,9 @@ function act(t){
 
 // 短信历史数据和当前选中的联系人
 var smsData=[];
+var callData=[];
 var curContact=null;
+var histMode='sms';
 // 颜色池
 const colors=['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#6366f1','#14b8a6'];
 function getAvatarColor(name){
@@ -686,25 +704,28 @@ function loadHist(){
   $('contactList').innerHTML='<div style="text-align:center;padding:20px;color:#94a3b8;font-size:0.85em">加载中...</div>';
   $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">💬</div><div>加载中...</div></div>';
   fetch('/history').then(r=>r.json()).then(d=>{
-    smsData=d.history||[];
-    if(smsData.length==0){
-      $('contactList').innerHTML='<div style="text-align:center;padding:30px 10px;color:#94a3b8;font-size:0.85em">暂无短信</div>';
-      $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">📭</div><div>暂无短信记录</div></div>';
+    smsData=d.smsHistory||d.history||[];
+    callData=d.callHistory||[];
+    var data=(histMode==='call') ? callData : smsData;
+    if(data.length==0){
+      $('contactList').innerHTML='<div style="text-align:center;padding:30px 10px;color:#94a3b8;font-size:0.85em">'+(histMode==='call'?'暂无来电':'暂无短信')+'</div>';
+      $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">📭</div><div>'+(histMode==='call'?'暂无来电记录':'暂无短信记录')+'</div></div>';
       return;
     }
-    // 按发送者分组
+    // 按号码分组
     var contacts={};
-    smsData.forEach(i=>{
-      if(!contacts[i.s])contacts[i.s]={name:i.s,msgs:[],lastTime:i.t};
-      contacts[i.s].msgs.push(i);
-      if(i.t>contacts[i.s].lastTime)contacts[i.s].lastTime=i.t;
+    data.forEach(i=>{
+      var key=(histMode==='call') ? i.n : i.s;
+      if(!contacts[key])contacts[key]={name:key,msgs:[],lastTime:i.t};
+      contacts[key].msgs.push(i);
+      if(i.t>contacts[key].lastTime)contacts[key].lastTime=i.t;
     });
     // 按最新消息时间排序联系人
     var sortedContacts=Object.values(contacts).sort((a,b)=>b.lastTime.localeCompare(a.lastTime));
     // 渲染联系人列表
     var h='';
     sortedContacts.forEach((c,idx)=>{
-      var preview=c.msgs[0].m.substring(0,20)+(c.msgs[0].m.length>20?'...':'');
+      var preview=(histMode==='call') ? ('来电 '+c.msgs.length+' 次') : (c.msgs[0].m.substring(0,20)+(c.msgs[0].m.length>20?'...':''));
       var shortTime=c.lastTime.substring(5,16);
       var avColor=getAvatarColor(c.name);
       var avText=c.name.replace('+','').substring(0,1);
@@ -733,6 +754,14 @@ function loadHist(){
   });
 }
 
+function setHistMode(mode){
+  histMode=mode;
+  $('histModeSms').className='badge '+(mode==='sms'?'b-ok':'b-wait');
+  $('histModeCall').className='badge '+(mode==='call'?'b-ok':'b-wait');
+  $('chatHeader').style.display='none';
+  loadHist();
+}
+
 function selContact(name){
   curContact=name;
   // 更新联系人列表高亮
@@ -740,7 +769,7 @@ function selContact(name){
     e.classList.toggle('active',e.dataset.name===name);
   });
   // 过滤该联系人的消息
-  var msgs=smsData.filter(i=>i.s===name);
+  var msgs=(histMode==='call') ? callData.filter(i=>i.n===name) : smsData.filter(i=>i.s===name);
   if(msgs.length===0){
     $('chatMessages').innerHTML='<div class="chat-empty">无消息</div>';
     return;
@@ -756,7 +785,7 @@ function selContact(name){
   // 移动端显示返回按钮和名字
   var backBtn='<div class="chat-back" onclick="backToList()"><svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="#64748b"/></svg></div>';
   $('chatTitle').innerHTML=`${backBtn}<div class="contact-avatar" style="width:28px;height:28px;font-size:0.8em;background:${avColor}">${avText}</div> ${name}`;
-  $('chatCount').innerText=msgs.length+'条短信';
+  $('chatCount').innerText=msgs.length + (histMode==='call' ? '次来电' : '条短信');
   $('chatCount').style.marginLeft='36px'; // 对齐调整
   
   // 移动端切换视图
@@ -775,10 +804,17 @@ function selContact(name){
       lastDay=day;
     }
     var time=m.t.substring(11,16);
-    h+=`<div class="msg-bubble msg-in">
-      <div>${m.m}</div>
-      <span class="msg-time">${time}</span>
-    </div>`;
+    if(histMode==='call'){
+      h+=`<div class="msg-bubble msg-in">
+        <div>📞 来电记录</div>
+        <span class="msg-time">${time}</span>
+      </div>`;
+    }else{
+      h+=`<div class="msg-bubble msg-in">
+        <div>${m.m}</div>
+        <span class="msg-time">${time}</span>
+      </div>`;
+    }
   });
   $('chatMessages').innerHTML=h;
   // 滚动到底部

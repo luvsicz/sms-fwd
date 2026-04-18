@@ -5,7 +5,7 @@
 // 短信历史和统计的全局变量定义
 SmsRecord smsHistory[MAX_SMS_HISTORY];
 int smsHistoryIndex = 0;
-Statistics stats = {0, 0, 0, 0, 0};
+Statistics stats = {0, 0, 0, 0, 0, 0};
 
 // 保存配置到 NVS
 void saveConfig() {
@@ -289,6 +289,67 @@ String getSmsHistory() {
   f.close();
   
   // 倒序输出最近100条
+  int count = 0;
+  for (int i = lines.size() - 1; i >= 0 && count < 100; i--, count++) {
+    if (!first) result += ",";
+    first = false;
+    result += lines[i];
+  }
+  result += "]";
+  return result;
+}
+
+// 添加来电到历史记录（SPIFFS 存储）
+void addCallToHistory(const char* caller, const char* timestamp) {
+  stats.callsReceived++;
+
+  String safeCaller = String(caller);
+  safeCaller.replace("\\", "\\\\");
+  safeCaller.replace("\"", "\\\"");
+
+  String line = "{\"t\":\"" + String(timestamp) + "\",\"n\":\"" + safeCaller + "\"}\n";
+
+  File f = SPIFFS.open("/calls.txt", "r");
+  size_t fileSize = f ? f.size() : 0;
+  f.close();
+
+  if (fileSize > 30000) {
+    f = SPIFFS.open("/calls.txt", "r");
+    f.seek(fileSize / 2);
+    String remaining = f.readString();
+    f.close();
+    int nl = remaining.indexOf('\n');
+    if (nl > 0) remaining = remaining.substring(nl + 1);
+    f = SPIFFS.open("/calls.txt", "w");
+    f.print(remaining);
+    f.close();
+  }
+
+  f = SPIFFS.open("/calls.txt", "a");
+  if (f) {
+    f.print(line);
+    f.close();
+  }
+
+  saveStats();
+}
+
+// 获取来电历史（返回 JSON 数组字符串）
+String getCallHistory() {
+  File f = SPIFFS.open("/calls.txt", "r");
+  if (!f) return "[]";
+
+  String result = "[";
+  bool first = true;
+  std::vector<String> lines;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    if (line.length() > 8) {
+      lines.push_back(line);
+    }
+  }
+  f.close();
+
   int count = 0;
   for (int i = lines.size() - 1; i >= 0 && count < 100; i--, count++) {
     if (!first) result += ",";
