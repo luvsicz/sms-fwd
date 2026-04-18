@@ -571,8 +571,8 @@ void handleStats() {
 void handleResetStats() {
   if (!checkAuth()) return;
 
-  resetStats(true);
-  server.send(200, "application/json", "{\"success\":true,\"message\":\"统计数据已重置（已保留启动次数）\"}");
+  resetStats(false);
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"统计数据已重置\"}");
 }
 
 // 清空短信历史记录

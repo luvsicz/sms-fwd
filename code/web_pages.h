@@ -183,7 +183,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div class="stat-box"><div class="stat-num" id="ssPushOk">-</div><div class="stat-tag">推送成功</div></div>
     </div>
     <div style="margin-top:12px">
-      <button class="btn btn-w" onclick="if(confirm('确定要重置统计数据吗？\n将清零收信、发信、来电、推送统计，保留启动次数。'))act('resetStats')">重置统计数据</button>
+      <button class="btn btn-w" onclick="if(confirm('确定要重置统计数据吗？\n将清零收信、发信、来电、推送统计和重启次数。'))act('resetStats')">重置统计数据</button>
     </div>
   </div>
 
