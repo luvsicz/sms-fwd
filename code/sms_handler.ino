@@ -598,6 +598,11 @@ void checkSerial1URC() {
     if (line.startsWith("+CMT:")) {
       Serial.println("检测到+CMT，等待PDU数据...");
       state = WAIT_PDU;
+      return;
+    }
+
+    if (handleCallUrc(line)) {
+      return;
     }
   } else if (state == WAIT_PDU) {
     // 跳过空行
@@ -716,6 +721,9 @@ void checkSerial1URC() {
     else {
       Serial.println("收到非PDU数据，返回IDLE状态");
       state = IDLE;
+
+      // 在 WAIT_PDU 期间也兼容来电 URC
+      handleCallUrc(line);
     }
   }
 }

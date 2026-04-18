@@ -7,6 +7,7 @@
 // 函数声明
 String urlEncode(const String& str);
 String jsonEscape(const String& str);
+String getCurrentTimeString();
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
 void sendSMSToServer(const char* sender, const char* message, const char* timestamp);
 void sendEmailNotification(const char* subject, const char* body);

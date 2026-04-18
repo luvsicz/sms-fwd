@@ -311,6 +311,18 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
   saveStats();
 }
 
+// 获取当前本地时间字符串（中国时区）
+String getCurrentTimeString() {
+  time_t now = time(nullptr);
+  if (now < 100000) return "设备时间未知";
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
 // 发送邮件通知函数
 void sendEmailNotification(const char* subject, const char* body) {
   if (!config.emailEnabled) return;
@@ -335,8 +347,10 @@ void sendEmailNotification(const char* subject, const char* body) {
     msg.headers.add(rfc822_to, to.c_str());
     msg.headers.add(rfc822_subject, subject);
     msg.text.body(body);
-    configTime(0, 0, "ntp.ntsc.ac.cn");
-    while (time(nullptr) < 100000) delay(100);
+    if (time(nullptr) < 100000) {
+      configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+      while (time(nullptr) < 100000) delay(100);
+    }
     msg.timestamp = time(nullptr);
     smtp.send(msg);
     Serial.println("邮件发送完成");

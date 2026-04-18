@@ -8,6 +8,8 @@
  * - web_pages.h       : HTML 页面内容
  * - web_handlers.h    : Web 处理函数声明
  * - web_handlers.ino  : Web 处理函数实现
+ * - call_handler.h    : 来电/通话处理函数声明
+ * - call_handler.ino  : 来电/通话处理函数实现
  * - sms_handler.h     : 短信处理函数声明
  * - sms_handler.ino   : 短信处理函数实现
  * - push_service.h    : 推送服务函数声明
@@ -39,6 +41,7 @@
 #include "config.h"
 #include "web_pages.h"
 #include "web_handlers.h"
+#include "call_handler.h"
 #include "sms_handler.h"
 #include "push_service.h"
 #include "mqtt_handler.h"
@@ -59,6 +62,9 @@ unsigned long timerIntervalSec = 0;  // 使用秒避免溢出（支持到 136 �
 
 char serialBuf[SERIAL_BUFFER_SIZE];
 int serialBufLen = 0;
+
+String lastCallNumber = "";
+unsigned long lastCallNotifyTime = 0;
 
 ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 
@@ -171,7 +177,19 @@ void setup() {
     }
   }
   if (retryCount < 10) Serial.println("AT+CNMI 设置成功");
-  
+
+  // 开启来电号码显示（即使部分模组最终输出 +CLCC，也建议开启）
+  Serial.println("开启来电号码显示(AT+CLIP=1)...");
+  retryCount = 0;
+  while (!sendATandWaitOK("AT+CLIP=1", 2000)) {
+    blink_short();
+    if (++retryCount >= 10) {
+      Serial.println("警告: AT+CLIP 设置失败，跳过");
+      break;
+    }
+  }
+  if (retryCount < 10) Serial.println("AT+CLIP 设置成功");
+
   // 配置 PDU 模式
   Serial.println("配置PDU模式(AT+CMGF=0)...");
   retryCount = 0;
@@ -195,7 +213,11 @@ void setup() {
     }
   }
   if (retryCount < 30) Serial.println("网络已附着");
-  
+
+  // 初始化本地时间（中国时区）
+  Serial.println("同步本地时间(NTP, CST-8)...");
+  configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+
 
   Serial.println("模组初始化完成");
   digitalWrite(LED_BUILTIN, LOW);

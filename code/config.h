@@ -154,9 +154,13 @@ extern bool configValid;
 extern unsigned long lastPrintTime;
 extern unsigned long lastTimerExec;
 extern unsigned long timerIntervalSec;
+extern String lastCallNumber;
+extern unsigned long lastCallNotifyTime;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 extern char serialBuf[SERIAL_BUFFER_SIZE];
 extern int serialBufLen;
+
+#define CALL_NOTIFY_DEDUP_MS 8000
 
 // 短信历史和统计
 extern SmsRecord smsHistory[MAX_SMS_HISTORY];
