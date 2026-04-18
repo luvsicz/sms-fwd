@@ -139,7 +139,7 @@ mqtt:
       payload_press: '{"action":"restart"}'
       icon: mdi:restart
 
-  # 事件实体（手工配置示例，自动发现启用时通常无需手工添加）
+  # 事件实体（手工配置示例；启用 HA 自动发现后，短信/来电事件都会自动创建）
   event:
     - name: "短信转发器短信事件"
       unique_id: sms_forwarder_sms_event

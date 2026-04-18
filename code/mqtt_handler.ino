@@ -180,7 +180,19 @@ void publishHaDiscoveryConfig() {
   messageConfig += "}";
   mqttClient.publish(messageConfigTopic.c_str(), messageConfig.c_str(), true);
 
-  // 10. 最近来电号码传感器
+  // 10. 短信事件实体
+  String smsEventConfigTopic = haPrefix + "/event/" + nodeId + "_sms/config";
+  String smsEventConfig = "{";
+  smsEventConfig += "\"name\":\"短信通知\",";
+  smsEventConfig += "\"unique_id\":\"" + nodeId + "_sms_event\",";
+  smsEventConfig += "\"state_topic\":\"" + mqttHaSmsReceivedTopic + "\",";
+  smsEventConfig += "\"event_types\":[\"sms_received\"],";
+  smsEventConfig += "\"icon\":\"mdi:message-badge\",";
+  smsEventConfig += deviceInfo;
+  smsEventConfig += "}";
+  mqttClient.publish(smsEventConfigTopic.c_str(), smsEventConfig.c_str(), true);
+
+  // 11. 最近来电号码传感器
   String lastCallerConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_caller/config";
   String lastCallerConfig = "{";
   lastCallerConfig += "\"name\":\"最近来电号码\",";
@@ -193,7 +205,7 @@ void publishHaDiscoveryConfig() {
   lastCallerConfig += "}";
   mqttClient.publish(lastCallerConfigTopic.c_str(), lastCallerConfig.c_str(), true);
 
-  // 11. 来电事件实体
+  // 12. 来电事件实体
   String callEventConfigTopic = haPrefix + "/event/" + nodeId + "_call/config";
   String callEventConfig = "{";
   callEventConfig += "\"name\":\"来电通知\",";
