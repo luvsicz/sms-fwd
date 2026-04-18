@@ -1,0 +1,82 @@
+blueprint:
+  name: 短信转发器 - 来电通知
+  description: 当短信转发器检测到新来电时，转发通知到手机或其他设备
+  domain: automation
+
+  input:
+    call_content_entity:
+      name: 来电详情传感器
+      description: 选择短信转发器的“来电详情”或“最近来电号码”传感器
+      selector:
+        entity:
+          domain: sensor
+
+    notify_service:
+      name: 通知服务
+      description: 选择要发送通知的服务（如 notify.mobile_app_xxx）
+      selector:
+        select:
+          options:
+            - notify.mobile_app_wvw
+            - notify.persistent_notification
+          custom_value: true
+      default: "notify.mobile_app_wvw"
+
+    filter_caller:
+      name: 过滤来电号码（可选）
+      description: 只有指定号码的来电才通知，留空则全部通知。多个号码用逗号分隔
+      default: ""
+      selector:
+        text:
+
+variables:
+  call_entity: !input call_content_entity
+  filter_caller: !input filter_caller
+
+trigger:
+  - platform: state
+    entity_id: !input call_content_entity
+
+condition:
+  # 忽略状态变为 unavailable/unknown 的情况
+  - condition: template
+    value_template: "{{ trigger.to_state.state not in ['unavailable', 'unknown', 'none', ''] }}"
+  # 过滤来电号码
+  - condition: template
+    value_template: >-
+      {% set caller = state_attr(call_entity, 'caller') | default(states(call_entity)) | default('') %}
+      {% if filter_caller == '' %}
+        true
+      {% else %}
+        {{ caller in filter_caller.split(',') | map('trim') | list }}
+      {% endif %}
+
+action:
+  - variables:
+      caller: >-
+        {{ state_attr(call_entity, 'caller')
+           | default(states(call_entity))
+           | default('未知号码') }}
+      time: >-
+        {{ state_attr(call_entity, 'time')
+           | default(state_attr(call_entity, 'timestamp'))
+           | default('') }}
+  - service: !input notify_service
+    data:
+      title: "📞 来电通知"
+      message: >-
+        {% if time != '' %}
+          来电号码：{{ caller }}
+
+          时间：{{ time }}
+        {% else %}
+          来电号码：{{ caller }}
+        {% endif %}
+      data:
+        push:
+          sound: default
+        tag: "call_{{ caller }}"
+
+mode: queued
+max: 10
+

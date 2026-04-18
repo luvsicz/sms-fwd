@@ -1,16 +1,16 @@
 blueprint:
-  name: 短信转发器 - 收到短信通知
-  description: 当短信转发器收到新短信时，转发通知到手机或其他设备
+  name: 短信转发器 - 收到短信通知（事件版）
+  description: 基于 Home Assistant 事件实体触发。当短信转发器收到新短信事件时，发送通知到手机或其他设备。
   domain: automation
-  
+
   input:
-    sms_content_entity:
-      name: 短信内容传感器
-      description: 选择短信转发器的"最近短信内容"传感器
+    sms_event_entity:
+      name: 短信事件实体
+      description: 选择短信转发器自动发现或手工配置的“短信通知”事件实体
       selector:
         entity:
-          domain: sensor
-    
+          domain: event
+
     notify_service:
       name: 通知服务
       description: 选择要发送通知的服务（如 notify.mobile_app_xxx）
@@ -21,7 +21,7 @@ blueprint:
             - notify.persistent_notification
           custom_value: true
       default: "notify.mobile_app_wvw"
-    
+
     filter_sender:
       name: 过滤发送者（可选）
       description: 只有指定号码发来的短信才通知，留空则全部通知。多个号码用逗号分隔
@@ -30,36 +30,40 @@ blueprint:
         text:
 
 variables:
-  sms_entity: !input sms_content_entity
   filter_sender: !input filter_sender
 
 trigger:
   - platform: state
-    entity_id: !input sms_content_entity
+    entity_id: !input sms_event_entity
 
 condition:
-  # 忽略状态变为 unavailable/unknown 的情况
   - condition: template
     value_template: "{{ trigger.to_state.state not in ['unavailable', 'unknown', 'none', ''] }}"
-  # 发送者过滤
   - condition: template
     value_template: >-
-      {% set sender = state_attr(sms_entity, 'sender') | default('') %}
+      {% set sender = trigger.to_state.attributes.sender | default('') %}
       {% if filter_sender == '' %}
         true
       {% else %}
-        {{ sender in filter_sender.split(',') }}
+        {{ sender in filter_sender.split(',') | map('trim') | list }}
       {% endif %}
 
 action:
   - variables:
-      sender: "{{ state_attr(sms_entity, 'sender') | default('未知') }}"
-      message: "{{ state_attr(sms_entity, 'message') | default(states(sms_entity)) }}"
-      time: "{{ state_attr(sms_entity, 'time') | default('') }}"
+      sender: "{{ trigger.to_state.attributes.sender | default('未知') }}"
+      message: "{{ trigger.to_state.attributes.message | default('') }}"
+      time: "{{ trigger.to_state.attributes.time | default(trigger.to_state.attributes.timestamp | default('')) }}"
   - service: !input notify_service
     data:
       title: "📱 {{ sender }}"
-      message: "{{ message }}"
+      message: >-
+        {% if time != '' %}
+          {{ message }}
+
+          时间：{{ time }}
+        {% else %}
+          {{ message }}
+        {% endif %}
       data:
         push:
           sound: default
@@ -67,3 +71,4 @@ action:
 
 mode: queued
 max: 10
+

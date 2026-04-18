@@ -18,10 +18,10 @@ blueprint:
       selector:
         select:
           options:
-            - notify.mobile_app_iphone
+            - notify.mobile_app_wvw
             - notify.persistent_notification
           custom_value: true
-      default: "notify.mobile_app_iphone"
+      default: "notify.mobile_app_wvw"
     
     offline_duration:
       name: 离线多久后告警
