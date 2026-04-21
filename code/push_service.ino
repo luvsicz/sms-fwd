@@ -162,6 +162,9 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       String jsonData = "{";
       jsonData += "\"title\":\"" + senderEscaped + "\",";
       jsonData += "\"body\":\"" + messageEscaped + "\"";
+      if (channel.key2.length() > 0) {
+        jsonData += ",\"group\":\"" + jsonEscape(channel.key2) + "\"";
+      }
       jsonData += "}";
       Serial.println("BARK: " + jsonData);
       sendHttpRequest(channel.url, "POST", "application/json", jsonData);

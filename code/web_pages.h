@@ -644,6 +644,7 @@ function upd(i){
   // Telegram(5) 和 钉钉(7) 需要显示 Key1 输入框
   var showK1=(t=='5'||t=='7');
   $('k1'+i).style.display=showK1?'block':'none';
+  $('k2'+i).style.display=(t=='2')?'block':'none'; // Bark group
   // 动态更新标签
   var lbl=$('k1l'+i);
   if(lbl){lbl.innerText=(t=='5')?'Chat ID':'加签密钥 (可选)';}

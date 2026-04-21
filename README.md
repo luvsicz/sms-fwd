@@ -249,14 +249,27 @@ Arduino IDE 建议：
    ```
 3. `Key1` 填写 `Chat ID`
 
-### 3. 企业微信机器人
+### 3. Bark
+- URL 填 Bark 的推送地址，例如 `https://api.day.app/<device_key>` 或自建 bark-server 地址
+- `Bark 分组 group (可选)` 可用于在通知中心和 Bark 历史中按组归类消息
+- 当前固件默认发送字段：
+  ```json
+  {
+    "title": "发送者",
+    "body": "短信内容",
+    "group": "已配置的分组名"
+  }
+  ```
+  > 未填写分组时，不会发送 `group` 字段。
+
+### 4. 企业微信机器人
 - URL 填完整的机器人 Webhook 地址即可
 
-### 4. 钉钉机器人
+### 5. 钉钉机器人
 - URL 填机器人 Webhook 地址
 - 如果启用了“加签”，则在 `Key1` 填入以 `SEC` 开头的签名密钥
 
-### 5. 通用 Webhook
+### 6. 通用 Webhook
 支持三种形式：
 
 #### POST JSON

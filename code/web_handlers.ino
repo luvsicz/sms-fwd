@@ -85,6 +85,8 @@ void handleRoot() {
   if (!checkAuth()) return;
   
   String html = String(htmlPage);
+  // 预留足够空间，避免后续替换 WiFi/推送通道等大段 HTML 时因 String 扩容失败而残留占位符
+  html.reserve(strlen(htmlPage) + strlen(commonCss) + 8192);
   html.replace("%COMMON_CSS%", commonCss);
   // html.replace("%COMMON_JS%", commonJs); // JS 已合并
   wifi_mode_t wifiMode = WiFi.getMode();
@@ -269,7 +271,11 @@ void handleRoot() {
     String k1Label = (config.pushChannels[i].type == PUSH_TYPE_TELEGRAM) ? "Chat ID" : "加签密钥 (可选)";
     String k1Hint = (config.pushChannels[i].type == PUSH_TYPE_TELEGRAM) ? "如 123456789" : "SEC开头的密钥";
     channelsHtml += "<div id=\"k1" + idx + "\" style=\"display:" + (showK1 ? "block" : "none") + "\"><div class=\"fg\"><label id=\"k1l" + idx + "\">" + k1Label + "</label><input name=\"push" + idx + "k1\" value=\"" + config.pushChannels[i].key1 + "\" placeholder=\"" + k1Hint + "\"></div></div>";
-    
+
+    // Key2 输入框 (Bark=group)
+    bool showK2 = (config.pushChannels[i].type == PUSH_TYPE_BARK);
+    channelsHtml += "<div id=\"k2" + idx + "\" style=\"display:" + (showK2 ? "block" : "none") + "\"><div class=\"fg\"><label>Bark 分组 group (可选)</label><input name=\"push" + idx + "k2\" value=\"" + config.pushChannels[i].key2 + "\" placeholder=\"如 家庭短信 / 验证码\"></div></div>";
+
     // 自定义模板 Body (显示条件: type == 4)
     channelsHtml += "<div id=\"cf" + idx + "\" style=\"display:" + (config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? "block" : "none") + "\"><div class=\"fg\"><label>Body模板</label><textarea name=\"push" + idx + "body\" rows=\"3\">" + config.pushChannels[i].customBody + "</textarea></div></div>";
     
@@ -364,6 +370,7 @@ void handleSave() {
     config.pushChannels[i].url = server.arg(prefix + "url");
     config.pushChannels[i].name = server.arg(prefix + "name");
     config.pushChannels[i].key1 = server.arg(prefix + "k1"); // Telegram Chat ID
+    config.pushChannels[i].key2 = server.arg(prefix + "k2"); // Bark group
     config.pushChannels[i].customBody = server.arg(prefix + "body");
   }
   

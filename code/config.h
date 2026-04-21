@@ -39,8 +39,8 @@ struct PushChannel {
   PushType type;
   String name;
   String url;
-  String key1;
-  String key2;
+  String key1;       // 按类型复用：Telegram Chat ID / 钉钉加签密钥
+  String key2;       // 按类型复用：Bark group
   String customBody;
 };
 
