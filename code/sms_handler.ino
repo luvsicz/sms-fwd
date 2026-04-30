@@ -483,6 +483,128 @@ bool containsReplacementCharUtf8(const String& text) {
   return false;
 }
 
+bool isTimestampLikelyValidSms(const String& timestamp) {
+  if (timestamp.length() != 19) return false;
+  if (timestamp.charAt(4) != '-' || timestamp.charAt(7) != '-' ||
+      timestamp.charAt(10) != ' ' || timestamp.charAt(13) != ':' ||
+      timestamp.charAt(16) != ':') {
+    return false;
+  }
+
+  int year = timestamp.substring(0, 4).toInt();
+  int month = timestamp.substring(5, 7).toInt();
+  int day = timestamp.substring(8, 10).toInt();
+  int hour = timestamp.substring(11, 13).toInt();
+  int minute = timestamp.substring(14, 16).toInt();
+  int second = timestamp.substring(17, 19).toInt();
+
+  if (year < 2020 || year > 2099) return false;
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > 31) return false;
+  if (hour < 0 || hour > 23) return false;
+  if (minute < 0 || minute > 59) return false;
+  if (second < 0 || second > 59) return false;
+
+  return true;
+}
+
+bool isLikelyValidSmsSender(const String& sender) {
+  if (sender.length() == 0) return false;
+
+  int digitCount = 0;
+  for (unsigned int i = 0; i < sender.length(); i++) {
+    char c = sender.charAt(i);
+    if (c >= '0' && c <= '9') {
+      digitCount++;
+      continue;
+    }
+    if (c == '+' && i == 0) continue;
+    if (c == ' ' || c == '-' || c == '(' || c == ')') continue;
+    return false;
+  }
+
+  return digitCount >= 3;
+}
+
+bool hasVisibleSmsText(const String& text) {
+  if (text.length() == 0) return false;
+
+  for (unsigned int i = 0; i < text.length(); i++) {
+    uint8_t c = (uint8_t)text.charAt(i);
+    if (c == '\n' || c == '\r' || c == '\t') continue;
+    if (c >= 0x20) return true;
+  }
+
+  return false;
+}
+
+bool isMostlyGsm7SymbolNoise(const String& text) {
+  if (text.length() < 24) return false;
+
+  const char* suspiciousChars[] = {
+    "Δ", "Φ", "Γ", "Λ", "Ω", "Π", "Ψ", "Σ", "Θ", "Ξ",
+    "Æ", "æ", "Ø", "ø", "Å", "å", "Ä", "Ö", "Ñ", "Ü",
+    "§", "¿", "à", "è", "é", "ù", "ì", "ò", "Ç", "¥", "£", "¤"
+  };
+
+  int suspiciousHits = 0;
+  for (unsigned int i = 0; i < sizeof(suspiciousChars) / sizeof(suspiciousChars[0]); i++) {
+    int pos = 0;
+    while ((pos = text.indexOf(suspiciousChars[i], pos)) >= 0) {
+      suspiciousHits++;
+      pos += strlen(suspiciousChars[i]);
+    }
+  }
+
+  int asciiLettersOrDigits = 0;
+  for (unsigned int i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    if ((c >= '0' && c <= '9') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z')) {
+      asciiLettersOrDigits++;
+    }
+  }
+
+  return suspiciousHits >= 6 && suspiciousHits > asciiLettersOrDigits / 2;
+}
+
+bool isPduLikelyStorableSms(const String& sender,
+                            const String& timestamp,
+                            const String& text,
+                            bool isSmsDeliver,
+                            bool hasUserData,
+                            bool fallbackDecoded,
+                            const DecodedPDU* fallbackSms) {
+  if (!isSmsDeliver) return false;
+  if (!hasUserData) return false;
+  if (!hasVisibleSmsText(text)) return false;
+
+  bool senderOk = isLikelyValidSmsSender(sender);
+  bool timeOk = isTimestampLikelyValidSms(timestamp);
+  bool textUtf8Ok = isLikelyValidUtf8(text) && !containsReplacementCharUtf8(text);
+  bool noisyText = isMostlyGsm7SymbolNoise(text);
+
+  if (senderOk && timeOk && textUtf8Ok && !noisyText) {
+    return true;
+  }
+
+  if (fallbackDecoded && fallbackSms != nullptr) {
+    bool fbSenderOk = isLikelyValidSmsSender(fallbackSms->sender);
+    bool fbTimeOk = isTimestampLikelyValidSms(fallbackSms->timestamp);
+    bool fbTextOk = hasVisibleSmsText(fallbackSms->text) &&
+                    isLikelyValidUtf8(fallbackSms->text) &&
+                    !containsReplacementCharUtf8(fallbackSms->text) &&
+                    !isMostlyGsm7SymbolNoise(fallbackSms->text);
+
+    if (fallbackSms->isSmsDeliver && fallbackSms->hasUserData && fbSenderOk && fbTimeOk && fbTextOk) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 int hexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -679,6 +801,10 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   out.refNumber = 0;
   out.partNumber = 0;
   out.totalParts = 1;
+  out.isSmsDeliver = false;
+  out.hasUserData = false;
+  out.dcs = 0;
+  out.fo = 0;
 
   if (pduHex.length() < 20 || (pduHex.length() % 2 != 0)) return false;
 
@@ -692,7 +818,14 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
 
   // FO
   uint8_t fo = hexByteAt(pduHex, pos);
+  out.fo = fo;
   pos += 2;
+
+  if ((fo & 0x03) != 0x00) {
+    Serial.printf("fallback parser: 非 SMS-DELIVER PDU, FO=0x%02X\n", fo);
+    return false;
+  }
+  out.isSmsDeliver = true;
 
   // OA
   int oaLen = hexByteAt(pduHex, pos);
@@ -713,6 +846,7 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   uint8_t pid = hexByteAt(pduHex, pos);
   pos += 2;
   uint8_t dcs = hexByteAt(pduHex, pos);
+  out.dcs = dcs;
   pos += 2;
   (void)pid;
 
@@ -726,6 +860,7 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   if (pos + 2 > pduHex.length()) return false;
   int udl = hexByteAt(pduHex, pos);
   pos += 2;
+  out.hasUserData = udl > 0;
 
   if (dcs != 0x00 && dcs != 0x08) {
     Serial.printf("fallback parser: 暂不支持 DCS=0x%02X\n", dcs);
@@ -835,6 +970,8 @@ void checkSerial1URC() {
       int refNumber = 0;
       int partNumber = 0;
       int totalParts = 1;
+      bool isSmsDeliver = true;
+      bool hasUserData = true;
 
       bool fallbackDecoded = false;
       DecodedPDU fallbackSms;
@@ -863,6 +1000,8 @@ void checkSerial1URC() {
               refNumber = fallbackSms.refNumber;
               partNumber = fallbackSms.partNumber;
               totalParts = fallbackSms.totalParts;
+              isSmsDeliver = fallbackSms.isSmsDeliver;
+              hasUserData = fallbackSms.hasUserData;
               Serial.println("✓ 使用fallback文本替换pdulib结果");
             }
           }
@@ -879,6 +1018,8 @@ void checkSerial1URC() {
           refNumber = fallbackSms.refNumber;
           partNumber = fallbackSms.partNumber;
           totalParts = fallbackSms.totalParts;
+          isSmsDeliver = fallbackSms.isSmsDeliver;
+          hasUserData = fallbackSms.hasUserData;
           Serial.println("✓ fallback PDU解析成功");
         }
       }
@@ -889,6 +1030,26 @@ void checkSerial1URC() {
 
       if (!decoded) {
         Serial.println("❌ PDU解析失败！");
+        state = IDLE;
+        return;
+      }
+
+      if (!isPduLikelyStorableSms(sender,
+                                  timestamp,
+                                  text,
+                                  isSmsDeliver,
+                                  hasUserData,
+                                  fallbackDecoded,
+                                  fallbackDecoded ? &fallbackSms : nullptr)) {
+        Serial.println("⚠️ 识别为异常/非短信PDU，已跳过存储与转发");
+        Serial.println("  原因线索:");
+        Serial.println("  - sender=" + sender);
+        Serial.println("  - timestamp=" + timestamp);
+        Serial.printf("  - deliver=%s, userData=%s, fallback=%s\n",
+                      isSmsDeliver ? "true" : "false",
+                      hasUserData ? "true" : "false",
+                      fallbackDecoded ? "true" : "false");
+        Serial.println("  - text=" + text);
         state = IDLE;
         return;
       }

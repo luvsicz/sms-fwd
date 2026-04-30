@@ -15,6 +15,10 @@ struct DecodedPDU {
   int refNumber;
   int partNumber;
   int totalParts;
+  bool isSmsDeliver;
+  bool hasUserData;
+  uint8_t dcs;
+  uint8_t fo;
 };
 
 // 外部依赖变量声明
@@ -32,6 +36,13 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
 void checkSerial1URC();
 String readSerialLine(HardwareSerial& port);
 bool isHexString(const String& str);
+bool isPduLikelyStorableSms(const String& sender,
+                            const String& timestamp,
+                            const String& text,
+                            bool isSmsDeliver,
+                            bool hasUserData,
+                            bool fallbackDecoded,
+                            const DecodedPDU* fallbackSms = nullptr);
 int hexNibble(char c);
 uint8_t hexByteAt(const String& s, int pos);
 String swapSemiOctetsToDigits(const String& hex, int digitCount);
