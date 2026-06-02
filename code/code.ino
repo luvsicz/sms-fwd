@@ -267,18 +267,70 @@ void setup() {
   }
   
   // 启用看门狗 (30秒超时)
-  // 适配 ESP32 Arduino Core v3.0+
+  // 适配 ESP32 Arduino Core v3.0+；避免重复初始化 TWDT
   esp_task_wdt_config_t wdt_config = {
       .timeout_ms = 30000,
       .idle_core_mask = (1 << 0), // ESP32-C3 是单核，使用 core 0
       .trigger_panic = true
   };
-  esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL);
+  esp_err_t wdtStatus = esp_task_wdt_status(NULL);
+  if (wdtStatus == ESP_ERR_INVALID_STATE) {
+    esp_err_t initResult = esp_task_wdt_init(&wdt_config);
+    if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE) {
+      Serial.printf("看门狗初始化失败: %d\n", initResult);
+    }
+  }
+
+  wdtStatus = esp_task_wdt_status(NULL);
+  if (wdtStatus == ESP_ERR_NOT_FOUND) {
+    esp_err_t addResult = esp_task_wdt_add(NULL);
+    if (addResult != ESP_OK) {
+      Serial.printf("看门狗添加loopTask失败: %d\n", addResult);
+    }
+  }
   Serial.println("看门狗已启用(30s)");
 }
 
 // ========== loop 函数 ==========
+void handleDebugSerialCommand() {
+  static String debugLine = "";
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      debugLine.trim();
+
+      if (debugLine == "TESTPUSH") {
+        Serial.println("收到调试命令 TESTPUSH，模拟短信推送...");
+        String timestamp = getCurrentTimeString();
+        processSmsContent(
+          "TEST_SENDER",
+          "这是一条 TESTPUSH 调试短信，验证码 123456，用于测试 Bark、MQTT 和 SMTP 推送。",
+          timestamp.c_str()
+        );
+        Serial.println("TESTPUSH 调试命令处理完成");
+      } else if (debugLine.length() > 0) {
+        // 非调试命令继续作为 AT 命令透传到模组
+        Serial1.println(debugLine);
+      }
+
+      debugLine = "";
+      return;
+    }
+
+    debugLine += c;
+    if (debugLine.length() > 200) {
+      Serial.println("串口调试命令过长，已丢弃");
+      debugLine = "";
+    }
+  }
+}
+
 void loop() {
   // 处理 HTTP 请求
   server.handleClient();
@@ -335,9 +387,9 @@ void loop() {
   // 检查长短信超时
   checkConcatTimeout();
   
-  // 本地透传
-  if (Serial.available()) Serial1.write(Serial.read());
-  
+  // 本地调试命令 / AT 透传
+  handleDebugSerialCommand();
+
   // 检查 URC 和解析
   checkSerial1URC();
   

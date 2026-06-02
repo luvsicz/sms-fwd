@@ -7,6 +7,189 @@
 
 #include <mbedtls/md.h>
 #include <mbedtls/base64.h>
+#include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
+// HTTP 推送必须短超时，避免单个通道阻塞 loopTask 触发看门狗
+static const uint16_t HTTP_PUSH_TIMEOUT_MS = 1000;
+static const uint8_t HTTP_PUSH_QUEUE_LENGTH = MAX_PUSH_CHANNELS * 2;
+static const uint32_t HTTP_PUSH_TASK_STACK_SIZE = 6144;
+static const uint8_t HTTP_PUSH_WORKER_COUNT = MAX_PUSH_CHANNELS;
+static const uint8_t EMAIL_QUEUE_LENGTH = 4;
+static const uint32_t EMAIL_TASK_STACK_SIZE = 8192;
+
+struct HttpPushJob {
+  PushChannel channel;
+  String sender;
+  String message;
+  String timestamp;
+};
+
+struct EmailJob {
+  String subject;
+  String body;
+};
+
+static QueueHandle_t httpPushQueue = nullptr;
+static TaskHandle_t httpPushTaskHandles[HTTP_PUSH_WORKER_COUNT] = {nullptr};
+static QueueHandle_t emailQueue = nullptr;
+static TaskHandle_t emailTaskHandle = nullptr;
+
+void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
+static void sendEmailNotificationNow(const char* subject, const char* body);
+
+static void feedPushWatchdog() {
+  if (esp_task_wdt_status(NULL) == ESP_OK) {
+    esp_task_wdt_reset();
+  }
+  yield();
+}
+
+static void httpPushWorkerTask(void* parameter) {
+  HttpPushJob* job = nullptr;
+
+  for (;;) {
+    if (xQueueReceive(httpPushQueue, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
+      sendToChannel(job->channel, job->sender.c_str(), job->message.c_str(), job->timestamp.c_str());
+      saveStats();
+      delete job;
+      job = nullptr;
+      delay(10);
+    }
+  }
+}
+
+static bool ensureHttpPushWorker() {
+  if (httpPushQueue == nullptr) {
+    httpPushQueue = xQueueCreate(HTTP_PUSH_QUEUE_LENGTH, sizeof(HttpPushJob*));
+    if (httpPushQueue == nullptr) {
+      Serial.println("HTTP推送队列创建失败");
+      return false;
+    }
+  }
+
+  for (uint8_t i = 0; i < HTTP_PUSH_WORKER_COUNT; i++) {
+    if (httpPushTaskHandles[i] == nullptr) {
+      char taskName[16];
+      snprintf(taskName, sizeof(taskName), "httpPush%u", i + 1);
+      BaseType_t taskCreated = xTaskCreate(
+        httpPushWorkerTask,
+        taskName,
+        HTTP_PUSH_TASK_STACK_SIZE,
+        nullptr,
+        1,
+        &httpPushTaskHandles[i]
+      );
+
+      if (taskCreated != pdPASS) {
+        Serial.println("HTTP推送任务创建失败");
+        httpPushTaskHandles[i] = nullptr;
+        return i > 0;
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool enqueueHttpPush(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
+  if (!ensureHttpPushWorker()) {
+    stats.pushFailed++;
+    return false;
+  }
+
+  HttpPushJob* job = new HttpPushJob();
+  if (job == nullptr) {
+    Serial.println("HTTP推送任务分配内存失败");
+    stats.pushFailed++;
+    return false;
+  }
+
+  job->channel = channel;
+  job->sender = String(sender);
+  job->message = String(message);
+  job->timestamp = String(timestamp);
+
+  if (xQueueSend(httpPushQueue, &job, 0) != pdTRUE) {
+    Serial.println("HTTP推送队列已满，丢弃本次通道推送");
+    delete job;
+    stats.pushFailed++;
+    return false;
+  }
+
+  return true;
+}
+
+static void emailWorkerTask(void* parameter) {
+  EmailJob* job = nullptr;
+
+  for (;;) {
+    if (xQueueReceive(emailQueue, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
+      sendEmailNotificationNow(job->subject.c_str(), job->body.c_str());
+      delete job;
+      job = nullptr;
+      delay(10);
+    }
+  }
+}
+
+static bool ensureEmailWorker() {
+  if (emailQueue == nullptr) {
+    emailQueue = xQueueCreate(EMAIL_QUEUE_LENGTH, sizeof(EmailJob*));
+    if (emailQueue == nullptr) {
+      Serial.println("邮件队列创建失败");
+      return false;
+    }
+  }
+
+  if (emailTaskHandle == nullptr) {
+    BaseType_t taskCreated = xTaskCreate(
+      emailWorkerTask,
+      "emailPush",
+      EMAIL_TASK_STACK_SIZE,
+      nullptr,
+      1,
+      &emailTaskHandle
+    );
+
+    if (taskCreated != pdPASS) {
+      Serial.println("邮件任务创建失败");
+      emailTaskHandle = nullptr;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool enqueueEmail(const char* subject, const char* body) {
+  if (!ensureEmailWorker()) {
+    stats.pushFailed++;
+    return false;
+  }
+
+  EmailJob* job = new EmailJob();
+  if (job == nullptr) {
+    Serial.println("邮件任务分配内存失败");
+    stats.pushFailed++;
+    return false;
+  }
+
+  job->subject = String(subject);
+  job->body = String(body);
+
+  if (xQueueSend(emailQueue, &job, 0) != pdTRUE) {
+    Serial.println("邮件队列已满，丢弃本次邮件通知");
+    delete job;
+    stats.pushFailed++;
+    return false;
+  }
+
+  Serial.println("邮件通知已入队");
+  return true;
+}
 
 // URL 编码辅助函数
 String urlEncode(const String& str) {
@@ -92,26 +275,46 @@ String hmacSha256Base64(const String& secret, const String& data) {
 // 发送 HTTP/HTTPS 请求的通用函数
 int sendHttpRequest(const String& url, const String& method, const String& contentType, const String& body) {
   HTTPClient http;
-  
+  WiFiClientSecure localSslClient;
+  bool beginOk = false;
+
+  feedPushWatchdog();
+
   // 判断是否为 HTTPS
   if (url.startsWith("https://")) {
-    // 使用全局的 ssl_client（在 code.ino 中已设置 setInsecure）
-    http.begin(ssl_client, url);
+    localSslClient.setInsecure();
+    localSslClient.setTimeout(1);
+    localSslClient.setHandshakeTimeout(1);
+    beginOk = http.begin(localSslClient, url);
   } else {
-    http.begin(url);
+    beginOk = http.begin(url);
   }
-  
+
+  if (!beginOk) {
+    Serial.println("HTTP请求初始化失败");
+    stats.pushFailed++;
+    feedPushWatchdog();
+    return -1;
+  }
+
+  http.setConnectTimeout(HTTP_PUSH_TIMEOUT_MS);
+  http.setTimeout(HTTP_PUSH_TIMEOUT_MS);
+
   if (contentType.length() > 0) {
     http.addHeader("Content-Type", contentType);
   }
   
+  feedPushWatchdog();
+
   int httpCode;
   if (method == "GET") {
     httpCode = http.GET();
   } else {
     httpCode = http.POST(body);
   }
-  
+
+  feedPushWatchdog();
+
   if (httpCode > 0) {
     Serial.printf("HTTP响应码: %d\n", httpCode);
     // 所有 2xx 状态码都视为成功 (200 OK, 201 Created, 202 Accepted, 204 No Content 等)
@@ -129,6 +332,7 @@ int sendHttpRequest(const String& url, const String& method, const String& conte
   }
   
   http.end();
+  feedPushWatchdog();
   return httpCode;
 }
 
@@ -139,7 +343,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
   Serial.println("发送到推送通道: " + channelName);
-  
+  feedPushWatchdog();
+
   String senderEscaped = jsonEscape(String(sender));
   String messageEscaped = jsonEscape(String(message));
   String timestampEscaped = jsonEscape(String(timestamp));
@@ -304,16 +509,23 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
     return;
   }
   
-  Serial.println("\n=== 开始多通道推送 ===");
+  Serial.println("\n=== HTTP推送入队 ===");
+  int queuedCount = 0;
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     if (isPushChannelValid(config.pushChannels[i])) {
-      sendToChannel(config.pushChannels[i], sender, message, timestamp);
-      delay(100); // 短暂延迟避免请求过快
+      feedPushWatchdog();
+      String channelName = config.pushChannels[i].name.length() > 0 ? config.pushChannels[i].name : ("通道" + String(config.pushChannels[i].type));
+      if (enqueueHttpPush(config.pushChannels[i], sender, message, timestamp)) {
+        queuedCount++;
+        Serial.println("HTTP推送已入队: " + channelName);
+      }
+      feedPushWatchdog();
+      delay(10); // 短暂让出 CPU，避免请求过快且不拖慢后续通道
     }
   }
-  Serial.println("=== 多通道推送完成 ===\n");
-  
-  // 保存推送统计
+  Serial.printf("=== HTTP推送入队完成: %d 个通道 ===\n\n", queuedCount);
+
+  // 保存队列满/内存不足等入队失败统计；HTTP请求结果由后台任务保存
   saveStats();
 }
 
@@ -332,7 +544,15 @@ String getCurrentTimeString() {
 // 发送邮件通知函数
 void sendEmailNotification(const char* subject, const char* body) {
   if (!config.emailEnabled) return;
-  
+
+  if (!enqueueEmail(subject, body)) {
+    saveStats();
+  }
+}
+
+static void sendEmailNotificationNow(const char* subject, const char* body) {
+  if (!config.emailEnabled) return;
+
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
       config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
     Serial.println("邮件配置不完整，跳过发送");
