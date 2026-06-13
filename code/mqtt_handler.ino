@@ -8,6 +8,10 @@
 
 #include <PubSubClient.h>
 
+static void logMqttElapsed(const char* label, unsigned long start) {
+  Serial.printf("[耗时] END %s: elapsed=%lums\n", label, millis() - start);
+}
+
 // 获取 MAC 地址后缀作为设备唯一 ID
 String getMacSuffix() {
   String mac = WiFi.macAddress();
@@ -226,7 +230,9 @@ void mqttReconnect() {
   if (!config.mqttEnabled) return;
   if (config.mqttServer.length() == 0) return;
   if (mqttClient.connected()) return;
-  
+  unsigned long reconnectStart = millis();
+  Serial.println("[耗时] START MQTT重连");
+
   // 配置服务器（可能配置变更了）
   mqttClient.setServer(config.mqttServer.c_str(), config.mqttPort);
   
@@ -280,6 +286,7 @@ void mqttReconnect() {
     Serial.print("MQTT连接失败, 错误码: ");
     Serial.println(mqttClient.state());
   }
+  logMqttElapsed("MQTT重连", reconnectStart);
 }
 
 // MQTT 消息回调处理
@@ -487,12 +494,18 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   
   // 发布到用户自定义主题
   Serial.println(" 主题1: " + mqttTopicSmsReceived);
+  unsigned long publishStart = millis();
+  Serial.println("[耗时] START MQTT发布短信主题1");
   bool success1 = mqttClient.publish(mqttTopicSmsReceived.c_str(), json.c_str());
-  
+  Serial.printf("[耗时] END MQTT发布短信主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
+
   // 发布到 HA 事件主题（如果启用）
   if (config.mqttHaDiscovery) {
     Serial.println(" 主题2 (HA): " + mqttHaSmsReceivedTopic);
-    mqttClient.publish(mqttHaSmsReceivedTopic.c_str(), json.c_str());
+    publishStart = millis();
+    Serial.println("[耗时] START MQTT发布短信HA主题");
+    bool successHa = mqttClient.publish(mqttHaSmsReceivedTopic.c_str(), json.c_str());
+    Serial.printf("[耗时] END MQTT发布短信HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
   
   if (success1) {
@@ -528,11 +541,17 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
   json += "}";
 
   Serial.println(" 主题1: " + mqttTopicCallReceived);
+  unsigned long publishStart = millis();
+  Serial.println("[耗时] START MQTT发布来电主题1");
   bool success1 = mqttClient.publish(mqttTopicCallReceived.c_str(), json.c_str());
+  Serial.printf("[耗时] END MQTT发布来电主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
   if (config.mqttHaDiscovery) {
     Serial.println(" 主题2 (HA): " + mqttHaCallReceivedTopic);
-    mqttClient.publish(mqttHaCallReceivedTopic.c_str(), json.c_str());
+    publishStart = millis();
+    Serial.println("[耗时] START MQTT发布来电HA主题");
+    bool successHa = mqttClient.publish(mqttHaCallReceivedTopic.c_str(), json.c_str());
+    Serial.printf("[耗时] END MQTT发布来电HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
 
   if (success1) {
@@ -553,7 +572,10 @@ void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
   
-  mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
+  unsigned long publishStart = millis();
+  Serial.println("[耗时] START MQTT发布发送短信结果");
+  bool successPublish = mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
+  Serial.printf("[耗时] END MQTT发布发送短信结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布发送短信结果: " + String(success ? "成功" : "失败"));
 }
 
@@ -568,7 +590,10 @@ void publishMqttPingResult(const char* host, bool success, const char* result) {
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
   
-  mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
+  unsigned long publishStart = millis();
+  Serial.println("[耗时] START MQTT发布Ping结果");
+  bool successPublish = mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
+  Serial.printf("[耗时] END MQTT发布Ping结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布Ping结果: " + String(success ? "成功" : "失败"));
 }
 
@@ -576,7 +601,9 @@ void publishMqttPingResult(const char* host, bool success, const char* result) {
 void publishMqttStatus(const char* status) {
   if (!config.mqttEnabled) return;
   if (!mqttClient.connected() && String(status) != "online") return;
-  
+  unsigned long statusStart = millis();
+  Serial.printf("[耗时] START MQTT发布状态: %s\n", status);
+
   String json = "{";
   json += "\"status\":\"" + String(status) + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\",";
@@ -584,22 +611,33 @@ void publishMqttStatus(const char* status) {
   json += "}";
   
   // 发布到用户自定义主题
-  mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
-  
+  unsigned long publishStart = millis();
+  Serial.println("[耗时] START MQTT发布状态主题1");
+  bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
+  Serial.printf("[耗时] END MQTT发布状态主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
+
   // 发布到 HA 状态主题（如果启用）
   if (config.mqttHaDiscovery) {
-    mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    publishStart = millis();
+    Serial.println("[耗时] START MQTT发布状态HA主题");
+    bool successHa = mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    Serial.printf("[耗时] END MQTT发布状态HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
   
   Serial.println("MQTT发布状态: " + String(status));
+  logMqttElapsed("MQTT发布状态", statusStart);
 }
 
 // 定期发布设备详细状态（双主题，用于 Home Assistant 等平台）
 void publishMqttDeviceStatus() {
   if (!config.mqttEnabled || !mqttClient.connected()) return;
-  
+  unsigned long statusStart = millis();
+  Serial.println("[耗时] START MQTT设备状态上报");
+
   // 获取信号质量
+  unsigned long stepStart = millis();
   String cesqResp = sendATCommand("AT+CESQ", 2000);
+  logMqttElapsed("MQTT状态-AT+CESQ", stepStart);
   int rxlev = -1, rsrp = -1, rsrq = -1;
   int cesqIdx = cesqResp.indexOf("+CESQ:");
   if (cesqIdx >= 0) {
@@ -646,7 +684,9 @@ void publishMqttDeviceStatus() {
   
   // 获取 APN
   String apn = "";
+  stepStart = millis();
   String cgdcontResp = sendATCommand("AT+CGDCONT?", 2000);
+  logMqttElapsed("MQTT状态-AT+CGDCONT", stepStart);
   int cgdIdx = cgdcontResp.indexOf("+CGDCONT:");
   if (cgdIdx >= 0) {
     int idx0 = cgdcontResp.indexOf(",\"", cgdIdx);
@@ -678,12 +718,19 @@ void publishMqttDeviceStatus() {
   json += "}";
   
   // 发布到用户自定义主题
-  mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
-  
+  stepStart = millis();
+  Serial.println("[耗时] START MQTT设备状态发布主题1");
+  bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
+  Serial.printf("[耗时] END MQTT设备状态发布主题1: elapsed=%lums, success=%s\n", millis() - stepStart, success1 ? "true" : "false");
+
   // 发布到 HA 状态主题（如果启用）
   if (config.mqttHaDiscovery) {
-    mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    stepStart = millis();
+    Serial.println("[耗时] START MQTT设备状态发布HA主题");
+    bool successHa = mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    Serial.printf("[耗时] END MQTT设备状态发布HA主题: elapsed=%lums, success=%s\n", millis() - stepStart, successHa ? "true" : "false");
   }
   
   Serial.println("MQTT上报设备状态");
+  logMqttElapsed("MQTT设备状态上报", statusStart);
 }

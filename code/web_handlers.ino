@@ -13,6 +13,7 @@ bool checkAuth() {
 
 // 发送 AT 命令并获取响应
 String sendATCommand(const char* cmd, unsigned long timeout) {
+  Serial.printf("[耗时] START AT命令: %s, timeout=%lums\n", cmd, timeout);
   while (Serial1.available()) Serial1.read();
   Serial1.println(cmd);
   
@@ -25,15 +26,22 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
       if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
         delay(50);  // 等待剩余数据
         while (Serial1.available()) resp += (char)Serial1.read();
+        Serial.printf("[耗时] END AT命令: %s, elapsed=%lums, result=%s, respLen=%u\n",
+                      cmd,
+                      millis() - start,
+                      resp.indexOf("OK") >= 0 ? "OK" : "ERROR",
+                      resp.length());
         return resp;
       }
     }
   }
+  Serial.printf("[耗时] TIMEOUT AT命令: %s, elapsed=%lums, respLen=%u\n", cmd, millis() - start, resp.length());
   return resp;
 }
 
 // AT 命令并等待 OK
 bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
+  Serial.printf("[耗时] START AT等待OK: %s, timeout=%lums\n", cmd, timeout);
   while (Serial1.available()) Serial1.read();
   Serial1.println(cmd);
   unsigned long start = millis();
@@ -42,10 +50,17 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
-      if (resp.indexOf("OK") >= 0) return true;
-      if (resp.indexOf("ERROR") >= 0) return false;
+      if (resp.indexOf("OK") >= 0) {
+        Serial.printf("[耗时] END AT等待OK: %s, elapsed=%lums, result=OK, respLen=%u\n", cmd, millis() - start, resp.length());
+        return true;
+      }
+      if (resp.indexOf("ERROR") >= 0) {
+        Serial.printf("[耗时] END AT等待OK: %s, elapsed=%lums, result=ERROR, respLen=%u\n", cmd, millis() - start, resp.length());
+        return false;
+      }
     }
   }
+  Serial.printf("[耗时] TIMEOUT AT等待OK: %s, elapsed=%lums, respLen=%u\n", cmd, millis() - start, resp.length());
   return false;
 }
 

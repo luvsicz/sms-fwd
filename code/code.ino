@@ -371,15 +371,32 @@ void loop() {
       unsigned long now = millis();
       if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
         lastMqttReconnectAttempt = now;
+        unsigned long mqttStepStart = millis();
+        Serial.println("[耗时] START loop-MQTT重连调用");
         mqttReconnect();
+        Serial.printf("[耗时] END loop-MQTT重连调用: elapsed=%lums\n", millis() - mqttStepStart);
       }
     } else {
+      unsigned long mqttStepStart = millis();
+      static unsigned long lastMqttLoopSampleLog = 0;
+      bool logMqttLoopSample = (mqttStepStart - lastMqttLoopSampleLog >= 5000);
+      if (logMqttLoopSample) {
+        lastMqttLoopSampleLog = mqttStepStart;
+        Serial.println("[耗时] START loop-MQTT.loop");
+      }
       mqttClient.loop();
-      
+      unsigned long mqttLoopElapsed = millis() - mqttStepStart;
+      if (logMqttLoopSample || mqttLoopElapsed > 100) {
+        Serial.printf("[耗时] END loop-MQTT.loop: elapsed=%lums\n", mqttLoopElapsed);
+      }
+
       unsigned long now = millis();
       if (now - lastMqttStatusReport > MQTT_STATUS_INTERVAL) {
         lastMqttStatusReport = now;
+        mqttStepStart = millis();
+        Serial.println("[耗时] START loop-MQTT状态上报调用");
         publishMqttDeviceStatus();
+        Serial.printf("[耗时] END loop-MQTT状态上报调用: elapsed=%lums\n", millis() - mqttStepStart);
       }
     }
   }
