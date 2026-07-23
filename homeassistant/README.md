@@ -44,6 +44,11 @@
 | 重启 | button | 远程重启设备 |
 | 最近短信发送者 | sensor | 最后收到短信的号码 |
 | 最近短信内容 | sensor | 最后收到的短信内容 |
+| 最新日志 | sensor | 最近一条普通设备日志 |
+| 最近慢操作 | sensor | 最近一次超过阈值的耗时步骤 |
+| 最近错误日志 | sensor | 最近一次错误日志 |
+| 最新耗时 | sensor | 最近一次耗时指标，单位 ms |
+| 设备日志事件 | event | 普通日志、耗时、慢操作、错误事件 |
 
 ### 双主题同步
 
@@ -53,6 +58,37 @@
 2. **HA 自动发现主题**：`homeassistant/sensor/sms_forwarder_<设备ID>/state`
 
 这意味着即使启用了自动发现，你仍然可以使用自定义主题进行其他集成。
+
+### 日志上报主题
+
+设备会通过 MQTT 上报普通日志、耗时指标、慢操作和错误日志：
+
+| 主题 | 说明 | Retain |
+|------|------|--------|
+| `sms/<设备ID>/log` | 普通设备日志 | 否 |
+| `sms/<设备ID>/log/slow` | 慢操作日志 | 否 |
+| `sms/<设备ID>/log/error` | 错误日志 | 否 |
+| `sms/<设备ID>/metric/timing` | 耗时指标 | 否 |
+| `homeassistant/event/sms_forwarder_<设备ID>_log/event` | HA 日志事件 | 否 |
+
+日志 payload 为 JSON，例如：
+
+```json
+{
+  "event_type": "timing",
+  "level": "info",
+  "module": "mqtt",
+  "step": "MQTT设备状态上报",
+  "elapsed_ms": 42,
+  "success": true,
+  "time": "2026-06-13 20:30:00",
+  "uptime": 505,
+  "free_heap": 278160,
+  "device": "a1b2c3"
+}
+```
+
+> 日志 topic 不使用 retained，避免 HA 重启后旧日志误触发自动化。固件内部使用小队列分批发送，降低 MQTT 日志上报本身造成阻塞的风险。
 
 ---
 
@@ -103,6 +139,10 @@ homeassistant:
 | sensor.短信转发器_ip | 设备 IP 地址 |
 | sensor.最近短信发送者 | 最后收到短信的号码 |
 | sensor.最近短信内容 | 最后收到的短信内容 |
+| sensor.短信转发器最新日志 | 最近一条普通日志 |
+| sensor.短信转发器最近慢操作 | 最近一次慢操作 |
+| sensor.短信转发器最近错误日志 | 最近一次错误 |
+| sensor.短信转发器最新耗时 | 最近一次耗时指标 |
 | binary_sensor.短信转发器在线 | 在线状态开关 |
 
 > ⚠️ 如果显示 unavailable：

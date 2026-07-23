@@ -7,9 +7,189 @@
  */
 
 #include <PubSubClient.h>
+#include "push_service.h"
 
 static void logMqttElapsed(const char* label, unsigned long start) {
-  Serial.printf("[耗时] END %s: elapsed=%lums\n", label, millis() - start);
+  unsigned long elapsed = millis() - start;
+  Serial.printf("[耗时] END %s: elapsed=%lums\n", label, elapsed);
+  publishTimingLog("mqtt", label, elapsed, true);
+}
+
+
+static const uint8_t MQTT_LOG_QUEUE_SIZE = 16;
+static const uint8_t MQTT_LOG_PROCESS_BURST = 2;
+static const unsigned long MQTT_SLOW_LOG_THRESHOLD_MS = 1000;
+static MqttLogEntry mqttLogQueue[MQTT_LOG_QUEUE_SIZE];
+static uint8_t mqttLogQueueHead = 0;
+static uint8_t mqttLogQueueTail = 0;
+static uint8_t mqttLogQueueCount = 0;
+static bool mqttLogQueueBusy = false;
+
+static String truncateLogText(const String& text, size_t maxLen) {
+  if (text.length() <= maxLen) return text;
+  if (maxLen <= 3) return text.substring(0, maxLen);
+  return text.substring(0, maxLen - 3) + "...";
+}
+
+static String mqttLogTimeString() {
+  String ts = getCurrentTimeString();
+  if (ts.length() == 0) ts = "";
+  return ts;
+}
+
+static String mqttLogTopicByKind(MqttLogKind kind) {
+  switch (kind) {
+    case MQTT_LOG_KIND_TIMING: return mqttTopicMetricTiming;
+    case MQTT_LOG_KIND_ERROR: return mqttTopicLogError;
+    case MQTT_LOG_KIND_SLOW: return mqttTopicLogSlow;
+    default: return mqttTopicLog;
+  }
+}
+
+static String buildMqttLogPayload(const MqttLogEntry& entry) {
+  String json = "{";
+  switch (entry.kind) {
+    case MQTT_LOG_KIND_TIMING:
+      json += "\"event_type\":\"timing\",";
+      json += "\"level\":\"" + entry.level + "\",";
+      json += "\"module\":\"" + jsonEscape(entry.module) + "\",";
+      json += "\"step\":\"" + jsonEscape(entry.step) + "\",";
+      json += "\"elapsed_ms\":" + String(entry.elapsedMs) + ",";
+      json += "\"success\":" + String(entry.success ? "true" : "false") + ",";
+      if (entry.thresholdMs > 0) {
+        json += "\"threshold_ms\":" + String(entry.thresholdMs) + ",";
+      }
+      break;
+    case MQTT_LOG_KIND_ERROR:
+      json += "\"event_type\":\"error_log\",";
+      json += "\"level\":\"" + entry.level + "\",";
+      json += "\"module\":\"" + jsonEscape(entry.module) + "\",";
+      json += "\"step\":\"" + jsonEscape(entry.step) + "\",";
+      json += "\"message\":\"" + jsonEscape(entry.message) + "\",";
+      json += "\"error\":\"" + jsonEscape(entry.error) + "\",";
+      json += "\"elapsed_ms\":" + String(entry.elapsedMs) + ",";
+      json += "\"success\":" + String(entry.success ? "true" : "false") + ",";
+      break;
+    case MQTT_LOG_KIND_SLOW:
+      json += "\"event_type\":\"slow_operation\",";
+      json += "\"level\":\"" + entry.level + "\",";
+      json += "\"module\":\"" + jsonEscape(entry.module) + "\",";
+      json += "\"step\":\"" + jsonEscape(entry.step) + "\",";
+      json += "\"message\":\"" + jsonEscape(entry.message) + "\",";
+      json += "\"elapsed_ms\":" + String(entry.elapsedMs) + ",";
+      json += "\"threshold_ms\":" + String(entry.thresholdMs) + ",";
+      json += "\"success\":" + String(entry.success ? "true" : "false") + ",";
+      break;
+    case MQTT_LOG_KIND_INFO:
+    default:
+      json += "\"event_type\":\"device_log\",";
+      json += "\"level\":\"" + entry.level + "\",";
+      json += "\"module\":\"" + jsonEscape(entry.module) + "\",";
+      json += "\"message\":\"" + jsonEscape(entry.message) + "\",";
+      break;
+  }
+  json += "\"time\":\"" + jsonEscape(mqttLogTimeString()) + "\",";
+  json += "\"uptime\":" + String(millis() / 1000) + ",";
+  json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"device\":\"" + mqttDeviceId + "\"";
+  json += "}";
+  return json;
+}
+
+static void enqueueMqttLogEntry(const MqttLogEntry& entry) {
+  MqttLogEntry stored = entry;
+  stored.timestampMs = millis();
+  if (mqttLogQueueCount >= MQTT_LOG_QUEUE_SIZE) {
+    mqttLogQueue[mqttLogQueueTail] = stored;
+    mqttLogQueueTail = (mqttLogQueueTail + 1) % MQTT_LOG_QUEUE_SIZE;
+    mqttLogQueueHead = mqttLogQueueTail;
+  } else {
+    mqttLogQueue[mqttLogQueueHead] = stored;
+    mqttLogQueueHead = (mqttLogQueueHead + 1) % MQTT_LOG_QUEUE_SIZE;
+    mqttLogQueueCount++;
+  }
+}
+
+static void publishMqttLogEntryToTopic(const String& topic, const String& payload) {
+  if (topic.length() == 0) return;
+  mqttClient.publish(topic.c_str(), payload.c_str(), false);
+}
+
+void publishDeviceLog(const char* level, const char* module, const char* message) {
+  if (!config.mqttEnabled) return;
+  MqttLogEntry entry;
+  entry.kind = MQTT_LOG_KIND_INFO;
+  entry.level = level && strlen(level) > 0 ? String(level) : "info";
+  entry.module = module ? truncateLogText(String(module), 32) : "system";
+  entry.message = message ? truncateLogText(String(message), 180) : "";
+  entry.step = "";
+  entry.error = "";
+  entry.elapsedMs = 0;
+  entry.thresholdMs = 0;
+  entry.success = true;
+  enqueueMqttLogEntry(entry);
+}
+
+void publishTimingLog(const char* module, const char* step, unsigned long elapsedMs, bool success) {
+  if (!config.mqttEnabled) return;
+  MqttLogEntry entry;
+  entry.kind = MQTT_LOG_KIND_TIMING;
+  entry.level = elapsedMs >= MQTT_SLOW_LOG_THRESHOLD_MS ? "warning" : "info";
+  entry.module = module ? truncateLogText(String(module), 32) : "timing";
+  entry.message = "";
+  entry.step = step ? truncateLogText(String(step), 80) : "";
+  entry.error = "";
+  entry.elapsedMs = elapsedMs;
+  entry.thresholdMs = elapsedMs >= MQTT_SLOW_LOG_THRESHOLD_MS ? MQTT_SLOW_LOG_THRESHOLD_MS : 0;
+  entry.success = success;
+  enqueueMqttLogEntry(entry);
+
+  if (elapsedMs >= MQTT_SLOW_LOG_THRESHOLD_MS) {
+    MqttLogEntry slow = entry;
+    slow.kind = MQTT_LOG_KIND_SLOW;
+    slow.level = "warning";
+    slow.message = "操作耗时超过阈值";
+    slow.thresholdMs = MQTT_SLOW_LOG_THRESHOLD_MS;
+    enqueueMqttLogEntry(slow);
+  }
+}
+
+void publishErrorLog(const char* module, const char* step, const char* message, const char* error, unsigned long elapsedMs) {
+  if (!config.mqttEnabled) return;
+  MqttLogEntry entry;
+  entry.kind = MQTT_LOG_KIND_ERROR;
+  entry.level = "error";
+  entry.module = module ? truncateLogText(String(module), 32) : "system";
+  entry.message = message ? truncateLogText(String(message), 160) : "";
+  entry.step = step ? truncateLogText(String(step), 80) : "";
+  entry.error = error ? truncateLogText(String(error), 80) : "";
+  entry.elapsedMs = elapsedMs;
+  entry.thresholdMs = 0;
+  entry.success = false;
+  enqueueMqttLogEntry(entry);
+}
+
+void processMqttLogQueue() {
+  if (mqttLogQueueBusy) return;
+  if (!config.mqttEnabled || !mqttClient.connected()) return;
+  if (mqttLogQueueCount == 0) return;
+
+  mqttLogQueueBusy = true;
+  uint8_t processed = 0;
+  while (mqttLogQueueCount > 0 && processed < MQTT_LOG_PROCESS_BURST) {
+    MqttLogEntry entry = mqttLogQueue[mqttLogQueueTail];
+    mqttLogQueueTail = (mqttLogQueueTail + 1) % MQTT_LOG_QUEUE_SIZE;
+    mqttLogQueueCount--;
+
+    String payload = buildMqttLogPayload(entry);
+    publishMqttLogEntryToTopic(mqttLogTopicByKind(entry.kind), payload);
+    if (config.mqttHaDiscovery && mqttHaLogEventTopic.length() > 0) {
+      publishMqttLogEntryToTopic(mqttHaLogEventTopic, payload);
+    }
+    processed++;
+    yield();
+  }
+  mqttLogQueueBusy = false;
 }
 
 // 获取 MAC 地址后缀作为设备唯一 ID
@@ -31,7 +211,11 @@ void initMqttTopics() {
   mqttTopicCallReceived = prefix + "/call/received";
   mqttTopicSmsSent = prefix + "/sms/sent";
   mqttTopicPingResult = prefix + "/ping/result";
-  
+  mqttTopicLog = prefix + "/log";
+  mqttTopicLogSlow = prefix + "/log/slow";
+  mqttTopicLogError = prefix + "/log/error";
+  mqttTopicMetricTiming = prefix + "/metric/timing";
+
   // 用户自定义前缀 - 订阅主题
   mqttTopicSmsSend = prefix + "/sms/send";
   mqttTopicPing = prefix + "/ping";
@@ -43,6 +227,7 @@ void initMqttTopics() {
   mqttHaStatusTopic = haPrefix + "/sensor/sms_forwarder_" + mqttDeviceId + "/state";
   mqttHaSmsReceivedTopic = haPrefix + "/event/sms_forwarder_" + mqttDeviceId + "_sms/event";
   mqttHaCallReceivedTopic = haPrefix + "/event/sms_forwarder_" + mqttDeviceId + "_call/event";
+  mqttHaLogEventTopic = haPrefix + "/event/sms_forwarder_" + mqttDeviceId + "_log/event";
 
   Serial.println("MQTT设备ID: " + mqttDeviceId);
   Serial.println("用户主题前缀: " + prefix);
@@ -222,7 +407,74 @@ void publishHaDiscoveryConfig() {
   callEventConfig += "}";
   mqttClient.publish(callEventConfigTopic.c_str(), callEventConfig.c_str(), true);
 
+  // 13. 最新日志传感器
+  String lastLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_log/config";
+  String lastLogConfig = "{";
+  lastLogConfig += "\"name\":\"最新日志\",";
+  lastLogConfig += "\"unique_id\":\"" + nodeId + "_last_log\",";
+  lastLogConfig += "\"state_topic\":\"" + mqttTopicLog + "\",";
+  lastLogConfig += "\"value_template\":\"{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}\",";
+  lastLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLog + "\",";
+  lastLogConfig += "\"icon\":\"mdi:text-box-search\",";
+  lastLogConfig += deviceInfo;
+  lastLogConfig += "}";
+  mqttClient.publish(lastLogConfigTopic.c_str(), lastLogConfig.c_str(), true);
+
+  // 14. 最近慢操作传感器
+  String slowLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_slow_log/config";
+  String slowLogConfig = "{";
+  slowLogConfig += "\"name\":\"最近慢操作\",";
+  slowLogConfig += "\"unique_id\":\"" + nodeId + "_last_slow_log\",";
+  slowLogConfig += "\"state_topic\":\"" + mqttTopicLogSlow + "\",";
+  slowLogConfig += "\"value_template\":\"{{ value_json.step | default('无') }}\",";
+  slowLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLogSlow + "\",";
+  slowLogConfig += "\"icon\":\"mdi:alert-clock\",";
+  slowLogConfig += deviceInfo;
+  slowLogConfig += "}";
+  mqttClient.publish(slowLogConfigTopic.c_str(), slowLogConfig.c_str(), true);
+
+  // 15. 最近错误传感器
+  String errorLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_error_log/config";
+  String errorLogConfig = "{";
+  errorLogConfig += "\"name\":\"最近错误日志\",";
+  errorLogConfig += "\"unique_id\":\"" + nodeId + "_last_error_log\",";
+  errorLogConfig += "\"state_topic\":\"" + mqttTopicLogError + "\",";
+  errorLogConfig += "\"value_template\":\"{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}\",";
+  errorLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLogError + "\",";
+  errorLogConfig += "\"icon\":\"mdi:alert-circle-outline\",";
+  errorLogConfig += deviceInfo;
+  errorLogConfig += "}";
+  mqttClient.publish(errorLogConfigTopic.c_str(), errorLogConfig.c_str(), true);
+
+  // 16. 最新耗时传感器
+  String timingConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_timing/config";
+  String timingConfig = "{";
+  timingConfig += "\"name\":\"最新耗时\",";
+  timingConfig += "\"unique_id\":\"" + nodeId + "_last_timing\",";
+  timingConfig += "\"state_topic\":\"" + mqttTopicMetricTiming + "\",";
+  timingConfig += "\"value_template\":\"{{ value_json.elapsed_ms | default(0) }}\",";
+  timingConfig += "\"unit_of_measurement\":\"ms\",";
+  timingConfig += "\"state_class\":\"measurement\",";
+  timingConfig += "\"json_attributes_topic\":\"" + mqttTopicMetricTiming + "\",";
+  timingConfig += "\"icon\":\"mdi:speedometer\",";
+  timingConfig += deviceInfo;
+  timingConfig += "}";
+  mqttClient.publish(timingConfigTopic.c_str(), timingConfig.c_str(), true);
+
+  // 17. 日志事件实体
+  String logEventConfigTopic = haPrefix + "/event/" + nodeId + "_log/config";
+  String logEventConfig = "{";
+  logEventConfig += "\"name\":\"设备日志事件\",";
+  logEventConfig += "\"unique_id\":\"" + nodeId + "_log_event\",";
+  logEventConfig += "\"state_topic\":\"" + mqttHaLogEventTopic + "\",";
+  logEventConfig += "\"event_types\":[\"device_log\",\"timing\",\"slow_operation\",\"error_log\"],";
+  logEventConfig += "\"icon\":\"mdi:text-box-search\",";
+  logEventConfig += deviceInfo;
+  logEventConfig += "}";
+  mqttClient.publish(logEventConfigTopic.c_str(), logEventConfig.c_str(), true);
+
   Serial.println("HA自动发现配置已发布");
+  publishDeviceLog("info", "mqtt", "HA自动发现配置已发布");
 }
 
 // MQTT 重连函数
@@ -267,7 +519,8 @@ void mqttReconnect() {
   
   if (connected) {
     Serial.println("MQTT连接成功");
-    
+    publishDeviceLog("info", "mqtt", "MQTT连接成功");
+
     // 订阅命令主题
     mqttClient.subscribe(mqttTopicSmsSend.c_str());
     mqttClient.subscribe(mqttTopicPing.c_str());
@@ -285,6 +538,7 @@ void mqttReconnect() {
   } else {
     Serial.print("MQTT连接失败, 错误码: ");
     Serial.println(mqttClient.state());
+    publishErrorLog("mqtt", "mqttReconnect", "MQTT连接失败", String(mqttClient.state()).c_str());
   }
   logMqttElapsed("MQTT重连", reconnectStart);
 }
@@ -482,7 +736,8 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   }
   
   Serial.println("MQTT推送短信...");
-  
+  publishDeviceLog("info", "mqtt", "MQTT推送短信");
+
   String json = "{";
   json += "\"event_type\":\"sms_received\",";
   json += "\"sender\":\"" + jsonEscape(String(sender)) + "\",";
@@ -510,8 +765,10 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   
   if (success1) {
     Serial.println("MQTT短信推送完成");
+    publishDeviceLog("info", "mqtt", "MQTT短信推送完成");
   } else {
     Serial.println("MQTT短信推送失败");
+    publishErrorLog("mqtt", "publishMqttSmsReceived", "MQTT短信推送失败", "publish_failed");
   }
 }
 
@@ -532,6 +789,7 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
   }
 
   Serial.println("MQTT推送来电通知...");
+  publishDeviceLog("info", "mqtt", "MQTT推送来电通知");
 
   String json = "{";
   json += "\"event_type\":\"incoming_call\",";
@@ -556,8 +814,10 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
 
   if (success1) {
     Serial.println("MQTT来电推送完成");
+    publishDeviceLog("info", "mqtt", "MQTT来电推送完成");
   } else {
     Serial.println("MQTT来电推送失败");
+    publishErrorLog("mqtt", "publishMqttCallReceived", "MQTT来电推送失败", "publish_failed");
   }
 }
 
@@ -577,6 +837,11 @@ void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   bool successPublish = mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布发送短信结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布发送短信结果: " + String(success ? "成功" : "失败"));
+  if (successPublish) {
+    publishDeviceLog("info", "mqtt", "MQTT发布发送短信结果完成");
+  } else {
+    publishErrorLog("mqtt", "publishMqttSmsSent", "MQTT发布发送短信结果失败", "publish_failed");
+  }
 }
 
 // 发布 Ping 测试结果
@@ -595,6 +860,11 @@ void publishMqttPingResult(const char* host, bool success, const char* result) {
   bool successPublish = mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布Ping结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布Ping结果: " + String(success ? "成功" : "失败"));
+  if (successPublish) {
+    publishDeviceLog("info", "mqtt", "MQTT发布Ping结果完成");
+  } else {
+    publishErrorLog("mqtt", "publishMqttPingResult", "MQTT发布Ping结果失败", "publish_failed");
+  }
 }
 
 // 发布设备状态（双主题）
@@ -626,6 +896,7 @@ void publishMqttStatus(const char* status) {
   
   Serial.println("MQTT发布状态: " + String(status));
   logMqttElapsed("MQTT发布状态", statusStart);
+  publishDeviceLog("info", "mqtt", (String("MQTT发布状态: ") + status).c_str());
 }
 
 // 定期发布设备详细状态（双主题，用于 Home Assistant 等平台）
@@ -733,4 +1004,5 @@ void publishMqttDeviceStatus() {
   
   Serial.println("MQTT上报设备状态");
   logMqttElapsed("MQTT设备状态上报", statusStart);
+  publishDeviceLog("info", "mqtt", "MQTT上报设备状态");
 }

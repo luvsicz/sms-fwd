@@ -119,6 +119,44 @@ mqtt:
         }
       icon: mdi:phone-in-talk
 
+    # 最新设备日志
+    - name: "短信转发器最新日志"
+      unique_id: sms_forwarder_last_log
+      state_topic: "sms/a1b2c3/log"
+      value_template: >-
+        {% set msg = value_json.message | default('') %}
+        {% if msg | length > 80 %}{{ msg[:80] }}...{% else %}{{ msg }}{% endif %}
+      json_attributes_topic: "sms/a1b2c3/log"
+      icon: mdi:text-box-search
+
+    # 最近慢操作
+    - name: "短信转发器最近慢操作"
+      unique_id: sms_forwarder_last_slow_log
+      state_topic: "sms/a1b2c3/log/slow"
+      value_template: "{{ value_json.step | default('无') }}"
+      json_attributes_topic: "sms/a1b2c3/log/slow"
+      icon: mdi:alert-clock
+
+    # 最近错误日志
+    - name: "短信转发器最近错误日志"
+      unique_id: sms_forwarder_last_error_log
+      state_topic: "sms/a1b2c3/log/error"
+      value_template: >-
+        {% set msg = value_json.message | default(value_json.error | default('')) %}
+        {% if msg | length > 80 %}{{ msg[:80] }}...{% else %}{{ msg }}{% endif %}
+      json_attributes_topic: "sms/a1b2c3/log/error"
+      icon: mdi:alert-circle-outline
+
+    # 最新耗时指标
+    - name: "短信转发器最新耗时"
+      unique_id: sms_forwarder_last_timing
+      state_topic: "sms/a1b2c3/metric/timing"
+      value_template: "{{ value_json.elapsed_ms | default(0) }}"
+      unit_of_measurement: "ms"
+      state_class: measurement
+      json_attributes_topic: "sms/a1b2c3/metric/timing"
+      icon: mdi:speedometer
+
   # 二进制传感器 - 在线状态
   binary_sensor:
     - name: "短信转发器在线"
@@ -154,6 +192,16 @@ mqtt:
       event_types:
         - incoming_call
       icon: mdi:phone-ring
+
+    - name: "短信转发器日志事件"
+      unique_id: sms_forwarder_log_event
+      state_topic: "homeassistant/event/sms_forwarder_a1b2c3_log/event"
+      event_types:
+        - device_log
+        - timing
+        - slow_operation
+        - error_log
+      icon: mdi:text-box-search
 
 # ===========================================
 # Lovelace 仪表板卡片配置示例

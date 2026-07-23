@@ -79,6 +79,10 @@ String mqttTopicSmsReceived = "";
 String mqttTopicCallReceived = "";
 String mqttTopicSmsSent = "";
 String mqttTopicPingResult = "";
+String mqttTopicLog = "";
+String mqttTopicLogSlow = "";
+String mqttTopicLogError = "";
+String mqttTopicMetricTiming = "";
 String mqttTopicSmsSend = "";
 String mqttTopicPing = "";
 String mqttTopicCmd = "";
@@ -86,6 +90,7 @@ String mqttTopicCmd = "";
 String mqttHaStatusTopic = "";
 String mqttHaSmsReceivedTopic = "";
 String mqttHaCallReceivedTopic = "";
+String mqttHaLogEventTopic = "";
 
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastMqttStatusReport = 0;
@@ -398,6 +403,8 @@ void loop() {
         publishMqttDeviceStatus();
         Serial.printf("[耗时] END loop-MQTT状态上报调用: elapsed=%lums\n", millis() - mqttStepStart);
       }
+
+      processMqttLogQueue();
     }
   }
   
