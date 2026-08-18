@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_system.h>
 #include <vector>
 
 // 串口映射
@@ -60,6 +61,11 @@ struct Statistics {
   unsigned long pushSuccess;    // 推送成功数
   unsigned long pushFailed;     // 推送失败数
   unsigned long bootCount;      // 启动次数
+  unsigned long brownoutResets; // 欠压复位次数（强烈指向供电不足）
+  unsigned long powerOnResets;  // 上电复位次数（可能是断电/供电跌落）
+  unsigned long watchdogResets; // 看门狗复位次数
+  unsigned long softwareResets; // 软件主动重启次数
+  unsigned long panicResets;    // 异常崩溃复位次数
 };
 
 struct HistoryCleanupResult {
@@ -172,6 +178,9 @@ extern int serialBufLen;
 extern SmsRecord smsHistory[MAX_SMS_HISTORY];
 extern int smsHistoryIndex;
 extern Statistics stats;
+extern esp_reset_reason_t lastResetReasonCode;
+extern String lastResetReasonText;
+extern bool lastResetPowerSuspected;
 
 // 函数声明
 void saveConfig();
@@ -195,5 +204,7 @@ bool isContentFiltered(const char* content);
 void saveStats();
 void loadStats();
 void resetStats(bool preserveBootCount = true);
+String resetReasonToString(esp_reset_reason_t reason);
+bool isPowerRelatedReset(esp_reset_reason_t reason);
 
 #endif // CONFIG_H

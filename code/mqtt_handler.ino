@@ -15,7 +15,6 @@ static void logMqttElapsed(const char* label, unsigned long start) {
   publishTimingLog("mqtt", label, elapsed, true);
 }
 
-
 static const uint8_t MQTT_LOG_QUEUE_SIZE = 16;
 static const uint8_t MQTT_LOG_PROCESS_BURST = 2;
 static const unsigned long MQTT_SLOW_LOG_THRESHOLD_MS = 1000;
@@ -56,9 +55,7 @@ static String buildMqttLogPayload(const MqttLogEntry& entry) {
       json += "\"step\":\"" + jsonEscape(entry.step) + "\",";
       json += "\"elapsed_ms\":" + String(entry.elapsedMs) + ",";
       json += "\"success\":" + String(entry.success ? "true" : "false") + ",";
-      if (entry.thresholdMs > 0) {
-        json += "\"threshold_ms\":" + String(entry.thresholdMs) + ",";
-      }
+      if (entry.thresholdMs > 0) json += "\"threshold_ms\":" + String(entry.thresholdMs) + ",";
       break;
     case MQTT_LOG_KIND_ERROR:
       json += "\"event_type\":\"error_log\",";
@@ -192,20 +189,53 @@ void processMqttLogQueue() {
   mqttLogQueueBusy = false;
 }
 
-// 获取 MAC 地址后缀作为设备唯一 ID
 String getMacSuffix() {
   String mac = WiFi.macAddress();
   mac.replace(":", "");
   mac.toLowerCase();
-  return mac.substring(6);  // 取后 6 位
+  return mac.substring(6);
 }
 
-// 初始化 MQTT 主题
+static String mqttResetStatusFields() {
+  String json = "";
+  json += "\"last_reset_reason\":\"" + jsonEscape(lastResetReasonText) + "\",";
+  json += "\"last_reset_reason_code\":" + String((int)lastResetReasonCode) + ",";
+  json += "\"power_suspected\":" + String(lastResetPowerSuspected ? "true" : "false") + ",";
+  json += "\"brownout_resets\":" + String(stats.brownoutResets) + ",";
+  json += "\"poweron_resets\":" + String(stats.powerOnResets) + ",";
+  json += "\"watchdog_resets\":" + String(stats.watchdogResets) + ",";
+  json += "\"software_resets\":" + String(stats.softwareResets) + ",";
+  json += "\"panic_resets\":" + String(stats.panicResets);
+  return json;
+}
+
+String buildMqttStatusJson(const char* status = "online") {
+  int wifiRssi = WiFi.RSSI();
+  String wifiStatus = "未知";
+  if (wifiRssi >= -50) wifiStatus = "极好";
+  else if (wifiRssi >= -60) wifiStatus = "很好";
+  else if (wifiRssi >= -70) wifiStatus = "良好";
+  else if (wifiRssi >= -80) wifiStatus = "一般";
+  else if (wifiRssi >= -90) wifiStatus = "较弱";
+  else if (wifiRssi != 0) wifiStatus = "很差";
+
+  String json = "{";
+  json += "\"status\":\"" + jsonEscape(String(status)) + "\",";
+  json += "\"device\":\"" + mqttDeviceId + "\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"wifi_rssi\":" + String(wifiRssi) + ",";
+  json += "\"wifi_status\":\"" + jsonEscape(wifiStatus) + "\",";
+  json += "\"uptime\":" + String(millis() / 1000) + ",";
+  json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += mqttResetStatusFields();
+  json += "}";
+  return json;
+}
+
 void initMqttTopics() {
   mqttDeviceId = getMacSuffix();
   String prefix = config.mqttPrefix + "/" + mqttDeviceId;
   
-  // 用户自定义前缀 - 发布主题
   mqttTopicStatus = prefix + "/status";
   mqttTopicSmsReceived = prefix + "/sms/received";
   mqttTopicCallReceived = prefix + "/call/received";
@@ -216,12 +246,10 @@ void initMqttTopics() {
   mqttTopicLogError = prefix + "/log/error";
   mqttTopicMetricTiming = prefix + "/metric/timing";
 
-  // 用户自定义前缀 - 订阅主题
   mqttTopicSmsSend = prefix + "/sms/send";
   mqttTopicPing = prefix + "/ping";
   mqttTopicCmd = prefix + "/cmd";
   
-  // Home Assistant 自动发现主题（状态数据发布位置）
   String haPrefix = config.mqttHaPrefix;
   if (haPrefix.length() == 0) haPrefix = "homeassistant";
   mqttHaStatusTopic = haPrefix + "/sensor/sms_forwarder_" + mqttDeviceId + "/state";
@@ -236,7 +264,21 @@ void initMqttTopics() {
   }
 }
 
-// 发布 Home Assistant MQTT 自动发现配置
+static void publishHaStatusSensor(const String& haPrefix, const String& nodeId, const String& suffix, const String& name, const String& valueTemplate, const String& icon, const String& deviceInfo, const String& unit = "", const String& stateClass = "") {
+  String topic = haPrefix + "/sensor/" + nodeId + suffix + "/config";
+  String payload = "{";
+  payload += "\"name\":\"" + name + "\",";
+  payload += "\"unique_id\":\"" + nodeId + suffix + "\",";
+  payload += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
+  payload += "\"value_template\":\"" + valueTemplate + "\",";
+  if (unit.length() > 0) payload += "\"unit_of_measurement\":\"" + unit + "\",";
+  if (stateClass.length() > 0) payload += "\"state_class\":\"" + stateClass + "\",";
+  payload += "\"icon\":\"" + icon + "\",";
+  payload += deviceInfo;
+  payload += "}";
+  mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
 void publishHaDiscoveryConfig() {
   if (!config.mqttHaDiscovery || !mqttClient.connected()) return;
   
@@ -244,7 +286,6 @@ void publishHaDiscoveryConfig() {
   if (haPrefix.length() == 0) haPrefix = "homeassistant";
   String nodeId = "sms_forwarder_" + mqttDeviceId;
   
-  // 设备信息（所有实体共享）
   String deviceInfo = "\"device\":{";
   deviceInfo += "\"identifiers\":[\"" + nodeId + "\"],";
   deviceInfo += "\"name\":\"短信转发器 " + mqttDeviceId + "\",";
@@ -252,73 +293,34 @@ void publishHaDiscoveryConfig() {
   deviceInfo += "\"model\":\"ESP32-C3 SMS Forwarder\",";
   deviceInfo += "\"sw_version\":\"1.0\"";
   deviceInfo += "}";
-  
-  // 1. 设备状态传感器
-  String statusConfigTopic = haPrefix + "/sensor/" + nodeId + "_status/config";
-  String statusConfig = "{";
-  statusConfig += "\"name\":\"状态\",";
-  statusConfig += "\"unique_id\":\"" + nodeId + "_status\",";
-  statusConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
-  statusConfig += "\"value_template\":\"{{ value_json.status }}\",";
-  statusConfig += "\"icon\":\"mdi:message-text\",";
-  statusConfig += deviceInfo;
-  statusConfig += "}";
-  mqttClient.publish(statusConfigTopic.c_str(), statusConfig.c_str(), true);
-  
-  // 2. WiFi 信号传感器
-  String wifiConfigTopic = haPrefix + "/sensor/" + nodeId + "_wifi/config";
-  String wifiConfig = "{";
-  wifiConfig += "\"name\":\"WiFi信号\",";
-  wifiConfig += "\"unique_id\":\"" + nodeId + "_wifi\",";
-  wifiConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
-  wifiConfig += "\"value_template\":\"{{ value_json.wifi_rssi }}\",";
-  wifiConfig += "\"unit_of_measurement\":\"dBm\",";
-  wifiConfig += "\"device_class\":\"signal_strength\",";
-  wifiConfig += "\"icon\":\"mdi:wifi\",";
-  wifiConfig += deviceInfo;
-  wifiConfig += "}";
-  mqttClient.publish(wifiConfigTopic.c_str(), wifiConfig.c_str(), true);
-  
-  // 3. 4G 信号传感器
-  String lteConfigTopic = haPrefix + "/sensor/" + nodeId + "_lte/config";
-  String lteConfig = "{";
-  lteConfig += "\"name\":\"4G信号\",";
-  lteConfig += "\"unique_id\":\"" + nodeId + "_lte\",";
-  lteConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
-  lteConfig += "\"value_template\":\"{{ value_json.lte_rsrp }}\",";
-  lteConfig += "\"unit_of_measurement\":\"dBm\",";
-  lteConfig += "\"device_class\":\"signal_strength\",";
-  lteConfig += "\"icon\":\"mdi:signal-4g\",";
-  lteConfig += deviceInfo;
-  lteConfig += "}";
-  mqttClient.publish(lteConfigTopic.c_str(), lteConfig.c_str(), true);
-  
-  // 4. IP 地址传感器
-  String ipConfigTopic = haPrefix + "/sensor/" + nodeId + "_ip/config";
-  String ipConfig = "{";
-  ipConfig += "\"name\":\"IP地址\",";
-  ipConfig += "\"unique_id\":\"" + nodeId + "_ip\",";
-  ipConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
-  ipConfig += "\"value_template\":\"{{ value_json.ip }}\",";
-  ipConfig += "\"icon\":\"mdi:ip-network\",";
-  ipConfig += deviceInfo;
-  ipConfig += "}";
-  mqttClient.publish(ipConfigTopic.c_str(), ipConfig.c_str(), true);
-  
-  // 5. 运行时间传感器
-  String uptimeConfigTopic = haPrefix + "/sensor/" + nodeId + "_uptime/config";
-  String uptimeConfig = "{";
-  uptimeConfig += "\"name\":\"运行时间\",";
-  uptimeConfig += "\"unique_id\":\"" + nodeId + "_uptime\",";
-  uptimeConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
-  uptimeConfig += "\"value_template\":\"{{ (value_json.uptime | int / 3600) | round(1) }}\",";
-  uptimeConfig += "\"unit_of_measurement\":\"小时\",";
-  uptimeConfig += "\"icon\":\"mdi:clock-outline\",";
-  uptimeConfig += deviceInfo;
-  uptimeConfig += "}";
-  mqttClient.publish(uptimeConfigTopic.c_str(), uptimeConfig.c_str(), true);
-  
-  // 6. 在线状态二值传感器
+
+  publishHaStatusSensor(haPrefix, nodeId, "_status", "状态", "{{ value_json.status }}", "mdi:message-text", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_reset_reason", "上次复位原因", "{{ value_json.last_reset_reason | default('未知') }}", "mdi:restart-alert", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_reset_reason_code", "上次复位原因代码", "{{ value_json.last_reset_reason_code | default(0) }}", "mdi:numeric", deviceInfo);
+
+  String powerSuspectConfigTopic = haPrefix + "/binary_sensor/" + nodeId + "_power_suspect/config";
+  String powerSuspectConfig = "{";
+  powerSuspectConfig += "\"name\":\"疑似供电问题\",";
+  powerSuspectConfig += "\"unique_id\":\"" + nodeId + "_power_suspect\",";
+  powerSuspectConfig += "\"state_topic\":\"" + mqttHaStatusTopic + "\",";
+  powerSuspectConfig += "\"value_template\":\"{{ value_json.power_suspected | default(false) }}\",";
+  powerSuspectConfig += "\"payload_on\":\"true\",";
+  powerSuspectConfig += "\"payload_off\":\"false\",";
+  powerSuspectConfig += "\"device_class\":\"problem\",";
+  powerSuspectConfig += deviceInfo;
+  powerSuspectConfig += "}";
+  mqttClient.publish(powerSuspectConfigTopic.c_str(), powerSuspectConfig.c_str(), true);
+
+  publishHaStatusSensor(haPrefix, nodeId, "_brownout_resets", "欠压复位次数", "{{ value_json.brownout_resets | default(0) }}", "mdi:flash-alert", deviceInfo, "次", "measurement");
+  publishHaStatusSensor(haPrefix, nodeId, "_poweron_resets", "上电复位次数", "{{ value_json.poweron_resets | default(0) }}", "mdi:power-plug", deviceInfo, "次", "measurement");
+  publishHaStatusSensor(haPrefix, nodeId, "_watchdog_resets", "看门狗复位次数", "{{ value_json.watchdog_resets | default(0) }}", "mdi:dog-side", deviceInfo, "次", "measurement");
+  publishHaStatusSensor(haPrefix, nodeId, "_software_resets", "软件复位次数", "{{ value_json.software_resets | default(0) }}", "mdi:restart", deviceInfo, "次", "measurement");
+  publishHaStatusSensor(haPrefix, nodeId, "_panic_resets", "异常复位次数", "{{ value_json.panic_resets | default(0) }}", "mdi:alert-octagon", deviceInfo, "次", "measurement");
+  publishHaStatusSensor(haPrefix, nodeId, "_wifi", "WiFi信号", "{{ value_json.wifi_rssi }}", "mdi:wifi", deviceInfo, "dBm");
+  publishHaStatusSensor(haPrefix, nodeId, "_lte", "4G信号", "{{ value_json.lte_rsrp }}", "mdi:signal-4g", deviceInfo, "dBm");
+  publishHaStatusSensor(haPrefix, nodeId, "_ip", "IP地址", "{{ value_json.ip }}", "mdi:ip-network", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_uptime", "运行时间", "{{ (value_json.uptime | int / 3600) | round(1) }}", "mdi:clock-outline", deviceInfo, "小时");
+
   String onlineConfigTopic = haPrefix + "/binary_sensor/" + nodeId + "_online/config";
   String onlineConfig = "{";
   onlineConfig += "\"name\":\"在线\",";
@@ -332,7 +334,6 @@ void publishHaDiscoveryConfig() {
   onlineConfig += "}";
   mqttClient.publish(onlineConfigTopic.c_str(), onlineConfig.c_str(), true);
   
-  // 7. 重启按钮
   String restartConfigTopic = haPrefix + "/button/" + nodeId + "_restart/config";
   String restartConfig = "{";
   restartConfig += "\"name\":\"重启\",";
@@ -344,7 +345,6 @@ void publishHaDiscoveryConfig() {
   restartConfig += "}";
   mqttClient.publish(restartConfigTopic.c_str(), restartConfig.c_str(), true);
   
-  // 8. 最近短信发送者传感器
   String senderConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_sender/config";
   String senderConfig = "{";
   senderConfig += "\"name\":\"最近短信发送者\",";
@@ -356,7 +356,6 @@ void publishHaDiscoveryConfig() {
   senderConfig += "}";
   mqttClient.publish(senderConfigTopic.c_str(), senderConfig.c_str(), true);
   
-  // 9. 最近短信内容传感器
   String messageConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_message/config";
   String messageConfig = "{";
   messageConfig += "\"name\":\"最近短信内容\",";
@@ -369,7 +368,6 @@ void publishHaDiscoveryConfig() {
   messageConfig += "}";
   mqttClient.publish(messageConfigTopic.c_str(), messageConfig.c_str(), true);
 
-  // 10. 短信事件实体
   String smsEventConfigTopic = haPrefix + "/event/" + nodeId + "_sms/config";
   String smsEventConfig = "{";
   smsEventConfig += "\"name\":\"短信通知\",";
@@ -381,7 +379,6 @@ void publishHaDiscoveryConfig() {
   smsEventConfig += "}";
   mqttClient.publish(smsEventConfigTopic.c_str(), smsEventConfig.c_str(), true);
 
-  // 11. 最近来电号码传感器
   String lastCallerConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_caller/config";
   String lastCallerConfig = "{";
   lastCallerConfig += "\"name\":\"最近来电号码\",";
@@ -394,7 +391,6 @@ void publishHaDiscoveryConfig() {
   lastCallerConfig += "}";
   mqttClient.publish(lastCallerConfigTopic.c_str(), lastCallerConfig.c_str(), true);
 
-  // 12. 来电事件实体
   String callEventConfigTopic = haPrefix + "/event/" + nodeId + "_call/config";
   String callEventConfig = "{";
   callEventConfig += "\"name\":\"来电通知\",";
@@ -407,61 +403,11 @@ void publishHaDiscoveryConfig() {
   callEventConfig += "}";
   mqttClient.publish(callEventConfigTopic.c_str(), callEventConfig.c_str(), true);
 
-  // 13. 最新日志传感器
-  String lastLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_log/config";
-  String lastLogConfig = "{";
-  lastLogConfig += "\"name\":\"最新日志\",";
-  lastLogConfig += "\"unique_id\":\"" + nodeId + "_last_log\",";
-  lastLogConfig += "\"state_topic\":\"" + mqttTopicLog + "\",";
-  lastLogConfig += "\"value_template\":\"{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}\",";
-  lastLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLog + "\",";
-  lastLogConfig += "\"icon\":\"mdi:text-box-search\",";
-  lastLogConfig += deviceInfo;
-  lastLogConfig += "}";
-  mqttClient.publish(lastLogConfigTopic.c_str(), lastLogConfig.c_str(), true);
+  publishHaStatusSensor(haPrefix, nodeId, "_last_log", "最新日志", "{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}", "mdi:text-box-search", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_last_slow_log", "最近慢操作", "{{ value_json.step | default('无') }}", "mdi:alert-clock", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_last_error_log", "最近错误日志", "{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}", "mdi:alert-circle-outline", deviceInfo);
+  publishHaStatusSensor(haPrefix, nodeId, "_last_timing", "最新耗时", "{{ value_json.elapsed_ms | default(0) }}", "mdi:speedometer", deviceInfo, "ms", "measurement");
 
-  // 14. 最近慢操作传感器
-  String slowLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_slow_log/config";
-  String slowLogConfig = "{";
-  slowLogConfig += "\"name\":\"最近慢操作\",";
-  slowLogConfig += "\"unique_id\":\"" + nodeId + "_last_slow_log\",";
-  slowLogConfig += "\"state_topic\":\"" + mqttTopicLogSlow + "\",";
-  slowLogConfig += "\"value_template\":\"{{ value_json.step | default('无') }}\",";
-  slowLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLogSlow + "\",";
-  slowLogConfig += "\"icon\":\"mdi:alert-clock\",";
-  slowLogConfig += deviceInfo;
-  slowLogConfig += "}";
-  mqttClient.publish(slowLogConfigTopic.c_str(), slowLogConfig.c_str(), true);
-
-  // 15. 最近错误传感器
-  String errorLogConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_error_log/config";
-  String errorLogConfig = "{";
-  errorLogConfig += "\"name\":\"最近错误日志\",";
-  errorLogConfig += "\"unique_id\":\"" + nodeId + "_last_error_log\",";
-  errorLogConfig += "\"state_topic\":\"" + mqttTopicLogError + "\",";
-  errorLogConfig += "\"value_template\":\"{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}\",";
-  errorLogConfig += "\"json_attributes_topic\":\"" + mqttTopicLogError + "\",";
-  errorLogConfig += "\"icon\":\"mdi:alert-circle-outline\",";
-  errorLogConfig += deviceInfo;
-  errorLogConfig += "}";
-  mqttClient.publish(errorLogConfigTopic.c_str(), errorLogConfig.c_str(), true);
-
-  // 16. 最新耗时传感器
-  String timingConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_timing/config";
-  String timingConfig = "{";
-  timingConfig += "\"name\":\"最新耗时\",";
-  timingConfig += "\"unique_id\":\"" + nodeId + "_last_timing\",";
-  timingConfig += "\"state_topic\":\"" + mqttTopicMetricTiming + "\",";
-  timingConfig += "\"value_template\":\"{{ value_json.elapsed_ms | default(0) }}\",";
-  timingConfig += "\"unit_of_measurement\":\"ms\",";
-  timingConfig += "\"state_class\":\"measurement\",";
-  timingConfig += "\"json_attributes_topic\":\"" + mqttTopicMetricTiming + "\",";
-  timingConfig += "\"icon\":\"mdi:speedometer\",";
-  timingConfig += deviceInfo;
-  timingConfig += "}";
-  mqttClient.publish(timingConfigTopic.c_str(), timingConfig.c_str(), true);
-
-  // 17. 日志事件实体
   String logEventConfigTopic = haPrefix + "/event/" + nodeId + "_log/config";
   String logEventConfig = "{";
   logEventConfig += "\"name\":\"设备日志事件\",";
@@ -477,7 +423,6 @@ void publishHaDiscoveryConfig() {
   publishDeviceLog("info", "mqtt", "HA自动发现配置已发布");
 }
 
-// MQTT 重连函数
 void mqttReconnect() {
   if (!config.mqttEnabled) return;
   if (config.mqttServer.length() == 0) return;
@@ -485,7 +430,6 @@ void mqttReconnect() {
   unsigned long reconnectStart = millis();
   Serial.println("[耗时] START MQTT重连");
 
-  // 配置服务器（可能配置变更了）
   mqttClient.setServer(config.mqttServer.c_str(), config.mqttPort);
   
   String clientId = "sms_" + mqttDeviceId;
@@ -493,35 +437,18 @@ void mqttReconnect() {
   Serial.println("客户端ID: " + clientId);
   
   bool connected = false;
-  
-  // 配置遗嘱消息（设备离线时自动发送）- 同时发送到两类主题
   String willMessage = "{\"status\":\"offline\",\"device\":\"" + mqttDeviceId + "\"}";
   
   if (config.mqttUser.length() > 0) {
-    connected = mqttClient.connect(
-      clientId.c_str(),
-      config.mqttUser.c_str(),
-      config.mqttPass.c_str(),
-      mqttTopicStatus.c_str(),
-      1,  // QoS
-      true,  // retain
-      willMessage.c_str()
-    );
+    connected = mqttClient.connect(clientId.c_str(), config.mqttUser.c_str(), config.mqttPass.c_str(), mqttTopicStatus.c_str(), 1, true, willMessage.c_str());
   } else {
-    connected = mqttClient.connect(
-      clientId.c_str(),
-      mqttTopicStatus.c_str(),
-      1,  // QoS
-      true,  // retain
-      willMessage.c_str()
-    );
+    connected = mqttClient.connect(clientId.c_str(), mqttTopicStatus.c_str(), 1, true, willMessage.c_str());
   }
   
   if (connected) {
     Serial.println("MQTT连接成功");
     publishDeviceLog("info", "mqtt", "MQTT连接成功");
 
-    // 订阅命令主题
     mqttClient.subscribe(mqttTopicSmsSend.c_str());
     mqttClient.subscribe(mqttTopicPing.c_str());
     mqttClient.subscribe(mqttTopicCmd.c_str());
@@ -530,10 +457,7 @@ void mqttReconnect() {
     Serial.println("  - " + mqttTopicPing);
     Serial.println("  - " + mqttTopicCmd);
     
-    // 发布 HA 自动发现配置
     publishHaDiscoveryConfig();
-    
-    // 发布上线状态
     publishMqttStatus("online");
   } else {
     Serial.print("MQTT连接失败, 错误码: ");
@@ -543,20 +467,15 @@ void mqttReconnect() {
   logMqttElapsed("MQTT重连", reconnectStart);
 }
 
-// MQTT 消息回调处理
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // 转换 payload 为字符串
   String message = "";
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  
+  for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+
   Serial.println("=== MQTT消息接收 ===");
   Serial.println("主题: " + String(topic));
   Serial.println("内容: " + message);
   Serial.println("====================");
   
-  // 处理发送短信命令
   if (String(topic) == mqttTopicSmsSend) {
     int phoneStart = message.indexOf("\"phone\"");
     int msgStart = message.indexOf("\"message\"");
@@ -591,11 +510,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println("短信命令格式错误");
       publishMqttSmsSent("", "", false);
     }
-  }
-  // 处理 Ping 命令
-  else if (String(topic) == mqttTopicPing) {
-    String host = "8.8.8.8";  // 默认目标
-    
+  } else if (String(topic) == mqttTopicPing) {
+    String host = "8.8.8.8";
+
     int hostStart = message.indexOf("\"host\"");
     if (hostStart >= 0) {
       int hostValStart = message.indexOf(":", hostStart) + 1;
@@ -610,8 +527,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     
     Serial.println("MQTT Ping命令: " + host);
-    
-    String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
+    sendATCommand("AT+CGACT=1,1", 10000);
     delay(500);
     
     String pingCmd = "AT+MPING=\"" + host + "\",30,1";
@@ -646,12 +562,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
               
               gotResult = true;
               pingSuccess = (result == 0 || result == 1) || (params.indexOf(',') >= 0 && params.length() > 5);
-              
-              if (pingSuccess && commaIdx > 0) {
-                resultMsg = params;
-              } else {
-                resultMsg = "错误码: " + String(result);
-              }
+              resultMsg = pingSuccess && commaIdx > 0 ? params : "错误码: " + String(result);
             }
             break;
           }
@@ -669,15 +580,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     
     sendATCommand("AT+CGACT=0,1", 5000);
-    
-    if (!gotResult) {
-      resultMsg = "超时";
-    }
-    
+    if (!gotResult) resultMsg = "超时";
     publishMqttPingResult(host.c_str(), pingSuccess, resultMsg.c_str());
-  }
-  // 处理控制命令
-  else if (String(topic) == mqttTopicCmd) {
+  } else if (String(topic) == mqttTopicCmd) {
     int actionStart = message.indexOf("\"action\"");
     if (actionStart >= 0) {
       int actionValStart = message.indexOf(":", actionStart) + 1;
@@ -694,42 +599,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         publishMqttStatus("restarting");
         delay(500);
         ESP.restart();
-      }
-      else if (actionRaw == "status") {
-        String statusJson = "{";
-        statusJson += "\"status\":\"online\",";
-        statusJson += "\"device\":\"" + mqttDeviceId + "\",";
-        statusJson += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-        statusJson += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-        statusJson += "\"uptime\":" + String(millis() / 1000) + ",";
-        statusJson += "\"free_heap\":" + String(ESP.getFreeHeap());
-        statusJson += "}";
+      } else if (actionRaw == "status") {
+        String statusJson = buildMqttStatusJson("online");
         mqttClient.publish(mqttTopicStatus.c_str(), statusJson.c_str(), true);
-        // 同步到 HA 主题
-        if (config.mqttHaDiscovery) {
-          mqttClient.publish(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
-        }
+        if (config.mqttHaDiscovery) mqttClient.publish(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
         Serial.println("已发送状态信息");
-      }
-      else {
+      } else {
         Serial.println("未知命令: " + actionRaw);
       }
     }
   }
 }
 
-// 发布收到短信通知（双主题）
 void publishMqttSmsReceived(const char* sender, const char* message, const char* timestamp) {
-  if (!config.mqttEnabled) {
-    return;
-  }
-  
+  if (!config.mqttEnabled) return;
   if (!mqttClient.connected()) {
     Serial.println("MQTT未连接，跳过短信推送");
     return;
   }
-  
-  // 仅控制模式下不推送短信内容
   if (config.mqttControlOnly) {
     Serial.println("MQTT仅控制模式，跳过短信推送");
     return;
@@ -747,14 +634,12 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
   
-  // 发布到用户自定义主题
   Serial.println(" 主题1: " + mqttTopicSmsReceived);
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布短信主题1");
   bool success1 = mqttClient.publish(mqttTopicSmsReceived.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布短信主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
-  // 发布到 HA 事件主题（如果启用）
   if (config.mqttHaDiscovery) {
     Serial.println(" 主题2 (HA): " + mqttHaSmsReceivedTopic);
     publishStart = millis();
@@ -772,17 +657,12 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   }
 }
 
-// 发布收到来电通知（双主题）
 void publishMqttCallReceived(const char* caller, const char* timestamp) {
-  if (!config.mqttEnabled) {
-    return;
-  }
-
+  if (!config.mqttEnabled) return;
   if (!mqttClient.connected()) {
     Serial.println("MQTT未连接，跳过来电推送");
     return;
   }
-
   if (config.mqttControlOnly) {
     Serial.println("MQTT仅控制模式，跳过来电推送");
     return;
@@ -821,7 +701,6 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
   }
 }
 
-// 发布发送短信结果
 void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   if (!config.mqttEnabled || !mqttClient.connected()) return;
   
@@ -837,20 +716,16 @@ void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   bool successPublish = mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布发送短信结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布发送短信结果: " + String(success ? "成功" : "失败"));
-  if (successPublish) {
-    publishDeviceLog("info", "mqtt", "MQTT发布发送短信结果完成");
-  } else {
-    publishErrorLog("mqtt", "publishMqttSmsSent", "MQTT发布发送短信结果失败", "publish_failed");
-  }
+  if (successPublish) publishDeviceLog("info", "mqtt", "MQTT发布发送短信结果完成");
+  else publishErrorLog("mqtt", "publishMqttSmsSent", "MQTT发布发送短信结果失败", "publish_failed");
 }
 
-// 发布 Ping 测试结果
 void publishMqttPingResult(const char* host, bool success, const char* result) {
   if (!config.mqttEnabled || !mqttClient.connected()) return;
   
   String json = "{";
   json += "\"success\":" + String(success ? "true" : "false") + ",";
-  json += "\"host\":\"" + String(host) + "\",";
+  json += "\"host\":\"" + jsonEscape(String(host)) + "\",";
   json += "\"result\":\"" + jsonEscape(String(result)) + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
@@ -860,33 +735,23 @@ void publishMqttPingResult(const char* host, bool success, const char* result) {
   bool successPublish = mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布Ping结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布Ping结果: " + String(success ? "成功" : "失败"));
-  if (successPublish) {
-    publishDeviceLog("info", "mqtt", "MQTT发布Ping结果完成");
-  } else {
-    publishErrorLog("mqtt", "publishMqttPingResult", "MQTT发布Ping结果失败", "publish_failed");
-  }
+  if (successPublish) publishDeviceLog("info", "mqtt", "MQTT发布Ping结果完成");
+  else publishErrorLog("mqtt", "publishMqttPingResult", "MQTT发布Ping结果失败", "publish_failed");
 }
 
-// 发布设备状态（双主题）
 void publishMqttStatus(const char* status) {
   if (!config.mqttEnabled) return;
   if (!mqttClient.connected() && String(status) != "online") return;
   unsigned long statusStart = millis();
   Serial.printf("[耗时] START MQTT发布状态: %s\n", status);
 
-  String json = "{";
-  json += "\"status\":\"" + String(status) + "\",";
-  json += "\"device\":\"" + mqttDeviceId + "\",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
-  json += "}";
-  
-  // 发布到用户自定义主题
+  String json = buildMqttStatusJson(status);
+
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布状态主题1");
   bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
   Serial.printf("[耗时] END MQTT发布状态主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
-  // 发布到 HA 状态主题（如果启用）
   if (config.mqttHaDiscovery) {
     publishStart = millis();
     Serial.println("[耗时] START MQTT发布状态HA主题");
@@ -899,13 +764,11 @@ void publishMqttStatus(const char* status) {
   publishDeviceLog("info", "mqtt", (String("MQTT发布状态: ") + status).c_str());
 }
 
-// 定期发布设备详细状态（双主题，用于 Home Assistant 等平台）
 void publishMqttDeviceStatus() {
   if (!config.mqttEnabled || !mqttClient.connected()) return;
   unsigned long statusStart = millis();
   Serial.println("[耗时] START MQTT设备状态上报");
 
-  // 获取信号质量
   unsigned long stepStart = millis();
   String cesqResp = sendATCommand("AT+CESQ", 2000);
   logMqttElapsed("MQTT状态-AT+CESQ", stepStart);
@@ -914,7 +777,6 @@ void publishMqttDeviceStatus() {
   if (cesqIdx >= 0) {
     String params = cesqResp.substring(cesqIdx + 6);
     params.trim();
-    // 格式: rxlev,ber,rscp,ecno,rsrq,rsrp
     int vals[6] = {0};
     int vi = 0;
     int start = 0;
@@ -924,16 +786,14 @@ void publishMqttDeviceStatus() {
         start = i + 1;
       }
     }
-    rxlev = vals[0];  // 0-63, 99=unknown
-    rsrq = vals[4];   // 0-34
-    rsrp = vals[5];   // 0-97
+    rxlev = vals[0];
+    rsrq = vals[4];
+    rsrp = vals[5];
   }
   
-  // 计算 dBm
   int rsrpDbm = (rsrp != 255 && rsrp <= 97) ? (rsrp - 141) : -999;
   int rsrqDb = (rsrq != 255 && rsrq <= 34) ? ((rsrq / 2) - 20) : -999;
   
-  // WiFi 信号评价
   int wifiRssi = WiFi.RSSI();
   String wifiStatus = "未知";
   if (wifiRssi >= -50) wifiStatus = "极好";
@@ -943,7 +803,6 @@ void publishMqttDeviceStatus() {
   else if (wifiRssi >= -90) wifiStatus = "较弱";
   else wifiStatus = "很差";
   
-  // 4G 信号评价
   String lteStatus = "未知";
   if (rsrpDbm != -999) {
     if (rsrpDbm >= -80) lteStatus = "极好";
@@ -953,7 +812,6 @@ void publishMqttDeviceStatus() {
     else lteStatus = "很差";
   }
   
-  // 获取 APN
   String apn = "";
   stepStart = millis();
   String cgdcontResp = sendATCommand("AT+CGDCONT?", 2000);
@@ -965,36 +823,32 @@ void publishMqttDeviceStatus() {
       idx0 = cgdcontResp.indexOf(",\"", idx0 + 2);
       if (idx0 >= 0) {
         int endIdx0 = cgdcontResp.indexOf("\"", idx0 + 2);
-        if (endIdx0 > idx0) {
-          apn = cgdcontResp.substring(idx0 + 2, endIdx0);
-        }
+        if (endIdx0 > idx0) apn = cgdcontResp.substring(idx0 + 2, endIdx0);
       }
     }
   }
   
-  // 构建 JSON
   String json = "{";
   json += "\"status\":\"online\",";
   json += "\"device\":\"" + mqttDeviceId + "\",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"wifi_rssi\":" + String(wifiRssi) + ",";
-  json += "\"wifi_status\":\"" + wifiStatus + "\",";
-  json += "\"wifi_ssid\":\"" + WiFi.SSID() + "\",";
+  json += "\"wifi_status\":\"" + jsonEscape(wifiStatus) + "\",";
+  json += "\"wifi_ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"lte_rsrp\":" + String(rsrpDbm) + ",";
   json += "\"lte_rsrq\":" + String(rsrqDb) + ",";
-  json += "\"lte_status\":\"" + lteStatus + "\",";
-  json += "\"apn\":\"" + apn + "\"";
+  json += "\"lte_status\":\"" + jsonEscape(lteStatus) + "\",";
+  json += "\"apn\":\"" + jsonEscape(apn) + "\",";
+  json += mqttResetStatusFields();
   json += "}";
   
-  // 发布到用户自定义主题
   stepStart = millis();
   Serial.println("[耗时] START MQTT设备状态发布主题1");
   bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
   Serial.printf("[耗时] END MQTT设备状态发布主题1: elapsed=%lums, success=%s\n", millis() - stepStart, success1 ? "true" : "false");
 
-  // 发布到 HA 状态主题（如果启用）
   if (config.mqttHaDiscovery) {
     stepStart = millis();
     Serial.println("[耗时] START MQTT设备状态发布HA主题");

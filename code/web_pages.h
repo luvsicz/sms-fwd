@@ -178,10 +178,16 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       <div class="stat-box"><div class="stat-num" id="ssSent">-</div><div class="stat-tag">发信</div></div>
       <div class="stat-box"><div class="stat-num" id="ssCall">-</div><div class="stat-tag">来电</div></div>
     </div>
-    <div class="grid-2" style="margin-top:12px">
-      <div class="stat-box"><div class="stat-num" id="ssBoot">-</div><div class="stat-tag">重启</div></div>
-      <div class="stat-box"><div class="stat-num" id="ssPushOk">-</div><div class="stat-tag">推送成功</div></div>
+    <div class="grid-3" style="margin-top:12px">
+      <div class="stat-box"><div class="stat-num" id="ssBoot">-</div><div class="stat-tag">启动</div></div>
+      <div class="stat-box"><div class="stat-num" id="ssBrownout">-</div><div class="stat-tag">欠压</div></div>
+      <div class="stat-box"><div class="stat-num" id="ssPwrSus">-</div><div class="stat-tag">供电嫌疑</div></div>
     </div>
+    <div class="grid-2" style="margin-top:12px">
+      <div class="stat-box"><div class="stat-num" id="ssPushOk">-</div><div class="stat-tag">推送成功</div></div>
+      <div class="stat-box"><div class="stat-num" id="ssPushFail">-</div><div class="stat-tag">推送失败</div></div>
+    </div>
+    <div style="margin-top:10px;font-size:0.85em;color:var(--text-light)" id="resetInfo">上次复位：-</div>
     <div style="margin-top:12px">
       <button class="btn btn-w" onclick="if(confirm('确定要重置统计数据吗？\n将清零收信、发信、来电、推送统计和重启次数。'))act('resetStats')">重置统计数据</button>
     </div>
@@ -205,7 +211,16 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
         <div style="font-size:0.8em;color:var(--text-light);margin-top:4px;word-break:break-all" id="mqTopics">%MQTT_TOPICS%</div>
       </div>
     </div>
-    
+
+    <div class="sw-row">
+      <span style="font-weight:600;color:#64748b">上次复位原因</span>
+      <span class="badge b-wait" id="rstReason">-</span>
+    </div>
+    <div class="sw-row">
+      <span style="font-weight:600;color:#64748b">供电嫌疑</span>
+      <span class="badge b-wait" id="rstPwr">-</span>
+    </div>
+
     <div class="stat-box" style="text-align:left;position:relative;margin-bottom:12px">
        <div class="stat-tag">模组网络</div>
        <div style="font-weight:700;font-size:1.1em;margin:4px 0" id="modNet">查询中...</div>
@@ -657,10 +672,17 @@ function autoLoad(){
     $('ssSent').innerText=d.sent;
     $('ssCall').innerText=d.calls||0;
     $('ssBoot').innerText=d.boots;
+    $('ssBrownout').innerText=d.brownoutResets||0;
+    $('ssPwrSus').innerText=d.powerSuspected ? '是' : '否';
     $('ssPushOk').innerText=d.pushOk||0;
+    $('ssPushFail').innerText=d.pushFail||0;
     $('wifiS').innerText=d.wifiRssi+' dBm';
+    $('rstReason').innerText=d.lastResetReason||'未知';
+    $('rstPwr').innerText=d.powerSuspected ? '是' : '否';
+    $('rstPwr').className='badge ' + (d.powerSuspected ? 'b-err' : 'b-ok');
     var h=Math.floor(d.uptime/3600);
     $('upT').innerText='运行 '+h+' 小时 / 内存 '+(d.freeHeap/1024).toFixed(0)+'K';
+    $('resetInfo').innerText='上次复位：'+(d.lastResetReason||'未知')+'；复位代码：'+(d.lastResetReasonCode ?? '-');
   }).catch(e=>{console.log('stats error',e)});
   
   // 自动查询模组信息

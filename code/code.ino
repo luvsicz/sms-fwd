@@ -114,7 +114,11 @@ void setup() {
   // 加载配置
   loadConfig();
   configValid = isConfigValid();
-  
+  Serial.printf("启动计数: %lu, 上次复位原因: %s (0x%02X)\n", stats.bootCount, lastResetReasonText.c_str(), (unsigned int)lastResetReasonCode);
+  if (lastResetPowerSuspected) {
+    Serial.println("提示: 上次复位属于供电/上电相关，优先排查电源、电缆和瞬时压降");
+  }
+
   // 添加所有启用的 WiFi 网络（WiFiMulti 会自动选择信号最强的）
   int wifiCount = 0;
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
@@ -258,7 +262,13 @@ void setup() {
   
   // 发送启动通知
   if (configValid) {
-    String body = "设备已启动\n地址: " + getDeviceUrl() + "\n启动次数: " + String(stats.bootCount);
+    String body = "设备已启动\n地址: " + getDeviceUrl() + "\n启动次数: " + String(stats.bootCount) + "\n上次复位原因: " + lastResetReasonText +
+                  "\n供电相关嫌疑: " + String(lastResetPowerSuspected ? "是" : "否") +
+                  "\n欠压复位次数: " + String(stats.brownoutResets) +
+                  "\n上电复位次数: " + String(stats.powerOnResets) +
+                  "\n看门狗复位次数: " + String(stats.watchdogResets) +
+                  "\n软件重启次数: " + String(stats.softwareResets) +
+                  "\n异常崩溃次数: " + String(stats.panicResets);
     sendEmailNotification("短信转发器已启动", body.c_str());
   }
   

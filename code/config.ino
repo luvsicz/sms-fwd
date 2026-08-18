@@ -7,7 +7,33 @@
 // 短信历史和统计的全局变量定义
 SmsRecord smsHistory[MAX_SMS_HISTORY];
 int smsHistoryIndex = 0;
-Statistics stats = {0, 0, 0, 0, 0, 0};
+Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+esp_reset_reason_t lastResetReasonCode = ESP_RST_UNKNOWN;
+String lastResetReasonText = "未知";
+bool lastResetPowerSuspected = false;
+
+String resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "上电复位";
+    case ESP_RST_EXT: return "外部复位";
+    case ESP_RST_SW: return "软件重启";
+    case ESP_RST_PANIC: return "异常崩溃复位";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT: return "看门狗复位";
+    case ESP_RST_BROWNOUT: return "欠压复位";
+    case ESP_RST_DEEPSLEEP: return "深睡唤醒";
+    case ESP_RST_SDIO: return "SDIO 复位";
+    case ESP_RST_USB: return "USB 复位";
+    case ESP_RST_JTAG: return "JTAG 复位";
+    case ESP_RST_EFUSE: return "eFuse 复位";
+    case ESP_RST_UNKNOWN:
+    default: return "未知";
+  }
+}
+
+bool isPowerRelatedReset(esp_reset_reason_t reason) {
+  return reason == ESP_RST_POWERON || reason == ESP_RST_BROWNOUT;
+}
 
 // 保存配置到 NVS
 void saveConfig() {
@@ -591,6 +617,11 @@ void saveStats() {
   preferences.putULong("pushOk", stats.pushSuccess);
   preferences.putULong("pushFail", stats.pushFailed);
   preferences.putULong("boots", stats.bootCount);
+  preferences.putULong("brownout", stats.brownoutResets);
+  preferences.putULong("poweron", stats.powerOnResets);
+  preferences.putULong("wdt", stats.watchdogResets);
+  preferences.putULong("swreset", stats.softwareResets);
+  preferences.putULong("panic", stats.panicResets);
   preferences.end();
 }
 
@@ -603,17 +634,42 @@ void loadStats() {
   stats.pushSuccess = preferences.getULong("pushOk", 0);
   stats.pushFailed = preferences.getULong("pushFail", 0);
   stats.bootCount = preferences.getULong("boots", 0) + 1;
+  stats.brownoutResets = preferences.getULong("brownout", 0);
+  stats.powerOnResets = preferences.getULong("poweron", 0);
+  stats.watchdogResets = preferences.getULong("wdt", 0);
+  stats.softwareResets = preferences.getULong("swreset", 0);
+  stats.panicResets = preferences.getULong("panic", 0);
   preferences.end();
-  
-  // 保存更新后的启动次数
+
+  lastResetReasonCode = esp_reset_reason();
+  lastResetReasonText = resetReasonToString(lastResetReasonCode);
+  lastResetPowerSuspected = isPowerRelatedReset(lastResetReasonCode);
+
+  if (lastResetReasonCode == ESP_RST_POWERON) stats.powerOnResets++;
+  else if (lastResetReasonCode == ESP_RST_BROWNOUT) stats.brownoutResets++;
+  else if (lastResetReasonCode == ESP_RST_TASK_WDT || lastResetReasonCode == ESP_RST_INT_WDT) stats.watchdogResets++;
+  else if (lastResetReasonCode == ESP_RST_SW) stats.softwareResets++;
+  else if (lastResetReasonCode == ESP_RST_PANIC) stats.panicResets++;
+
+  // 保存更新后的启动次数和重启分类统计
   preferences.begin("sms_stats", false);
   preferences.putULong("boots", stats.bootCount);
+  preferences.putULong("brownout", stats.brownoutResets);
+  preferences.putULong("poweron", stats.powerOnResets);
+  preferences.putULong("wdt", stats.watchdogResets);
+  preferences.putULong("swreset", stats.softwareResets);
+  preferences.putULong("panic", stats.panicResets);
   preferences.end();
 }
 
 // 重置统计数据，可选择保留启动次数
 void resetStats(bool preserveBootCount) {
   unsigned long bootCount = preserveBootCount ? stats.bootCount : 0;
+  unsigned long brownoutResets = preserveBootCount ? stats.brownoutResets : 0;
+  unsigned long powerOnResets = preserveBootCount ? stats.powerOnResets : 0;
+  unsigned long watchdogResets = preserveBootCount ? stats.watchdogResets : 0;
+  unsigned long softwareResets = preserveBootCount ? stats.softwareResets : 0;
+  unsigned long panicResets = preserveBootCount ? stats.panicResets : 0;
 
   stats.smsReceived = 0;
   stats.smsSent = 0;
@@ -621,7 +677,11 @@ void resetStats(bool preserveBootCount) {
   stats.pushSuccess = 0;
   stats.pushFailed = 0;
   stats.bootCount = bootCount;
+  stats.brownoutResets = brownoutResets;
+  stats.powerOnResets = powerOnResets;
+  stats.watchdogResets = watchdogResets;
+  stats.softwareResets = softwareResets;
+  stats.panicResets = panicResets;
 
   saveStats();
 }
-

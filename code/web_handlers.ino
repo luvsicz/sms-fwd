@@ -581,6 +581,14 @@ void handleStats() {
   json += "\"pushOk\":" + String(stats.pushSuccess) + ",";
   json += "\"pushFail\":" + String(stats.pushFailed) + ",";
   json += "\"boots\":" + String(stats.bootCount) + ",";
+  json += "\"lastResetReason\":\"" + jsonEscape(lastResetReasonText) + "\",";
+  json += "\"lastResetReasonCode\":" + String((int)lastResetReasonCode) + ",";
+  json += "\"powerSuspected\":" + String(lastResetPowerSuspected ? "true" : "false") + ",";
+  json += "\"brownoutResets\":" + String(stats.brownoutResets) + ",";
+  json += "\"powerOnResets\":" + String(stats.powerOnResets) + ",";
+  json += "\"watchdogResets\":" + String(stats.watchdogResets) + ",";
+  json += "\"softwareResets\":" + String(stats.softwareResets) + ",";
+  json += "\"panicResets\":" + String(stats.panicResets) + ",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"wifiRssi\":" + String(WiFi.RSSI());
