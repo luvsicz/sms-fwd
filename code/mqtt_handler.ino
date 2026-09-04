@@ -7,7 +7,17 @@
  */
 
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
 #include "push_service.h"
+
+static bool publishMqttPayload(const char* topic, const char* payload, bool retained = false) {
+  bool published = mqttClient.publish(topic, payload, retained);
+  if (esp_task_wdt_status(NULL) == ESP_OK) {
+    esp_task_wdt_reset();
+  }
+  yield();
+  return published;
+}
 
 static void logMqttElapsed(const char* label, unsigned long start) {
   unsigned long elapsed = millis() - start;
@@ -109,7 +119,7 @@ static void enqueueMqttLogEntry(const MqttLogEntry& entry) {
 
 static void publishMqttLogEntryToTopic(const String& topic, const String& payload) {
   if (topic.length() == 0) return;
-  mqttClient.publish(topic.c_str(), payload.c_str(), false);
+  publishMqttPayload(topic.c_str(), payload.c_str(), false);
 }
 
 void publishDeviceLog(const char* level, const char* module, const char* message) {
@@ -276,7 +286,7 @@ static void publishHaStatusSensor(const String& haPrefix, const String& nodeId, 
   payload += "\"icon\":\"" + icon + "\",";
   payload += deviceInfo;
   payload += "}";
-  mqttClient.publish(topic.c_str(), payload.c_str(), true);
+  publishMqttPayload(topic.c_str(), payload.c_str(), true);
 }
 
 void publishHaDiscoveryConfig() {
@@ -309,7 +319,7 @@ void publishHaDiscoveryConfig() {
   powerSuspectConfig += "\"device_class\":\"problem\",";
   powerSuspectConfig += deviceInfo;
   powerSuspectConfig += "}";
-  mqttClient.publish(powerSuspectConfigTopic.c_str(), powerSuspectConfig.c_str(), true);
+  publishMqttPayload(powerSuspectConfigTopic.c_str(), powerSuspectConfig.c_str(), true);
 
   publishHaStatusSensor(haPrefix, nodeId, "_brownout_resets", "欠压复位次数", "{{ value_json.brownout_resets | default(0) }}", "mdi:flash-alert", deviceInfo, "次", "measurement");
   publishHaStatusSensor(haPrefix, nodeId, "_poweron_resets", "上电复位次数", "{{ value_json.poweron_resets | default(0) }}", "mdi:power-plug", deviceInfo, "次", "measurement");
@@ -332,8 +342,8 @@ void publishHaDiscoveryConfig() {
   onlineConfig += "\"device_class\":\"connectivity\",";
   onlineConfig += deviceInfo;
   onlineConfig += "}";
-  mqttClient.publish(onlineConfigTopic.c_str(), onlineConfig.c_str(), true);
-  
+  publishMqttPayload(onlineConfigTopic.c_str(), onlineConfig.c_str(), true);
+
   String restartConfigTopic = haPrefix + "/button/" + nodeId + "_restart/config";
   String restartConfig = "{";
   restartConfig += "\"name\":\"重启\",";
@@ -343,8 +353,8 @@ void publishHaDiscoveryConfig() {
   restartConfig += "\"icon\":\"mdi:restart\",";
   restartConfig += deviceInfo;
   restartConfig += "}";
-  mqttClient.publish(restartConfigTopic.c_str(), restartConfig.c_str(), true);
-  
+  publishMqttPayload(restartConfigTopic.c_str(), restartConfig.c_str(), true);
+
   String senderConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_sender/config";
   String senderConfig = "{";
   senderConfig += "\"name\":\"最近短信发送者\",";
@@ -354,8 +364,8 @@ void publishHaDiscoveryConfig() {
   senderConfig += "\"icon\":\"mdi:account\",";
   senderConfig += deviceInfo;
   senderConfig += "}";
-  mqttClient.publish(senderConfigTopic.c_str(), senderConfig.c_str(), true);
-  
+  publishMqttPayload(senderConfigTopic.c_str(), senderConfig.c_str(), true);
+
   String messageConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_message/config";
   String messageConfig = "{";
   messageConfig += "\"name\":\"最近短信内容\",";
@@ -366,7 +376,7 @@ void publishHaDiscoveryConfig() {
   messageConfig += "\"icon\":\"mdi:message-text\",";
   messageConfig += deviceInfo;
   messageConfig += "}";
-  mqttClient.publish(messageConfigTopic.c_str(), messageConfig.c_str(), true);
+  publishMqttPayload(messageConfigTopic.c_str(), messageConfig.c_str(), true);
 
   String smsEventConfigTopic = haPrefix + "/event/" + nodeId + "_sms/config";
   String smsEventConfig = "{";
@@ -377,7 +387,7 @@ void publishHaDiscoveryConfig() {
   smsEventConfig += "\"icon\":\"mdi:message-badge\",";
   smsEventConfig += deviceInfo;
   smsEventConfig += "}";
-  mqttClient.publish(smsEventConfigTopic.c_str(), smsEventConfig.c_str(), true);
+  publishMqttPayload(smsEventConfigTopic.c_str(), smsEventConfig.c_str(), true);
 
   String lastCallerConfigTopic = haPrefix + "/sensor/" + nodeId + "_last_caller/config";
   String lastCallerConfig = "{";
@@ -389,7 +399,7 @@ void publishHaDiscoveryConfig() {
   lastCallerConfig += "\"icon\":\"mdi:phone-in-talk\",";
   lastCallerConfig += deviceInfo;
   lastCallerConfig += "}";
-  mqttClient.publish(lastCallerConfigTopic.c_str(), lastCallerConfig.c_str(), true);
+  publishMqttPayload(lastCallerConfigTopic.c_str(), lastCallerConfig.c_str(), true);
 
   String callEventConfigTopic = haPrefix + "/event/" + nodeId + "_call/config";
   String callEventConfig = "{";
@@ -401,7 +411,7 @@ void publishHaDiscoveryConfig() {
   callEventConfig += "\"icon\":\"mdi:phone-ring\",";
   callEventConfig += deviceInfo;
   callEventConfig += "}";
-  mqttClient.publish(callEventConfigTopic.c_str(), callEventConfig.c_str(), true);
+  publishMqttPayload(callEventConfigTopic.c_str(), callEventConfig.c_str(), true);
 
   publishHaStatusSensor(haPrefix, nodeId, "_last_log", "最新日志", "{{ value_json.message[:80] }}{% if value_json.message | length > 80 %}...{% endif %}", "mdi:text-box-search", deviceInfo);
   publishHaStatusSensor(haPrefix, nodeId, "_last_slow_log", "最近慢操作", "{{ value_json.step | default('无') }}", "mdi:alert-clock", deviceInfo);
@@ -417,7 +427,7 @@ void publishHaDiscoveryConfig() {
   logEventConfig += "\"icon\":\"mdi:text-box-search\",";
   logEventConfig += deviceInfo;
   logEventConfig += "}";
-  mqttClient.publish(logEventConfigTopic.c_str(), logEventConfig.c_str(), true);
+  publishMqttPayload(logEventConfigTopic.c_str(), logEventConfig.c_str(), true);
 
   Serial.println("HA自动发现配置已发布");
   publishDeviceLog("info", "mqtt", "HA自动发现配置已发布");
@@ -431,7 +441,8 @@ void mqttReconnect() {
   Serial.println("[耗时] START MQTT重连");
 
   mqttClient.setServer(config.mqttServer.c_str(), config.mqttPort);
-  
+  mqttClient.setSocketTimeout(5);
+
   String clientId = "sms_" + mqttDeviceId;
   Serial.println("连接MQTT服务器: " + config.mqttServer);
   Serial.println("客户端ID: " + clientId);
@@ -576,6 +587,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         }
       }
       if (gotResult) break;
+      esp_task_wdt_reset();
+      yield();
       delay(10);
     }
     
@@ -601,8 +614,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         ESP.restart();
       } else if (actionRaw == "status") {
         String statusJson = buildMqttStatusJson("online");
-        mqttClient.publish(mqttTopicStatus.c_str(), statusJson.c_str(), true);
-        if (config.mqttHaDiscovery) mqttClient.publish(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
+        publishMqttPayload(mqttTopicStatus.c_str(), statusJson.c_str(), true);
+        if (config.mqttHaDiscovery) {
+          publishMqttPayload(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
+        }
         Serial.println("已发送状态信息");
       } else {
         Serial.println("未知命令: " + actionRaw);
@@ -637,14 +652,14 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   Serial.println(" 主题1: " + mqttTopicSmsReceived);
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布短信主题1");
-  bool success1 = mqttClient.publish(mqttTopicSmsReceived.c_str(), json.c_str());
+  bool success1 = publishMqttPayload(mqttTopicSmsReceived.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布短信主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
   if (config.mqttHaDiscovery) {
     Serial.println(" 主题2 (HA): " + mqttHaSmsReceivedTopic);
     publishStart = millis();
     Serial.println("[耗时] START MQTT发布短信HA主题");
-    bool successHa = mqttClient.publish(mqttHaSmsReceivedTopic.c_str(), json.c_str());
+    bool successHa = publishMqttPayload(mqttHaSmsReceivedTopic.c_str(), json.c_str());
     Serial.printf("[耗时] END MQTT发布短信HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
   
@@ -681,14 +696,14 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
   Serial.println(" 主题1: " + mqttTopicCallReceived);
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布来电主题1");
-  bool success1 = mqttClient.publish(mqttTopicCallReceived.c_str(), json.c_str());
+  bool success1 = publishMqttPayload(mqttTopicCallReceived.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布来电主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
   if (config.mqttHaDiscovery) {
     Serial.println(" 主题2 (HA): " + mqttHaCallReceivedTopic);
     publishStart = millis();
     Serial.println("[耗时] START MQTT发布来电HA主题");
-    bool successHa = mqttClient.publish(mqttHaCallReceivedTopic.c_str(), json.c_str());
+    bool successHa = publishMqttPayload(mqttHaCallReceivedTopic.c_str(), json.c_str());
     Serial.printf("[耗时] END MQTT发布来电HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
 
@@ -713,7 +728,7 @@ void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布发送短信结果");
-  bool successPublish = mqttClient.publish(mqttTopicSmsSent.c_str(), json.c_str());
+  bool successPublish = publishMqttPayload(mqttTopicSmsSent.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布发送短信结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布发送短信结果: " + String(success ? "成功" : "失败"));
   if (successPublish) publishDeviceLog("info", "mqtt", "MQTT发布发送短信结果完成");
@@ -732,7 +747,7 @@ void publishMqttPingResult(const char* host, bool success, const char* result) {
   
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布Ping结果");
-  bool successPublish = mqttClient.publish(mqttTopicPingResult.c_str(), json.c_str());
+  bool successPublish = publishMqttPayload(mqttTopicPingResult.c_str(), json.c_str());
   Serial.printf("[耗时] END MQTT发布Ping结果: elapsed=%lums, success=%s\n", millis() - publishStart, successPublish ? "true" : "false");
   Serial.println("MQTT发布Ping结果: " + String(success ? "成功" : "失败"));
   if (successPublish) publishDeviceLog("info", "mqtt", "MQTT发布Ping结果完成");
@@ -749,13 +764,13 @@ void publishMqttStatus(const char* status) {
 
   unsigned long publishStart = millis();
   Serial.println("[耗时] START MQTT发布状态主题1");
-  bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
+  bool success1 = publishMqttPayload(mqttTopicStatus.c_str(), json.c_str(), true);
   Serial.printf("[耗时] END MQTT发布状态主题1: elapsed=%lums, success=%s\n", millis() - publishStart, success1 ? "true" : "false");
 
   if (config.mqttHaDiscovery) {
     publishStart = millis();
     Serial.println("[耗时] START MQTT发布状态HA主题");
-    bool successHa = mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    bool successHa = publishMqttPayload(mqttHaStatusTopic.c_str(), json.c_str(), true);
     Serial.printf("[耗时] END MQTT发布状态HA主题: elapsed=%lums, success=%s\n", millis() - publishStart, successHa ? "true" : "false");
   }
   
@@ -846,13 +861,13 @@ void publishMqttDeviceStatus() {
   
   stepStart = millis();
   Serial.println("[耗时] START MQTT设备状态发布主题1");
-  bool success1 = mqttClient.publish(mqttTopicStatus.c_str(), json.c_str(), true);
+  bool success1 = publishMqttPayload(mqttTopicStatus.c_str(), json.c_str(), true);
   Serial.printf("[耗时] END MQTT设备状态发布主题1: elapsed=%lums, success=%s\n", millis() - stepStart, success1 ? "true" : "false");
 
   if (config.mqttHaDiscovery) {
     stepStart = millis();
     Serial.println("[耗时] START MQTT设备状态发布HA主题");
-    bool successHa = mqttClient.publish(mqttHaStatusTopic.c_str(), json.c_str(), true);
+    bool successHa = publishMqttPayload(mqttHaStatusTopic.c_str(), json.c_str(), true);
     Serial.printf("[耗时] END MQTT设备状态发布HA主题: elapsed=%lums, success=%s\n", millis() - stepStart, successHa ? "true" : "false");
   }
   

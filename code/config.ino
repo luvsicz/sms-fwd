@@ -3,6 +3,8 @@
  */
 
 #include "push_service.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // 短信历史和统计的全局变量定义
 SmsRecord smsHistory[MAX_SMS_HISTORY];
@@ -11,6 +13,17 @@ Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 esp_reset_reason_t lastResetReasonCode = ESP_RST_UNKNOWN;
 String lastResetReasonText = "未知";
 bool lastResetPowerSuspected = false;
+
+static SemaphoreHandle_t statsMutex = nullptr;
+
+void initStatsLock() {
+  if (statsMutex == nullptr) {
+    statsMutex = xSemaphoreCreateMutex();
+    if (statsMutex == nullptr) {
+      Serial.println("统计锁创建失败，统计持久化将使用无锁降级路径");
+    }
+  }
+}
 
 String resetReasonToString(esp_reset_reason_t reason) {
   switch (reason) {
@@ -37,6 +50,12 @@ bool isPowerRelatedReset(esp_reset_reason_t reason) {
 
 // 保存配置到 NVS
 void saveConfig() {
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("配置锁获取超时，跳过本次配置保存");
+    return;
+  }
   preferences.begin("sms_config", false);
   
   // 喂狗防止超时
@@ -116,6 +135,7 @@ void saveConfig() {
   preferences.putString("cfList", config.contentFilterList);
   
   preferences.end();
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
   esp_task_wdt_reset();
   Serial.println("配置已保存");
 }
@@ -610,6 +630,13 @@ bool isContentFiltered(const char* content) {
 
 // 保存统计数据
 void saveStats() {
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("统计锁获取超时，跳过本次统计保存");
+    return;
+  }
+
   preferences.begin("sms_stats", false);
   preferences.putULong("received", stats.smsReceived);
   preferences.putULong("sent", stats.smsSent);
@@ -623,6 +650,8 @@ void saveStats() {
   preferences.putULong("swreset", stats.softwareResets);
   preferences.putULong("panic", stats.panicResets);
   preferences.end();
+
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
 }
 
 // 加载统计数据

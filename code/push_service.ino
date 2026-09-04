@@ -319,8 +319,29 @@ int sendHttpRequest(const String& url, const String& method, const String& conte
     Serial.printf("HTTP响应码: %d\n", httpCode);
     // 所有 2xx 状态码都视为成功 (200 OK, 201 Created, 202 Accepted, 204 No Content 等)
     if (httpCode >= 200 && httpCode < 300) {
-      String response = http.getString();
-      Serial.println("响应: " + response.substring(0, 200));  // 限制输出长度
+      // 只读取有限的响应预览，不把远端返回体整体复制到堆上。
+      NetworkClient* responseStream = http.getStreamPtr();
+      if (responseStream != nullptr) {
+        const size_t previewLimit = 256;
+        char preview[previewLimit + 1];
+        size_t previewLength = 0;
+        unsigned long previewStart = millis();
+        while (previewLength < previewLimit && millis() - previewStart < HTTP_PUSH_TIMEOUT_MS) {
+          int available = responseStream->available();
+          if (available <= 0) {
+            if (!responseStream->connected()) break;
+            yield();
+            delay(1);
+            continue;
+          }
+          size_t toRead = min((size_t)available, previewLimit - previewLength);
+          int readLength = responseStream->readBytes(preview + previewLength, toRead);
+          if (readLength <= 0) break;
+          previewLength += (size_t)readLength;
+        }
+        preview[previewLength] = '\0';
+        Serial.println("响应: " + String(preview));
+      }
       stats.pushSuccess++;
     } else {
       Serial.println("HTTP错误响应");
@@ -562,6 +583,8 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
   auto statusCallback = [](SMTPStatus status) {
     Serial.println(status.text);
   };
+  ssl_client.setTimeout(5000);
+  ssl_client.setHandshakeTimeout(5);
   smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback);
   if (smtp.isConnected()) {
     smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password);
@@ -575,7 +598,16 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
     msg.text.body(body);
     if (time(nullptr) < 100000) {
       configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
-      while (time(nullptr) < 100000) delay(100);
+      unsigned long syncStart = millis();
+      while (time(nullptr) < 100000 && millis() - syncStart < 10000) {
+        delay(100);
+        yield();
+      }
+      if (time(nullptr) < 100000) {
+        Serial.println("NTP同步超时，跳过本次邮件，避免邮件任务永久阻塞");
+        ssl_client.stop();
+        return;
+      }
     }
     msg.timestamp = time(nullptr);
     smtp.send(msg);
@@ -583,4 +615,6 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
   } else {
     Serial.println("邮件服务器连接失败");
   }
+  // ReadyMail 复用全局客户端，显式断开底层连接，避免失败连接长期占用资源。
+  ssl_client.stop();
 }

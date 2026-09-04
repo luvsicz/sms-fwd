@@ -202,6 +202,7 @@ bool phoneNumbersMatch(const String& senderNum, const String& filterNum);
 bool isNumberFiltered(const char* number);
 bool isContentFiltered(const char* content);
 void saveStats();
+void initStatsLock();
 void loadStats();
 void resetStats(bool preserveBootCount = true);
 String resetReasonToString(esp_reset_reason_t reason);

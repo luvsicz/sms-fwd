@@ -20,6 +20,9 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
   unsigned long start = millis();
   String resp = "";
   while (millis() - start < timeout) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
@@ -47,6 +50,9 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   unsigned long start = millis();
   String resp = "";
   while (millis() - start < timeout) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
@@ -70,6 +76,9 @@ bool waitCGATT1() {
   unsigned long start = millis();
   String resp = "";
   while (millis() - start < 2000) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
@@ -99,9 +108,25 @@ void blink_short(unsigned long gap_time) {
 void handleRoot() {
   if (!checkAuth()) return;
   
-  String html = String(htmlPage);
-  // 预留足够空间，避免后续替换 WiFi/推送通道等大段 HTML 时因 String 扩容失败而残留占位符
-  html.reserve(strlen(htmlPage) + strlen(commonCss) + 8192);
+  const size_t htmlTemplateLength = strlen(htmlPage);
+  const size_t htmlReserveLength = htmlTemplateLength + strlen(commonCss) + 8192;
+  if (ESP.getFreeHeap() < htmlReserveLength + 4096) {
+    Serial.printf("首页响应内存不足，free=%u need=%u\n", ESP.getFreeHeap(), htmlReserveLength + 4096);
+    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
+    return;
+  }
+  String html;
+  if (!html.reserve(htmlReserveLength)) {
+    Serial.println("首页响应 String.reserve 失败");
+    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
+    return;
+  }
+  html = htmlPage;
+  if (html.length() != htmlTemplateLength) {
+    Serial.printf("首页模板分配失败，actual=%u expected=%u\n", html.length(), htmlTemplateLength);
+    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
+    return;
+  }
   html.replace("%COMMON_CSS%", commonCss);
   // html.replace("%COMMON_JS%", commonJs); // JS 已合并
   wifi_mode_t wifiMode = WiFi.getMode();
@@ -297,9 +322,17 @@ void handleRoot() {
     channelsHtml += "</div></div>";
   }
   html.replace("%PUSH_CHANNELS%", channelsHtml);
-  
-  
-  server.send(200, "text/html", html);
+
+  // replace/拼接在低堆或碎片化时可能静默失败，禁止把 200 + 空响应发给客户端。
+  if (!html || html.length() == 0) {
+    Serial.printf("首页响应生成失败，free=%u\n", ESP.getFreeHeap());
+    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：响应生成失败，请稍后重试");
+    return;
+  }
+  esp_task_wdt_reset();
+  yield();
+
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
 // 处理工具箱页面请求 (重定向到首页)

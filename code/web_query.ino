@@ -291,6 +291,9 @@ void handlePing() {
   String pingResultMsg = "";
   
   while (millis() - start < 35000) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;

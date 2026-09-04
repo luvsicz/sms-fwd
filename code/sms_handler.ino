@@ -232,8 +232,12 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
 
 // 合并长短信各分段
 String assembleConcatSms(int slot) {
+  if (slot < 0 || slot >= MAX_CONCAT_MESSAGES || !concatBuffer[slot].inUse) return "";
+  int partsToAssemble = concatBuffer[slot].totalParts;
+  if (partsToAssemble < 1) partsToAssemble = 1;
+  if (partsToAssemble > MAX_CONCAT_PARTS) partsToAssemble = MAX_CONCAT_PARTS;
   String result = "";
-  for (int i = 0; i < concatBuffer[slot].totalParts; i++) {
+  for (int i = 0; i < partsToAssemble; i++) {
     if (concatBuffer[slot].parts[i].valid) {
       result += concatBuffer[slot].parts[i].text;
     } else {
@@ -312,6 +316,9 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   unsigned long start = millis();
   bool gotPrompt = false;
   while (millis() - start < 5000) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     if (Serial1.available()) {
       char c = Serial1.read();
       Serial.print(c);
@@ -335,6 +342,9 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   start = millis();
   String resp = "";
   while (millis() - start < 30000) {
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
@@ -348,6 +358,9 @@ bool sendSMS(const char* phoneNumber, const char* message) {
         return false;
       }
     }
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
   }
   Serial.println("短信发送超时");
   return false;
@@ -1061,7 +1074,13 @@ void checkSerial1URC() {
       Serial.printf("长短信信息: 参考号=%d, 当前=%d, 总计=%d\n", refNumber, partNumber, totalParts);
       Serial.println("===============");
 
-      // 判断是否为长短信
+      // 判断是否为长短信，拒绝越界分段，避免写入固定大小缓存。
+      if (totalParts < 1 || totalParts > MAX_CONCAT_PARTS ||
+          (totalParts > 1 && (partNumber < 1 || partNumber > totalParts))) {
+        Serial.printf("异常长短信分段信息，已丢弃: part=%d total=%d\n", partNumber, totalParts);
+        state = IDLE;
+        return;
+      }
       if (totalParts > 1 && partNumber > 0) {
         Serial.printf("收到长短信分段 %d/%d\n", partNumber, totalParts);
 

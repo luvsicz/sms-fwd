@@ -111,6 +111,8 @@ void setup() {
   // 初始化短信存储(SPIFFS)
   initSmsStorage();
   
+  // 初始化 NVS 互斥锁后再加载配置，避免后台推送任务与 Web 保存交叉访问 Preferences。
+  initStatsLock();
   // 加载配置
   loadConfig();
   configValid = isConfigValid();
@@ -144,6 +146,8 @@ void setup() {
     }
     blink_short();
     Serial.print(".");
+    esp_task_wdt_reset();
+    yield();
   }
   Serial.println();
 
