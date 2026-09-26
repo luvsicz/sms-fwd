@@ -215,7 +215,14 @@ static String mqttResetStatusFields() {
   json += "\"poweron_resets\":" + String(stats.powerOnResets) + ",";
   json += "\"watchdog_resets\":" + String(stats.watchdogResets) + ",";
   json += "\"software_resets\":" + String(stats.softwareResets) + ",";
-  json += "\"panic_resets\":" + String(stats.panicResets);
+  json += "\"panic_resets\":" + String(stats.panicResets) + ",";
+  json += "\"has_interrupted_operation\":" + String(lastInterruptedOperation.valid ? "true" : "false") + ",";
+  json += "\"interrupted_operation\":\"" + jsonEscape(lastInterruptedOperation.operation) + "\",";
+  json += "\"interrupted_stage\":\"" + jsonEscape(lastInterruptedOperation.stage) + "\",";
+  json += "\"interrupted_uptime\":" + String(lastInterruptedOperation.uptimeSeconds) + ",";
+  json += "\"interrupted_free_heap\":" + String(lastInterruptedOperation.freeHeap) + ",";
+  json += "\"interrupted_min_free_heap\":" + String(lastInterruptedOperation.minFreeHeap) + ",";
+  json += "\"interrupted_max_alloc_heap\":" + String(lastInterruptedOperation.maxAllocHeap);
   return json;
 }
 

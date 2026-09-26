@@ -13,6 +13,9 @@ Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 esp_reset_reason_t lastResetReasonCode = ESP_RST_UNKNOWN;
 String lastResetReasonText = "未知";
 bool lastResetPowerSuspected = false;
+InterruptedOperationDiagnostic lastInterruptedOperation = {
+  false, "", "", 0, 0, 0, 0
+};
 
 static SemaphoreHandle_t statsMutex = nullptr;
 
@@ -46,6 +49,65 @@ String resetReasonToString(esp_reset_reason_t reason) {
 
 bool isPowerRelatedReset(esp_reset_reason_t reason) {
   return reason == ESP_RST_POWERON || reason == ESP_RST_BROWNOUT;
+}
+
+void recordOperationDiagnostic(const char* operation, const char* stage) {
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("诊断锁获取超时，跳过本次操作快照");
+    return;
+  }
+
+  String operationText = operation ? String(operation) : "";
+  String stageText = stage ? String(stage) : "";
+  operationText = operationText.substring(0, 31);
+  stageText = stageText.substring(0, 31);
+
+  preferences.begin("sms_diag", false);
+  preferences.putBool("active", true);
+  preferences.putString("op", operationText);
+  preferences.putString("stage", stageText);
+  preferences.putULong("uptime", millis() / 1000);
+  preferences.putULong("heap", ESP.getFreeHeap());
+  preferences.putULong("minHeap", ESP.getMinFreeHeap());
+  preferences.putULong("maxAlloc", ESP.getMaxAllocHeap());
+  preferences.end();
+
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
+}
+
+void clearOperationDiagnostic() {
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("诊断锁获取超时，未清除操作快照");
+    return;
+  }
+
+  preferences.begin("sms_diag", false);
+  preferences.putBool("active", false);
+  preferences.end();
+
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
+}
+
+static void loadInterruptedOperationDiagnostic() {
+  preferences.begin("sms_diag", true);
+  lastInterruptedOperation.valid = preferences.getBool("active", false);
+  lastInterruptedOperation.operation = preferences.getString("op", "");
+  lastInterruptedOperation.stage = preferences.getString("stage", "");
+  lastInterruptedOperation.uptimeSeconds = preferences.getULong("uptime", 0);
+  lastInterruptedOperation.freeHeap = preferences.getULong("heap", 0);
+  lastInterruptedOperation.minFreeHeap = preferences.getULong("minHeap", 0);
+  lastInterruptedOperation.maxAllocHeap = preferences.getULong("maxAlloc", 0);
+  preferences.end();
+
+  if (lastInterruptedOperation.valid) {
+    preferences.begin("sms_diag", false);
+    preferences.putBool("active", false);
+    preferences.end();
+  }
 }
 
 // 保存配置到 NVS
@@ -673,6 +735,7 @@ void loadStats() {
   lastResetReasonCode = esp_reset_reason();
   lastResetReasonText = resetReasonToString(lastResetReasonCode);
   lastResetPowerSuspected = isPowerRelatedReset(lastResetReasonCode);
+  loadInterruptedOperationDiagnostic();
 
   if (lastResetReasonCode == ESP_RST_POWERON) stats.powerOnResets++;
   else if (lastResetReasonCode == ESP_RST_BROWNOUT) stats.brownoutResets++;
@@ -689,6 +752,18 @@ void loadStats() {
   preferences.putULong("swreset", stats.softwareResets);
   preferences.putULong("panic", stats.panicResets);
   preferences.end();
+
+  if (lastInterruptedOperation.valid) {
+    Serial.printf(
+      "复位前未完成操作: %s/%s, uptime=%lus, heap=%u, minHeap=%u, maxAlloc=%u\n",
+      lastInterruptedOperation.operation.c_str(),
+      lastInterruptedOperation.stage.c_str(),
+      lastInterruptedOperation.uptimeSeconds,
+      lastInterruptedOperation.freeHeap,
+      lastInterruptedOperation.minFreeHeap,
+      lastInterruptedOperation.maxAllocHeap
+    );
+  }
 }
 
 // 重置统计数据，可选择保留启动次数

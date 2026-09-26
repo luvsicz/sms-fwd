@@ -19,6 +19,8 @@ static const uint32_t HTTP_PUSH_TASK_STACK_SIZE = 6144;
 static const uint8_t HTTP_PUSH_WORKER_COUNT = MAX_PUSH_CHANNELS;
 static const uint8_t EMAIL_QUEUE_LENGTH = 4;
 static const uint32_t EMAIL_TASK_STACK_SIZE = 8192;
+static const uint32_t SMTP_STAGE_TIMEOUT_MS = 20000;
+static const TickType_t SMTP_PROGRESS_DELAY_TICKS = pdMS_TO_TICKS(10);
 
 struct HttpPushJob {
   PushChannel channel;
@@ -133,6 +135,34 @@ static void emailWorkerTask(void* parameter) {
       delay(10);
     }
   }
+}
+
+static bool waitForSmtpProgress(const char* stage, unsigned long stageStart) {
+  while (smtp.isProcessing()) {
+    if (millis() - stageStart >= SMTP_STAGE_TIMEOUT_MS) {
+      Serial.printf("SMTP事务超时，阶段: %s\n", stage);
+      recordOperationDiagnostic("smtp", stage);
+      smtp.stop();
+      ssl_client.stop();
+      return false;
+    }
+
+    smtp.loop();
+    vTaskDelay(SMTP_PROGRESS_DELAY_TICKS);
+  }
+
+  SMTPStatus status = smtp.status();
+  if (status.errorCode != 0 || status.statusCode >= 400) {
+    Serial.printf(
+      "SMTP阶段失败: %s, error=%d, status=%d\n",
+      stage,
+      status.errorCode,
+      status.statusCode
+    );
+    return false;
+  }
+
+  return true;
 }
 
 static bool ensureEmailWorker() {
@@ -585,36 +615,61 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
   };
   ssl_client.setTimeout(5000);
   ssl_client.setHandshakeTimeout(5);
-  smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback);
-  if (smtp.isConnected()) {
-    smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password);
+  recordOperationDiagnostic("smtp", "connect");
+  unsigned long stageStart = millis();
+  bool started = smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback, true, false);
+  if (!started || !waitForSmtpProgress("connect", stageStart) || !smtp.isConnected()) {
+    Serial.println("邮件服务器连接失败");
+    smtp.stop();
+    ssl_client.stop();
+    clearOperationDiagnostic();
+    return;
+  }
 
-    SMTPMessage msg;
-    String from = "sms notify <"; from += config.smtpUser; from += ">";
-    msg.headers.add(rfc822_from, from.c_str());
-    String to = "your_email <"; to += config.smtpSendTo; to += ">";
-    msg.headers.add(rfc822_to, to.c_str());
-    msg.headers.add(rfc822_subject, subject);
-    msg.text.body(body);
-    if (time(nullptr) < 100000) {
-      configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
-      unsigned long syncStart = millis();
-      while (time(nullptr) < 100000 && millis() - syncStart < 10000) {
-        delay(100);
-        yield();
-      }
-      if (time(nullptr) < 100000) {
-        Serial.println("NTP同步超时，跳过本次邮件，避免邮件任务永久阻塞");
-        ssl_client.stop();
-        return;
-      }
+  recordOperationDiagnostic("smtp", "authenticate");
+  stageStart = millis();
+  started = smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password, false);
+  if (!started || !waitForSmtpProgress("authenticate", stageStart) || !smtp.isAuthenticated()) {
+    Serial.println("SMTP认证失败");
+    smtp.stop();
+    ssl_client.stop();
+    clearOperationDiagnostic();
+    return;
+  }
+
+  SMTPMessage msg;
+  String from = "sms notify <"; from += config.smtpUser; from += ">";
+  msg.headers.add(rfc822_from, from.c_str());
+  String to = "your_email <"; to += config.smtpSendTo; to += ">";
+  msg.headers.add(rfc822_to, to.c_str());
+  msg.headers.add(rfc822_subject, subject);
+  msg.text.body(body);
+  if (time(nullptr) < 100000) {
+    configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+    unsigned long syncStart = millis();
+    while (time(nullptr) < 100000 && millis() - syncStart < 10000) {
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
-    msg.timestamp = time(nullptr);
-    smtp.send(msg);
+    if (time(nullptr) < 100000) {
+      Serial.println("NTP同步超时，跳过本次邮件，避免邮件任务永久阻塞");
+      smtp.stop();
+      ssl_client.stop();
+      clearOperationDiagnostic();
+      return;
+    }
+  }
+
+  msg.timestamp = time(nullptr);
+  recordOperationDiagnostic("smtp", "send");
+  stageStart = millis();
+  started = smtp.send(msg, "", false);
+  if (started && waitForSmtpProgress("send", stageStart) && smtp.status().isComplete) {
     Serial.println("邮件发送完成");
   } else {
-    Serial.println("邮件服务器连接失败");
+    Serial.println("邮件发送失败");
   }
-  // ReadyMail 复用全局客户端，显式断开底层连接，避免失败连接长期占用资源。
+
+  smtp.stop();
   ssl_client.stop();
+  clearOperationDiagnostic();
 }

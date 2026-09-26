@@ -622,6 +622,13 @@ void handleStats() {
   json += "\"watchdogResets\":" + String(stats.watchdogResets) + ",";
   json += "\"softwareResets\":" + String(stats.softwareResets) + ",";
   json += "\"panicResets\":" + String(stats.panicResets) + ",";
+  json += "\"interruptedOperation\":\"" + jsonEscape(lastInterruptedOperation.operation) + "\",";
+  json += "\"interruptedStage\":\"" + jsonEscape(lastInterruptedOperation.stage) + "\",";
+  json += "\"interruptedUptime\":" + String(lastInterruptedOperation.uptimeSeconds) + ",";
+  json += "\"interruptedFreeHeap\":" + String(lastInterruptedOperation.freeHeap) + ",";
+  json += "\"interruptedMinFreeHeap\":" + String(lastInterruptedOperation.minFreeHeap) + ",";
+  json += "\"interruptedMaxAllocHeap\":" + String(lastInterruptedOperation.maxAllocHeap) + ",";
+  json += "\"hasInterruptedOperation\":" + String(lastInterruptedOperation.valid ? "true" : "false") + ",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"wifiRssi\":" + String(WiFi.RSSI());

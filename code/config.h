@@ -73,6 +73,17 @@ struct HistoryCleanupResult {
   int removed;
 };
 
+// 上次复位前尚未完成的高风险操作快照
+struct InterruptedOperationDiagnostic {
+  bool valid;
+  String operation;
+  String stage;
+  unsigned long uptimeSeconds;
+  uint32_t freeHeap;
+  uint32_t minFreeHeap;
+  uint32_t maxAllocHeap;
+};
+
 // WiFi 配置结构
 #define MAX_WIFI_NETWORKS 3
 struct WifiNetwork {
@@ -181,6 +192,7 @@ extern Statistics stats;
 extern esp_reset_reason_t lastResetReasonCode;
 extern String lastResetReasonText;
 extern bool lastResetPowerSuspected;
+extern InterruptedOperationDiagnostic lastInterruptedOperation;
 
 // 函数声明
 void saveConfig();
@@ -207,5 +219,7 @@ void loadStats();
 void resetStats(bool preserveBootCount = true);
 String resetReasonToString(esp_reset_reason_t reason);
 bool isPowerRelatedReset(esp_reset_reason_t reason);
+void recordOperationDiagnostic(const char* operation, const char* stage);
+void clearOperationDiagnostic();
 
 #endif // CONFIG_H

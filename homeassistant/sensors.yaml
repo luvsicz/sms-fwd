@@ -74,7 +74,57 @@ mqtt:
       value_template: "{{ ((value_json.uptime | default(0) | int(0)) / 3600) | round(1) }}"
       unit_of_measurement: "小时"
       icon: mdi:clock-outline
-      
+
+    # 最近一次复位原因
+    - name: "短信转发器上次复位原因"
+      unique_id: sms_forwarder_last_reset_reason
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.last_reset_reason | default('未知') }}"
+      icon: mdi:restart-alert
+
+    # 最近一次复位原因代码
+    - name: "短信转发器上次复位原因代码"
+      unique_id: sms_forwarder_last_reset_reason_code
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.last_reset_reason_code | default(0) }}"
+      icon: mdi:numeric
+
+    # 复位统计
+    - name: "短信转发器欠压复位次数"
+      unique_id: sms_forwarder_brownout_resets
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.brownout_resets | default(0) }}"
+      state_class: measurement
+      icon: mdi:flash-alert
+
+    - name: "短信转发器上电复位次数"
+      unique_id: sms_forwarder_poweron_resets
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.poweron_resets | default(0) }}"
+      state_class: measurement
+      icon: mdi:power-plug
+
+    - name: "短信转发器看门狗复位次数"
+      unique_id: sms_forwarder_watchdog_resets
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.watchdog_resets | default(0) }}"
+      state_class: measurement
+      icon: mdi:dog-side
+
+    - name: "短信转发器软件复位次数"
+      unique_id: sms_forwarder_software_resets
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.software_resets | default(0) }}"
+      state_class: measurement
+      icon: mdi:restart
+
+    - name: "短信转发器异常复位次数"
+      unique_id: sms_forwarder_panic_resets
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.panic_resets | default(0) }}"
+      state_class: measurement
+      icon: mdi:alert-octagon
+
     # 最近收到的短信 - 发送者
     - name: "最近短信发送者"
       unique_id: sms_forwarder_last_sender
@@ -167,6 +217,15 @@ mqtt:
       payload_off: "offline"
       device_class: connectivity
       icon: mdi:message-check
+
+    - name: "短信转发器疑似供电问题"
+      unique_id: sms_forwarder_power_suspected
+      state_topic: "sms/a1b2c3/status"
+      value_template: "{{ value_json.power_suspected | default(false) }}"
+      payload_on: "true"
+      payload_off: "false"
+      device_class: problem
+      icon: mdi:flash-alert
 
   # 按钮 - 控制命令
   button:

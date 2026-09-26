@@ -683,6 +683,13 @@ function autoLoad(){
     var h=Math.floor(d.uptime/3600);
     $('upT').innerText='运行 '+h+' 小时 / 内存 '+(d.freeHeap/1024).toFixed(0)+'K';
     $('resetInfo').innerText='上次复位：'+(d.lastResetReason||'未知')+'；复位代码：'+(d.lastResetReasonCode ?? '-');
+    if(d.hasInterruptedOperation){
+      var diag='；复位前操作：'+(d.interruptedOperation||'未知')+'/'+(d.interruptedStage||'未知');
+      diag+='（运行 '+(d.interruptedUptime||0)+' 秒，堆 '+Math.floor((d.interruptedFreeHeap||0)/1024)+'K';
+      diag+='，历史最低 '+Math.floor((d.interruptedMinFreeHeap||0)/1024)+'K';
+      diag+='，最大连续块 '+Math.floor((d.interruptedMaxAllocHeap||0)/1024)+'K）';
+      $('resetInfo').innerText+=diag;
+    }
   }).catch(e=>{console.log('stats error',e)});
   
   // 自动查询模组信息
