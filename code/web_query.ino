@@ -7,10 +7,13 @@ void handleQuery() {
   if (!checkAuth()) return;
   
   String type = server.arg("type");
-  String json = "{";
+  String json;
+  json.reserve(768);
+  json = "{";
   bool success = false;
-  String message = "";
-  
+  String message;
+  message.reserve(640);
+
   if (type == "ati") {
     // 固件信息查询
     String resp = sendATCommand("ATI", 2000);
@@ -398,7 +401,9 @@ void handlePing() {
   String deactivateResp = sendATCommand("AT+CGACT=0,1", 5000);
   Serial.println("CGACT关闭响应: " + deactivateResp);
   
-  String json = "{";
+  String json;
+  json.reserve(128);
+  json = "{";
   if (gotPingResult && pingResultMsg.indexOf("延迟") >= 0) {
     json += "\"success\":true,";
     json += "\"message\":\"" + pingResultMsg + "\"";

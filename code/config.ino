@@ -9,7 +9,7 @@
 // 短信历史和统计的全局变量定义
 SmsRecord smsHistory[MAX_SMS_HISTORY];
 int smsHistoryIndex = 0;
-Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+Statistics stats;
 esp_reset_reason_t lastResetReasonCode = ESP_RST_UNKNOWN;
 String lastResetReasonText = "未知";
 bool lastResetPowerSuspected = false;
@@ -26,6 +26,23 @@ void initStatsLock() {
       Serial.println("统计锁创建失败，统计持久化将使用无锁降级路径");
     }
   }
+}
+
+// 统计原子安全自增辅助函数（支持多线程/任务安全并发递增）
+void statsIncrementSmsReceived() { stats.smsReceived++; }
+void statsIncrementSmsSent() { stats.smsSent++; }
+void statsIncrementCallsReceived() { stats.callsReceived++; }
+void statsIncrementPushSuccess() { stats.pushSuccess++; }
+void statsIncrementPushFailed() { stats.pushFailed++; }
+
+// 生成紧凑 NVS 键名，确保即便 MAX_WIFI_NETWORKS 增大也不会超过 15 字符 (M4)
+static String makeNvsWifiKey(const char* prefix, int index) {
+  String key = String(prefix) + String(index);
+  if (key.length() > 15) {
+    Serial.printf("警告: NVS键名超长(长度=%u)，截断至15字符: %s\n", key.length(), key.c_str());
+    key = key.substring(0, 15);
+  }
+  return key;
 }
 
 String resetReasonToString(esp_reset_reason_t reason) {
@@ -124,12 +141,21 @@ void saveConfig() {
   esp_task_wdt_reset();
   yield();
   
-  // 保存 WiFi 配置
+  // 保存 WiFi 配置（使用紧凑前缀确保不超过 15 字符，即使 MAX_WIFI_NETWORKS 增大也不会超限）
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    String prefix = "wifi" + String(i);
-    preferences.putString((prefix + "ssid").c_str(), config.wifiNetworks[i].ssid);
-    preferences.putString((prefix + "pass").c_str(), config.wifiNetworks[i].password);
-    preferences.putBool((prefix + "en").c_str(), config.wifiNetworks[i].enabled);
+    String newKeySsid = makeNvsWifiKey("w_s_", i);
+    String newKeyPass = makeNvsWifiKey("w_p_", i);
+    String newKeyEn   = makeNvsWifiKey("w_e_", i);
+
+    preferences.putString(newKeySsid.c_str(), config.wifiNetworks[i].ssid);
+    preferences.putString(newKeyPass.c_str(), config.wifiNetworks[i].password);
+    preferences.putBool(newKeyEn.c_str(), config.wifiNetworks[i].enabled);
+
+    // 平滑迁移：移除旧键名以节约 NVS 空间
+    String oldPrefix = "wifi" + String(i);
+    preferences.remove((oldPrefix + "ssid").c_str());
+    preferences.remove((oldPrefix + "pass").c_str());
+    preferences.remove((oldPrefix + "en").c_str());
     yield();  // 让出 CPU
   }
   
@@ -206,26 +232,65 @@ void saveConfig() {
 void loadConfig() {
   preferences.begin("sms_config", true);
   
-  // 加载 WiFi 配置（首次使用时从 wifi_config.h 读取默认值）
+  // 加载 WiFi 配置（优先读取紧凑新键名，回退旧键名以保证向前兼容）
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    String prefix = "wifi" + String(i);
+    String newKeySsid = makeNvsWifiKey("w_s_", i);
+    String newKeyPass = makeNvsWifiKey("w_p_", i);
+    String newKeyEn   = makeNvsWifiKey("w_e_", i);
+    String oldPrefix  = "wifi" + String(i);
+
     if (i == 0) {
       // 第一个网络默认使用 wifi_config.h 中的配置
-      config.wifiNetworks[i].ssid = preferences.getString((prefix + "ssid").c_str(), WIFI_SSID);
-      config.wifiNetworks[i].password = preferences.getString((prefix + "pass").c_str(), WIFI_PASS);
-      config.wifiNetworks[i].enabled = preferences.getBool((prefix + "en").c_str(), true);
+      String defaultSsid = WIFI_SSID;
+      String defaultPass = WIFI_PASS;
+      if (preferences.isKey(newKeySsid.c_str())) {
+        config.wifiNetworks[i].ssid = preferences.getString(newKeySsid.c_str(), defaultSsid);
+      } else {
+        config.wifiNetworks[i].ssid = preferences.getString((oldPrefix + "ssid").c_str(), defaultSsid);
+      }
+
+      if (preferences.isKey(newKeyPass.c_str())) {
+        config.wifiNetworks[i].password = preferences.getString(newKeyPass.c_str(), defaultPass);
+      } else {
+        config.wifiNetworks[i].password = preferences.getString((oldPrefix + "pass").c_str(), defaultPass);
+      }
+
+      if (preferences.isKey(newKeyEn.c_str())) {
+        config.wifiNetworks[i].enabled = preferences.getBool(newKeyEn.c_str(), true);
+      } else {
+        config.wifiNetworks[i].enabled = preferences.getBool((oldPrefix + "en").c_str(), true);
+      }
     } else {
-      config.wifiNetworks[i].ssid = preferences.getString((prefix + "ssid").c_str(), "");
-      config.wifiNetworks[i].password = preferences.getString((prefix + "pass").c_str(), "");
-      config.wifiNetworks[i].enabled = preferences.getBool((prefix + "en").c_str(), false);
+      if (preferences.isKey(newKeySsid.c_str())) {
+        config.wifiNetworks[i].ssid = preferences.getString(newKeySsid.c_str(), "");
+      } else {
+        config.wifiNetworks[i].ssid = preferences.getString((oldPrefix + "ssid").c_str(), "");
+      }
+
+      if (preferences.isKey(newKeyPass.c_str())) {
+        config.wifiNetworks[i].password = preferences.getString(newKeyPass.c_str(), "");
+      } else {
+        config.wifiNetworks[i].password = preferences.getString((oldPrefix + "pass").c_str(), "");
+      }
+
+      if (preferences.isKey(newKeyEn.c_str())) {
+        config.wifiNetworks[i].enabled = preferences.getBool(newKeyEn.c_str(), false);
+      } else {
+        config.wifiNetworks[i].enabled = preferences.getBool((oldPrefix + "en").c_str(), false);
+      }
     }
   }
   
   config.smtpServer = preferences.getString("smtpServer", "");
+  config.smtpServer.trim();
   config.smtpPort = preferences.getInt("smtpPort", 465);
+  if (config.smtpPort <= 0) config.smtpPort = 465;
   config.smtpUser = preferences.getString("smtpUser", "");
+  config.smtpUser.trim();
   config.smtpPass = preferences.getString("smtpPass", "");
+  config.smtpPass.trim();
   config.smtpSendTo = preferences.getString("smtpSendTo", "");
+  config.smtpSendTo.trim();
   config.emailEnabled = preferences.getBool("smtpEn", false);
   config.webUser = preferences.getString("webUser", DEFAULT_WEB_USER);
   config.webPass = preferences.getString("webPass", DEFAULT_WEB_PASS);
@@ -329,10 +394,28 @@ String getDeviceUrl() {
   return "http://" MDNS_HOSTNAME ".local 或 http://" + WiFi.localIP().toString();
 }
 
-// 初始化 SPIFFS
+// 初始化 SPIFFS 并检查历史文件自愈恢复
 void initSmsStorage() {
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS 初始化失败");
+    return;
+  }
+
+  // 检查主历史文件与修剪临时文件自愈恢复 (H3)
+  const char* historyFiles[] = {"/sms.txt", "/calls.txt"};
+  for (const char* path : historyFiles) {
+    String tempPath = String(path) + ".trim.tmp";
+    if (!SPIFFS.exists(path) && SPIFFS.exists(tempPath)) {
+      Serial.printf("检测到主历史文件 %s 缺失，但存在临时文件 %s，执行自愈恢复\n", path, tempPath.c_str());
+      if (SPIFFS.rename(tempPath, path)) {
+        Serial.printf("历史文件自愈恢复成功: %s\n", path);
+      } else {
+        Serial.printf("历史文件自愈恢复失败: %s\n", path);
+      }
+    } else if (SPIFFS.exists(path) && SPIFFS.exists(tempPath)) {
+      // 主文件已完好但残留修剪临时文件，清理以释放闪存空间
+      SPIFFS.remove(tempPath);
+    }
   }
 }
 
@@ -379,6 +462,7 @@ HistoryCleanupResult cleanupHistoryFile(const char* path) {
 
   while (src.available()) {
     String line = src.readStringUntil('\n');
+    line.trim();
     if (line.length() == 0) {
       continue;
     }
@@ -396,8 +480,7 @@ HistoryCleanupResult cleanupHistoryFile(const char* path) {
 
   SPIFFS.remove(path);
   if (!SPIFFS.rename(tempPath, path)) {
-    Serial.println("历史清洗失败：无法替换原文件");
-    SPIFFS.remove(tempPath);
+    Serial.println("历史清洗失败：无法替换原文件，保留临时文件以待恢复");
     result.kept = 0;
     result.removed = 0;
   }
@@ -405,37 +488,124 @@ HistoryCleanupResult cleanupHistoryFile(const char* path) {
   return result;
 }
 
+// 安全修剪历史文件：采用固定小缓冲区流式复制到临时文件，避免低内存下大字符串分配失败清空文件 (M2, M3, M5)
+bool safeTrimHistoryFile(const char* path, size_t maxSize, size_t targetSize) {
+  if (!path || path[0] == '\0') return false;
+
+  File src = SPIFFS.open(path, "r");
+  if (!src) {
+    return false; // M3: 打开失败立即返回，不调用 close()
+  }
+
+  size_t fileSize = src.size();
+  if (fileSize <= maxSize) {
+    src.close();
+    return true; // 文件未超过上限，无需修剪
+  }
+
+  // 低内存安全防护：避免在极端内存不足时修剪导致数据丢失 (M2)
+  if (ESP.getMaxAllocHeap() < 4096) {
+    Serial.printf("内存水位极低(maxAlloc=%u)，跳过历史文件修剪: %s\n", ESP.getMaxAllocHeap(), path);
+    src.close();
+    return false;
+  }
+
+  size_t startOffset = (fileSize > targetSize) ? (fileSize - targetSize) : (fileSize / 2);
+  if (!src.seek(startOffset)) {
+    Serial.println("历史修剪 seek 失败");
+    src.close();
+    return false;
+  }
+
+  // 跳过定位点可能截断的半行，找到下一个换行符作为完整行的起点
+  bool foundNewline = false;
+  while (src.available()) {
+    char c = (char)src.read();
+    if (c == '\n') {
+      foundNewline = true;
+      break;
+    }
+  }
+
+  if (!foundNewline || !src.available()) {
+    Serial.println("历史修剪未找到有效的后续行，保留原文件");
+    src.close();
+    return false;
+  }
+
+  String tempPath = String(path) + ".trim.tmp";
+  File dst = SPIFFS.open(tempPath, "w");
+  if (!dst) {
+    Serial.println("历史修剪无法创建临时文件");
+    src.close();
+    return false;
+  }
+
+  // 使用栈上固定 256 字节小缓冲区流式分块拷贝，杜绝 String 内存碎片与 OOM (M2, M5)
+  uint8_t buffer[256];
+  size_t copiedBytes = 0;
+  while (src.available()) {
+    int bytesRead = src.read(buffer, sizeof(buffer));
+    if (bytesRead > 0) {
+      size_t written = dst.write(buffer, bytesRead);
+      if (written != (size_t)bytesRead) {
+        Serial.println("历史修剪写入临时文件异常");
+        src.close();
+        dst.close();
+        SPIFFS.remove(tempPath);
+        return false;
+      }
+      copiedBytes += written;
+    } else {
+      break;
+    }
+  }
+
+  src.close();
+  dst.close();
+
+  // 空内容防护：若复制字节为 0，说明未获取到有效内容，绝不覆盖原文件！ (M2)
+  if (copiedBytes == 0) {
+    Serial.println("历史修剪有效数据为空，取消替换，保护原历史记录");
+    SPIFFS.remove(tempPath);
+    return false;
+  }
+
+  // 临时文件写入有效，执行原子替换
+  SPIFFS.remove(path);
+  if (!SPIFFS.rename(tempPath, path)) {
+    Serial.println("历史修剪替换原文件失败，保留临时文件以待自愈");
+    return false;
+  }
+
+  Serial.printf("历史文件修剪成功: %s, 原大小: %u, 修剪后: %u\n", path, fileSize, copiedBytes);
+  return true;
+}
+
 // 添加短信到历史记录（SPIFFS 存储）
 void addSmsToHistory(const char* sender, const char* message, const char* timestamp) {
   stats.smsReceived++;
   
-  // 构建 JSON 行
+  // 构建 JSON 行，预分配空间消除 String 碎片化 (M5)
   String safeTimestamp = jsonEscape(String(timestamp));
   String safeSender = jsonEscape(String(sender));
   String safeMessage = jsonEscape(String(message).substring(0, 200));
-  String line = "{\"t\":\"" + safeTimestamp + "\",\"s\":\"" + safeSender + "\",\"m\":\"" + safeMessage + "\"}\n";
 
-  // 检查文件大小，超过 50KB 则清理旧数据
-  File f = SPIFFS.open("/sms.txt", "r");
-  size_t fileSize = f ? f.size() : 0;
-  f.close();
-  
-  if (fileSize > 50000) {
-    // 读取后半部分保留
-    f = SPIFFS.open("/sms.txt", "r");
-    f.seek(fileSize / 2);
-    String remaining = f.readString();
-    f.close();
-    // 从第一个换行开始保留
-    int nl = remaining.indexOf('\n');
-    if (nl > 0) remaining = remaining.substring(nl + 1);
-    f = SPIFFS.open("/sms.txt", "w");
-    f.print(remaining);
-    f.close();
-  }
-  
+  String line;
+  line.reserve(safeTimestamp.length() + safeSender.length() + safeMessage.length() + 32);
+  line += "{\"t\":\"";
+  line += safeTimestamp;
+  line += "\",\"s\":\"";
+  line += safeSender;
+  line += "\",\"m\":\"";
+  line += safeMessage;
+  line += "\"}\n";
+
+  // 检查文件大小并安全修剪（超过 50KB 则修剪保留约 25KB，低内存下安全放弃修剪，绝不清空历史）(M2, M3)
+  safeTrimHistoryFile("/sms.txt", 50000, 25000);
+
   // 追加新短信
-  f = SPIFFS.open("/sms.txt", "a");
+  File f = SPIFFS.open("/sms.txt", "a");
   if (f) {
     f.print(line);
     f.close();
@@ -445,32 +615,54 @@ void addSmsToHistory(const char* sender, const char* message, const char* timest
   saveStats();
 }
 
-// 获取短信历史（返回 JSON 数组字符串）
+// 获取短信历史（返回 JSON 数组字符串，使用固定容量环形缓冲区避免一次性把整个文件读入内存）(M6, M5)
 String getSmsHistory() {
   File f = SPIFFS.open("/sms.txt", "r");
   if (!f) return "[]";
   
-  String result = "[";
-  bool first = true;
-  
-  // 读取所有行并倒序排列
-  std::vector<String> lines;
+  // 堆上分配环形缓冲区，避免在栈上直接占用 1.6KB+ 栈空间导致栈溢出 (M6)
+  std::unique_ptr<String[]> ringBuffer(new (std::nothrow) String[MAX_SMS_HISTORY]);
+  if (!ringBuffer) {
+    Serial.println("内存不足，无法分配短信历史缓冲区");
+    f.close();
+    return "[]";
+  }
+
+  int head = 0;
+  int count = 0;
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
+    line.trim();
     if (line.length() > 10 && isLikelyValidHistoryJsonLine(line)) {
-      lines.push_back(line);
+      ringBuffer[head] = line;
+      head = (head + 1) % MAX_SMS_HISTORY;
+      if (count < MAX_SMS_HISTORY) count++;
     } else if (line.length() > 0) {
       Serial.println("跳过损坏的短信历史行");
     }
   }
   f.close();
-  
-  // 倒序输出最近100条
-  int count = 0;
-  for (int i = lines.size() - 1; i >= 0 && count < 100; i--, count++) {
+
+  if (count == 0) return "[]";
+
+  // 预估输出大小并调用 reserve 消除堆碎片 (M5)
+  size_t totalBytes = 2; // "[" + "]"
+  for (int i = 0; i < count; i++) {
+    totalBytes += ringBuffer[i].length() + 1;
+  }
+
+  String result;
+  result.reserve(totalBytes + 16);
+  result = "[";
+  bool first = true;
+
+  // 倒序输出最近记录（从最新到最旧）
+  for (int i = 0; i < count; i++) {
+    int idx = (head - 1 - i + MAX_SMS_HISTORY) % MAX_SMS_HISTORY;
     if (!first) result += ",";
     first = false;
-    result += lines[i];
+    result += ringBuffer[idx];
   }
   result += "]";
   return result;
@@ -503,25 +695,18 @@ void addCallToHistory(const char* caller, const char* timestamp) {
   String safeTimestamp = jsonEscape(String(timestamp));
   String safeCaller = jsonEscape(String(caller));
 
-  String line = "{\"t\":\"" + safeTimestamp + "\",\"n\":\"" + safeCaller + "\"}\n";
+  String line;
+  line.reserve(safeTimestamp.length() + safeCaller.length() + 24);
+  line += "{\"t\":\"";
+  line += safeTimestamp;
+  line += "\",\"n\":\"";
+  line += safeCaller;
+  line += "\"}\n";
 
-  File f = SPIFFS.open("/calls.txt", "r");
-  size_t fileSize = f ? f.size() : 0;
-  f.close();
+  // 检查文件大小并安全修剪（超过 30KB 则修剪保留约 15KB）(M2, M3)
+  safeTrimHistoryFile("/calls.txt", 30000, 15000);
 
-  if (fileSize > 30000) {
-    f = SPIFFS.open("/calls.txt", "r");
-    f.seek(fileSize / 2);
-    String remaining = f.readString();
-    f.close();
-    int nl = remaining.indexOf('\n');
-    if (nl > 0) remaining = remaining.substring(nl + 1);
-    f = SPIFFS.open("/calls.txt", "w");
-    f.print(remaining);
-    f.close();
-  }
-
-  f = SPIFFS.open("/calls.txt", "a");
+  File f = SPIFFS.open("/calls.txt", "a");
   if (f) {
     f.print(line);
     f.close();
@@ -530,29 +715,52 @@ void addCallToHistory(const char* caller, const char* timestamp) {
   saveStats();
 }
 
-// 获取来电历史（返回 JSON 数组字符串）
+// 获取来电历史（返回 JSON 数组字符串，使用固定容量环形缓冲区避免一次性把整个文件读入内存）(M6, M5)
 String getCallHistory() {
   File f = SPIFFS.open("/calls.txt", "r");
   if (!f) return "[]";
 
-  String result = "[";
-  bool first = true;
-  std::vector<String> lines;
+  // 堆上分配环形缓冲区，避免在栈上直接占用 1.6KB+ 栈空间导致栈溢出 (M6)
+  std::unique_ptr<String[]> ringBuffer(new (std::nothrow) String[MAX_SMS_HISTORY]);
+  if (!ringBuffer) {
+    Serial.println("内存不足，无法分配来电历史缓冲区");
+    f.close();
+    return "[]";
+  }
+
+  int head = 0;
+  int count = 0;
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
+    line.trim();
     if (line.length() > 8 && isLikelyValidHistoryJsonLine(line)) {
-      lines.push_back(line);
+      ringBuffer[head] = line;
+      head = (head + 1) % MAX_SMS_HISTORY;
+      if (count < MAX_SMS_HISTORY) count++;
     } else if (line.length() > 0) {
       Serial.println("跳过损坏的来电历史行");
     }
   }
   f.close();
 
-  int count = 0;
-  for (int i = lines.size() - 1; i >= 0 && count < 100; i--, count++) {
+  if (count == 0) return "[]";
+
+  size_t totalBytes = 2;
+  for (int i = 0; i < count; i++) {
+    totalBytes += ringBuffer[i].length() + 1;
+  }
+
+  String result;
+  result.reserve(totalBytes + 16);
+  result = "[";
+  bool first = true;
+
+  for (int i = 0; i < count; i++) {
+    int idx = (head - 1 - i + MAX_SMS_HISTORY) % MAX_SMS_HISTORY;
     if (!first) result += ",";
     first = false;
-    result += lines[i];
+    result += ringBuffer[idx];
   }
   result += "]";
   return result;
@@ -700,17 +908,17 @@ void saveStats() {
   }
 
   preferences.begin("sms_stats", false);
-  preferences.putULong("received", stats.smsReceived);
-  preferences.putULong("sent", stats.smsSent);
-  preferences.putULong("calls", stats.callsReceived);
-  preferences.putULong("pushOk", stats.pushSuccess);
-  preferences.putULong("pushFail", stats.pushFailed);
-  preferences.putULong("boots", stats.bootCount);
-  preferences.putULong("brownout", stats.brownoutResets);
-  preferences.putULong("poweron", stats.powerOnResets);
-  preferences.putULong("wdt", stats.watchdogResets);
-  preferences.putULong("swreset", stats.softwareResets);
-  preferences.putULong("panic", stats.panicResets);
+  preferences.putULong("received", stats.smsReceived.load());
+  preferences.putULong("sent", stats.smsSent.load());
+  preferences.putULong("calls", stats.callsReceived.load());
+  preferences.putULong("pushOk", stats.pushSuccess.load());
+  preferences.putULong("pushFail", stats.pushFailed.load());
+  preferences.putULong("boots", stats.bootCount.load());
+  preferences.putULong("brownout", stats.brownoutResets.load());
+  preferences.putULong("poweron", stats.powerOnResets.load());
+  preferences.putULong("wdt", stats.watchdogResets.load());
+  preferences.putULong("swreset", stats.softwareResets.load());
+  preferences.putULong("panic", stats.panicResets.load());
   preferences.end();
 
   if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
@@ -718,18 +926,25 @@ void saveStats() {
 
 // 加载统计数据
 void loadStats() {
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("统计锁获取超时，跳过本次统计加载");
+    return;
+  }
+
   preferences.begin("sms_stats", true);
-  stats.smsReceived = preferences.getULong("received", 0);
-  stats.smsSent = preferences.getULong("sent", 0);
-  stats.callsReceived = preferences.getULong("calls", 0);
-  stats.pushSuccess = preferences.getULong("pushOk", 0);
-  stats.pushFailed = preferences.getULong("pushFail", 0);
-  stats.bootCount = preferences.getULong("boots", 0) + 1;
-  stats.brownoutResets = preferences.getULong("brownout", 0);
-  stats.powerOnResets = preferences.getULong("poweron", 0);
-  stats.watchdogResets = preferences.getULong("wdt", 0);
-  stats.softwareResets = preferences.getULong("swreset", 0);
-  stats.panicResets = preferences.getULong("panic", 0);
+  stats.smsReceived.store(preferences.getULong("received", 0));
+  stats.smsSent.store(preferences.getULong("sent", 0));
+  stats.callsReceived.store(preferences.getULong("calls", 0));
+  stats.pushSuccess.store(preferences.getULong("pushOk", 0));
+  stats.pushFailed.store(preferences.getULong("pushFail", 0));
+  stats.bootCount.store(preferences.getULong("boots", 0) + 1);
+  stats.brownoutResets.store(preferences.getULong("brownout", 0));
+  stats.powerOnResets.store(preferences.getULong("poweron", 0));
+  stats.watchdogResets.store(preferences.getULong("wdt", 0));
+  stats.softwareResets.store(preferences.getULong("swreset", 0));
+  stats.panicResets.store(preferences.getULong("panic", 0));
   preferences.end();
 
   lastResetReasonCode = esp_reset_reason();
@@ -745,13 +960,15 @@ void loadStats() {
 
   // 保存更新后的启动次数和重启分类统计
   preferences.begin("sms_stats", false);
-  preferences.putULong("boots", stats.bootCount);
-  preferences.putULong("brownout", stats.brownoutResets);
-  preferences.putULong("poweron", stats.powerOnResets);
-  preferences.putULong("wdt", stats.watchdogResets);
-  preferences.putULong("swreset", stats.softwareResets);
-  preferences.putULong("panic", stats.panicResets);
+  preferences.putULong("boots", stats.bootCount.load());
+  preferences.putULong("brownout", stats.brownoutResets.load());
+  preferences.putULong("poweron", stats.powerOnResets.load());
+  preferences.putULong("wdt", stats.watchdogResets.load());
+  preferences.putULong("swreset", stats.softwareResets.load());
+  preferences.putULong("panic", stats.panicResets.load());
   preferences.end();
+
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
 
   if (lastInterruptedOperation.valid) {
     Serial.printf(
@@ -768,24 +985,33 @@ void loadStats() {
 
 // 重置统计数据，可选择保留启动次数
 void resetStats(bool preserveBootCount) {
-  unsigned long bootCount = preserveBootCount ? stats.bootCount : 0;
-  unsigned long brownoutResets = preserveBootCount ? stats.brownoutResets : 0;
-  unsigned long powerOnResets = preserveBootCount ? stats.powerOnResets : 0;
-  unsigned long watchdogResets = preserveBootCount ? stats.watchdogResets : 0;
-  unsigned long softwareResets = preserveBootCount ? stats.softwareResets : 0;
-  unsigned long panicResets = preserveBootCount ? stats.panicResets : 0;
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex != nullptr &&
+      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("统计锁获取超时，跳过本次重置统计");
+    return;
+  }
 
-  stats.smsReceived = 0;
-  stats.smsSent = 0;
-  stats.callsReceived = 0;
-  stats.pushSuccess = 0;
-  stats.pushFailed = 0;
-  stats.bootCount = bootCount;
-  stats.brownoutResets = brownoutResets;
-  stats.powerOnResets = powerOnResets;
-  stats.watchdogResets = watchdogResets;
-  stats.softwareResets = softwareResets;
-  stats.panicResets = panicResets;
+  unsigned long bootCount = preserveBootCount ? stats.bootCount.load() : 0;
+  unsigned long brownoutResets = preserveBootCount ? stats.brownoutResets.load() : 0;
+  unsigned long powerOnResets = preserveBootCount ? stats.powerOnResets.load() : 0;
+  unsigned long watchdogResets = preserveBootCount ? stats.watchdogResets.load() : 0;
+  unsigned long softwareResets = preserveBootCount ? stats.softwareResets.load() : 0;
+  unsigned long panicResets = preserveBootCount ? stats.panicResets.load() : 0;
+
+  stats.smsReceived.store(0);
+  stats.smsSent.store(0);
+  stats.callsReceived.store(0);
+  stats.pushSuccess.store(0);
+  stats.pushFailed.store(0);
+  stats.bootCount.store(bootCount);
+  stats.brownoutResets.store(brownoutResets);
+  stats.powerOnResets.store(powerOnResets);
+  stats.watchdogResets.store(watchdogResets);
+  stats.softwareResets.store(softwareResets);
+  stats.panicResets.store(panicResets);
+
+  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
 
   saveStats();
 }

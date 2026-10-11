@@ -18,7 +18,9 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
   Serial1.println(cmd);
   
   unsigned long start = millis();
-  String resp = "";
+  String resp;
+  resp.reserve(128); // 预分配响应缓冲区，避免频繁拼接再分配 (M5)
+  // 注释 (M1): 无符号整型差值 (millis() - start) 溢出回绕安全
   while (millis() - start < timeout) {
     esp_task_wdt_reset();
     yield();
@@ -48,7 +50,9 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   while (Serial1.available()) Serial1.read();
   Serial1.println(cmd);
   unsigned long start = millis();
-  String resp = "";
+  String resp;
+  resp.reserve(64);
+  // 注释 (M1): 无符号整型差值 (millis() - start) 溢出回绕安全
   while (millis() - start < timeout) {
     esp_task_wdt_reset();
     yield();
@@ -400,13 +404,23 @@ void handleSave() {
   
   // SMTP 配置
   config.emailEnabled = server.arg("smtpEn") == "true";
-  config.smtpServer = server.arg("smtpServer");
+  String nextSmtpServer = server.arg("smtpServer");
+  nextSmtpServer.trim();
+  config.smtpServer = nextSmtpServer;
   config.smtpPort = server.arg("smtpPort").toInt();
-  if (config.smtpPort == 0) config.smtpPort = 465;
-  config.smtpUser = server.arg("smtpUser");
-  config.smtpPass = server.arg("smtpPass");
-  config.smtpSendTo = server.arg("smtpSendTo");
-  
+  if (config.smtpPort <= 0) config.smtpPort = 465;
+  String nextSmtpUser = server.arg("smtpUser");
+  nextSmtpUser.trim();
+  config.smtpUser = nextSmtpUser;
+  String nextSmtpPass = server.arg("smtpPass");
+  nextSmtpPass.trim();
+  if (nextSmtpPass.length() > 0) {
+    config.smtpPass = nextSmtpPass;
+  }
+  String nextSmtpSendTo = server.arg("smtpSendTo");
+  nextSmtpSendTo.trim();
+  config.smtpSendTo = nextSmtpSendTo;
+
   esp_task_wdt_reset();
   yield();
   
@@ -594,10 +608,16 @@ void handleSmsHistory() {
   
   String historyJson = getSmsHistory();
   String callHistoryJson = getCallHistory();
-  String json = "{";
-  json += "\"history\":" + historyJson + ",";
-  json += "\"smsHistory\":" + historyJson + ",";
-  json += "\"callHistory\":" + callHistoryJson;
+
+  // 预估大小并 reserve，仅保留单份 smsHistory 避免重复存放导致 OOM (M5)
+  size_t estLen = historyJson.length() + callHistoryJson.length() + 64;
+  String json;
+  json.reserve(estLen);
+  json = "{";
+  json += "\"smsHistory\":";
+  json += historyJson;
+  json += ",\"callHistory\":";
+  json += callHistoryJson;
   json += "}";
 
   server.send(200, "application/json", json);
@@ -607,21 +627,23 @@ void handleSmsHistory() {
 void handleStats() {
   if (!checkAuth()) return;
   
-  String json = "{";
-  json += "\"received\":" + String(stats.smsReceived) + ",";
-  json += "\"sent\":" + String(stats.smsSent) + ",";
-  json += "\"calls\":" + String(stats.callsReceived) + ",";
-  json += "\"pushOk\":" + String(stats.pushSuccess) + ",";
-  json += "\"pushFail\":" + String(stats.pushFailed) + ",";
-  json += "\"boots\":" + String(stats.bootCount) + ",";
+  String json;
+  json.reserve(1024); // 预分配 1KB 空间，杜绝几十次 += 造成的堆碎片 (M5)
+  json = "{";
+  json += "\"received\":" + String(stats.smsReceived.load()) + ",";
+  json += "\"sent\":" + String(stats.smsSent.load()) + ",";
+  json += "\"calls\":" + String(stats.callsReceived.load()) + ",";
+  json += "\"pushOk\":" + String(stats.pushSuccess.load()) + ",";
+  json += "\"pushFail\":" + String(stats.pushFailed.load()) + ",";
+  json += "\"boots\":" + String(stats.bootCount.load()) + ",";
   json += "\"lastResetReason\":\"" + jsonEscape(lastResetReasonText) + "\",";
   json += "\"lastResetReasonCode\":" + String((int)lastResetReasonCode) + ",";
   json += "\"powerSuspected\":" + String(lastResetPowerSuspected ? "true" : "false") + ",";
-  json += "\"brownoutResets\":" + String(stats.brownoutResets) + ",";
-  json += "\"powerOnResets\":" + String(stats.powerOnResets) + ",";
-  json += "\"watchdogResets\":" + String(stats.watchdogResets) + ",";
-  json += "\"softwareResets\":" + String(stats.softwareResets) + ",";
-  json += "\"panicResets\":" + String(stats.panicResets) + ",";
+  json += "\"brownoutResets\":" + String(stats.brownoutResets.load()) + ",";
+  json += "\"powerOnResets\":" + String(stats.powerOnResets.load()) + ",";
+  json += "\"watchdogResets\":" + String(stats.watchdogResets.load()) + ",";
+  json += "\"softwareResets\":" + String(stats.softwareResets.load()) + ",";
+  json += "\"panicResets\":" + String(stats.panicResets.load()) + ",";
   json += "\"interruptedOperation\":\"" + jsonEscape(lastInterruptedOperation.operation) + "\",";
   json += "\"interruptedStage\":\"" + jsonEscape(lastInterruptedOperation.stage) + "\",";
   json += "\"interruptedUptime\":" + String(lastInterruptedOperation.uptimeSeconds) + ",";
@@ -650,7 +672,7 @@ void handleClearSmsHistory() {
   if (!checkAuth()) return;
 
   clearSmsHistory();
-  stats.smsReceived = 0;
+  stats.smsReceived.store(0);
   saveStats();
   server.send(200, "application/json", "{\"success\":true,\"message\":\"短信记录已清空，对应统计已归零\"}");
 }
@@ -660,7 +682,7 @@ void handleClearCallHistory() {
   if (!checkAuth()) return;
 
   clearCallHistory();
-  stats.callsReceived = 0;
+  stats.callsReceived.store(0);
   saveStats();
   server.send(200, "application/json", "{\"success\":true,\"message\":\"来电记录已清空，对应统计已归零\"}");
 }
@@ -684,11 +706,17 @@ void handleCleanupHistory() {
     return;
   }
 
-  String json = "{";
+  String json;
+  json.reserve(128);
+  json = "{";
   json += "\"success\":true,";
-  json += "\"message\":\"" + targetName + "清洗完成\",";
-  json += "\"kept\":" + String(result.kept) + ",";
-  json += "\"removed\":" + String(result.removed);
+  json += "\"message\":\"";
+  json += targetName;
+  json += "清洗完成\",";
+  json += "\"kept\":";
+  json += String(result.kept);
+  json += ",\"removed\":";
+  json += String(result.removed);
   json += "}";
   server.send(200, "application/json", json);
 }

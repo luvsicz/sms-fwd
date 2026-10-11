@@ -56,7 +56,9 @@ static String mqttLogTopicByKind(MqttLogKind kind) {
 }
 
 static String buildMqttLogPayload(const MqttLogEntry& entry) {
-  String json = "{";
+  String json;
+  json.reserve(384);
+  json = "{";
   switch (entry.kind) {
     case MQTT_LOG_KIND_TIMING:
       json += "\"event_type\":\"timing\",";
@@ -211,11 +213,11 @@ static String mqttResetStatusFields() {
   json += "\"last_reset_reason\":\"" + jsonEscape(lastResetReasonText) + "\",";
   json += "\"last_reset_reason_code\":" + String((int)lastResetReasonCode) + ",";
   json += "\"power_suspected\":" + String(lastResetPowerSuspected ? "true" : "false") + ",";
-  json += "\"brownout_resets\":" + String(stats.brownoutResets) + ",";
-  json += "\"poweron_resets\":" + String(stats.powerOnResets) + ",";
-  json += "\"watchdog_resets\":" + String(stats.watchdogResets) + ",";
-  json += "\"software_resets\":" + String(stats.softwareResets) + ",";
-  json += "\"panic_resets\":" + String(stats.panicResets) + ",";
+  json += "\"brownout_resets\":" + String((unsigned long)stats.brownoutResets.load()) + ",";
+  json += "\"poweron_resets\":" + String((unsigned long)stats.powerOnResets.load()) + ",";
+  json += "\"watchdog_resets\":" + String((unsigned long)stats.watchdogResets.load()) + ",";
+  json += "\"software_resets\":" + String((unsigned long)stats.softwareResets.load()) + ",";
+  json += "\"panic_resets\":" + String((unsigned long)stats.panicResets.load()) + ",";
   json += "\"has_interrupted_operation\":" + String(lastInterruptedOperation.valid ? "true" : "false") + ",";
   json += "\"interrupted_operation\":\"" + jsonEscape(lastInterruptedOperation.operation) + "\",";
   json += "\"interrupted_stage\":\"" + jsonEscape(lastInterruptedOperation.stage) + "\",";
@@ -647,12 +649,18 @@ void publishMqttSmsReceived(const char* sender, const char* message, const char*
   Serial.println("MQTT推送短信...");
   publishDeviceLog("info", "mqtt", "MQTT推送短信");
 
-  String json = "{";
+  String safeSender = jsonEscape(String(sender));
+  String safeMessage = jsonEscape(String(message));
+  String safeTime = jsonEscape(String(timestamp));
+
+  String json;
+  json.reserve(safeSender.length() + safeMessage.length() + safeTime.length() * 2 + mqttDeviceId.length() + 128);
+  json = "{";
   json += "\"event_type\":\"sms_received\",";
-  json += "\"sender\":\"" + jsonEscape(String(sender)) + "\",";
-  json += "\"message\":\"" + jsonEscape(String(message)) + "\",";
-  json += "\"time\":\"" + jsonEscape(String(timestamp)) + "\",";
-  json += "\"timestamp\":\"" + jsonEscape(String(timestamp)) + "\",";
+  json += "\"sender\":\"" + safeSender + "\",";
+  json += "\"message\":\"" + safeMessage + "\",";
+  json += "\"time\":\"" + safeTime + "\",";
+  json += "\"timestamp\":\"" + safeTime + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
   
@@ -693,10 +701,15 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
   Serial.println("MQTT推送来电通知...");
   publishDeviceLog("info", "mqtt", "MQTT推送来电通知");
 
-  String json = "{";
+  String safeCaller = jsonEscape(String(caller));
+  String safeTime = jsonEscape(String(timestamp));
+
+  String json;
+  json.reserve(safeCaller.length() + safeTime.length() + mqttDeviceId.length() + 96);
+  json = "{";
   json += "\"event_type\":\"incoming_call\",";
-  json += "\"caller\":\"" + jsonEscape(String(caller)) + "\",";
-  json += "\"timestamp\":\"" + jsonEscape(String(timestamp)) + "\",";
+  json += "\"caller\":\"" + safeCaller + "\",";
+  json += "\"timestamp\":\"" + safeTime + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
 
@@ -726,10 +739,15 @@ void publishMqttCallReceived(const char* caller, const char* timestamp) {
 void publishMqttSmsSent(const char* phone, const char* message, bool success) {
   if (!config.mqttEnabled || !mqttClient.connected()) return;
   
-  String json = "{";
+  String safePhone = jsonEscape(String(phone));
+  String safeMsg = jsonEscape(String(message));
+
+  String json;
+  json.reserve(safePhone.length() + safeMsg.length() + mqttDeviceId.length() + 96);
+  json = "{";
   json += "\"success\":" + String(success ? "true" : "false") + ",";
-  json += "\"phone\":\"" + jsonEscape(String(phone)) + "\",";
-  json += "\"message\":\"" + jsonEscape(String(message)) + "\",";
+  json += "\"phone\":\"" + safePhone + "\",";
+  json += "\"message\":\"" + safeMsg + "\",";
   json += "\"device\":\"" + mqttDeviceId + "\"";
   json += "}";
   
@@ -850,7 +868,9 @@ void publishMqttDeviceStatus() {
     }
   }
   
-  String json = "{";
+  String json;
+  json.reserve(512);
+  json = "{";
   json += "\"status\":\"online\",";
   json += "\"device\":\"" + mqttDeviceId + "\",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";

@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <esp_system.h>
 #include <vector>
+#include <atomic>
+#include <memory>
 
 // 串口映射
 #define TXD 3
@@ -53,19 +55,50 @@ struct SmsRecord {
   bool valid;
 };
 
-// 统计计数器结构
+// 统计计数器结构（使用 std::atomic 支持多任务/多线程并发安全访问）
 struct Statistics {
-  unsigned long smsReceived;    // 收到短信数
-  unsigned long smsSent;        // 发送短信数
-  unsigned long callsReceived;  // 收到来电数
-  unsigned long pushSuccess;    // 推送成功数
-  unsigned long pushFailed;     // 推送失败数
-  unsigned long bootCount;      // 启动次数
-  unsigned long brownoutResets; // 欠压复位次数（强烈指向供电不足）
-  unsigned long powerOnResets;  // 上电复位次数（可能是断电/供电跌落）
-  unsigned long watchdogResets; // 看门狗复位次数
-  unsigned long softwareResets; // 软件主动重启次数
-  unsigned long panicResets;    // 异常崩溃复位次数
+  std::atomic<uint32_t> smsReceived{0};    // 收到短信数
+  std::atomic<uint32_t> smsSent{0};        // 发送短信数
+  std::atomic<uint32_t> callsReceived{0};  // 收到来电数
+  std::atomic<uint32_t> pushSuccess{0};    // 推送成功数
+  std::atomic<uint32_t> pushFailed{0};     // 推送失败数
+  std::atomic<uint32_t> bootCount{0};      // 启动次数
+  std::atomic<uint32_t> brownoutResets{0}; // 欠压复位次数（强烈指向供电不足）
+  std::atomic<uint32_t> powerOnResets{0};  // 上电复位次数（可能是断电/供电跌落）
+  std::atomic<uint32_t> watchdogResets{0}; // 看门狗复位次数
+  std::atomic<uint32_t> softwareResets{0}; // 软件主动重启次数
+  std::atomic<uint32_t> panicResets{0};    // 异常崩溃复位次数
+
+  Statistics() = default;
+  Statistics(const Statistics& other) {
+    smsReceived.store(other.smsReceived.load());
+    smsSent.store(other.smsSent.load());
+    callsReceived.store(other.callsReceived.load());
+    pushSuccess.store(other.pushSuccess.load());
+    pushFailed.store(other.pushFailed.load());
+    bootCount.store(other.bootCount.load());
+    brownoutResets.store(other.brownoutResets.load());
+    powerOnResets.store(other.powerOnResets.load());
+    watchdogResets.store(other.watchdogResets.load());
+    softwareResets.store(other.softwareResets.load());
+    panicResets.store(other.panicResets.load());
+  }
+  Statistics& operator=(const Statistics& other) {
+    if (this != &other) {
+      smsReceived.store(other.smsReceived.load());
+      smsSent.store(other.smsSent.load());
+      callsReceived.store(other.callsReceived.load());
+      pushSuccess.store(other.pushSuccess.load());
+      pushFailed.store(other.pushFailed.load());
+      bootCount.store(other.bootCount.load());
+      brownoutResets.store(other.brownoutResets.load());
+      powerOnResets.store(other.powerOnResets.load());
+      watchdogResets.store(other.watchdogResets.load());
+      softwareResets.store(other.softwareResets.load());
+      panicResets.store(other.panicResets.load());
+    }
+    return *this;
+  }
 };
 
 struct HistoryCleanupResult {
@@ -86,6 +119,8 @@ struct InterruptedOperationDiagnostic {
 
 // WiFi 配置结构
 #define MAX_WIFI_NETWORKS 3
+// 确保即使 MAX_WIFI_NETWORKS 增大，生成的紧凑 NVS 键名（如 "w_s_" + idx）也不会超过 15 字节
+static_assert(MAX_WIFI_NETWORKS < 100000000, "MAX_WIFI_NETWORKS is too large for 15-character NVS key");
 struct WifiNetwork {
   String ssid;
   String password;
@@ -209,12 +244,18 @@ HistoryCleanupResult cleanupSmsHistory();
 HistoryCleanupResult cleanupCallHistory();
 void clearSmsHistory();
 void clearCallHistory();
+bool safeTrimHistoryFile(const char* path, size_t maxSize, size_t targetSize);
 String normalizePhoneNumber(const String& rawNumber);
 bool phoneNumbersMatch(const String& senderNum, const String& filterNum);
 bool isNumberFiltered(const char* number);
 bool isContentFiltered(const char* content);
 void saveStats();
 void initStatsLock();
+void statsIncrementSmsReceived();
+void statsIncrementSmsSent();
+void statsIncrementCallsReceived();
+void statsIncrementPushSuccess();
+void statsIncrementPushFailed();
 void loadStats();
 void resetStats(bool preserveBootCount = true);
 String resetReasonToString(esp_reset_reason_t reason);
