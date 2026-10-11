@@ -11,6 +11,40 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
+
+// 全局 TLS/SMTP 互斥锁，确保后台邮件任务与外部并发调用时的独占安全 (C4)
+static SemaphoreHandle_t smtpMutex = nullptr;
+
+void initSmtpLock() {
+  if (smtpMutex == nullptr) {
+    smtpMutex = xSemaphoreCreateMutex();
+    if (smtpMutex == nullptr) {
+      Serial.println("SMTP互斥锁创建失败");
+    }
+  }
+}
+
+// RAII 锁守卫，确保在任何返回路径下自动释放 SMTP 锁
+struct SmtpLockGuard {
+  SemaphoreHandle_t mutex;
+  bool locked;
+  SmtpLockGuard(SemaphoreHandle_t m, TickType_t timeout) : mutex(m), locked(false) {
+    if (mutex != nullptr && xSemaphoreTake(mutex, timeout) == pdTRUE) {
+      locked = true;
+    }
+  }
+  ~SmtpLockGuard() {
+    if (locked && mutex != nullptr) {
+      xSemaphoreGive(mutex);
+    }
+  }
+
+  SmtpLockGuard(const SmtpLockGuard&) = delete;
+  SmtpLockGuard& operator=(const SmtpLockGuard&) = delete;
+
+  bool isLocked() const { return locked; }
+};
 
 // HTTP 推送必须短超时，避免单个通道阻塞 loopTask 触发看门狗
 static const uint16_t HTTP_PUSH_TIMEOUT_MS = 1000;
@@ -130,6 +164,7 @@ static void emailWorkerTask(void* parameter) {
   for (;;) {
     if (xQueueReceive(emailQueue, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
       sendEmailNotificationNow(job->subject.c_str(), job->body.c_str());
+      saveStats();
       delete job;
       job = nullptr;
       delay(10);
@@ -604,71 +639,148 @@ void sendEmailNotification(const char* subject, const char* body) {
 static void sendEmailNotificationNow(const char* subject, const char* body) {
   if (!config.emailEnabled) return;
 
-  if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
-      config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi未连接，跳过邮件发送");
+    stats.pushFailed++;
+    return;
+  }
+
+  String smtpServer = config.smtpServer;
+  smtpServer.trim();
+  String smtpUser = config.smtpUser;
+  smtpUser.trim();
+  String smtpPass = config.smtpPass;
+  smtpPass.trim();
+  String smtpSendTo = config.smtpSendTo;
+  smtpSendTo.trim();
+  int smtpPort = config.smtpPort > 0 ? config.smtpPort : 465;
+
+  if (smtpServer.length() == 0 || smtpUser.length() == 0 ||
+      smtpPass.length() == 0 || smtpSendTo.length() == 0) {
     Serial.println("邮件配置不完整，跳过发送");
     return;
   }
-  
+
+  // 在建立 SMTP 连接之前检查 NTP 时间同步，避免连接建立后空等导致服务端断开，
+  // 且即使 NTP 超时也继续使用 ReadyMail 默认时间戳发送，不丢弃邮件通知
+  if (time(nullptr) < 100000) {
+    configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+    unsigned long syncStart = millis();
+    while (time(nullptr) < 100000 && millis() - syncStart < 8000) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (time(nullptr) < 100000) {
+      Serial.println("警告: NTP尚未完成同步，将使用默认时间戳继续发送邮件");
+    }
+  }
+
+  // 获取 SMTP 独占锁，防止多任务/多线程并发调用导致 TLS/SMTP 崩溃 (C4)
+  if (smtpMutex == nullptr) initSmtpLock();
+  SmtpLockGuard lock(smtpMutex, pdMS_TO_TICKS(35000));
+  if (!lock.isLocked()) {
+    Serial.println("SMTP互斥锁获取超时，跳过本次邮件发送");
+    stats.pushFailed++;
+    return;
+  }
+
   auto statusCallback = [](SMTPStatus status) {
     Serial.println(status.text);
   };
-  ssl_client.setTimeout(5000);
-  ssl_client.setHandshakeTimeout(5);
+
+  if (ssl_client.stillInPlainStart() && smtpPort != 587 && smtpPort != 25) {
+    ssl_client = WiFiClientSecure();
+  }
+  ssl_client.setInsecure();
+  ssl_client.setConnectionTimeout(10000);
+  ssl_client.setTimeout(10000);
+  ssl_client.setHandshakeTimeout(15);
+
+  bool useSsl = (smtpPort != 25);
+  if (smtpPort == 587) {
+    ssl_client.setPlainStart();
+    smtp.setStartTLS([](bool &success) {
+      success = ssl_client.startTLS() != 0;
+    }, true);
+  } else if (smtpPort == 25) {
+    ssl_client.setPlainStart();
+    smtp.setStartTLS(NULL, false);
+  } else {
+    smtp.setStartTLS(NULL, false);
+  }
+
   recordOperationDiagnostic("smtp", "connect");
   unsigned long stageStart = millis();
-  bool started = smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback, true, false);
+  bool started = smtp.connect(smtpServer.c_str(), smtpPort, statusCallback, useSsl, false);
   if (!started || !waitForSmtpProgress("connect", stageStart) || !smtp.isConnected()) {
-    Serial.println("邮件服务器连接失败");
+    SMTPStatus st = smtp.status();
+    Serial.printf("邮件服务器连接失败 (error=%d, status=%d)\n", st.errorCode, st.statusCode);
     smtp.stop();
     ssl_client.stop();
     clearOperationDiagnostic();
+    stats.pushFailed++;
     return;
   }
 
   recordOperationDiagnostic("smtp", "authenticate");
   stageStart = millis();
-  started = smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password, false);
+  started = smtp.authenticate(smtpUser.c_str(), smtpPass.c_str(), readymail_auth_password, false);
   if (!started || !waitForSmtpProgress("authenticate", stageStart) || !smtp.isAuthenticated()) {
-    Serial.println("SMTP认证失败");
+    SMTPStatus st = smtp.status();
+    Serial.printf("SMTP认证失败 (error=%d, status=%d)\n", st.errorCode, st.statusCode);
     smtp.stop();
     ssl_client.stop();
     clearOperationDiagnostic();
+    stats.pushFailed++;
     return;
   }
 
-  SMTPMessage msg;
-  String from = "sms notify <"; from += config.smtpUser; from += ">";
+  // ReadyMail 异步发送模式 (await=false) 强制要求使用 smtp.getMessage() 内部消息对象，
+  // 否则 sendImpl() 会因 local_msg.headers.size() == 0 直接报错 -109 (SMTP_ERROR_UNINITIALIZE_LOCAL_SMTP_MESSAGE)
+  SMTPMessage &msg = smtp.getMessage();
+  msg.clear();
+
+  String from;
+  from.reserve(smtpUser.length() + 32);
+  from = "sms notify <"; from += smtpUser; from += ">";
   msg.headers.add(rfc822_from, from.c_str());
-  String to = "your_email <"; to += config.smtpSendTo; to += ">";
-  msg.headers.add(rfc822_to, to.c_str());
-  msg.headers.add(rfc822_subject, subject);
-  msg.text.body(body);
-  if (time(nullptr) < 100000) {
-    configTzTime("CST-8", "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
-    unsigned long syncStart = millis();
-    while (time(nullptr) < 100000 && millis() - syncStart < 10000) {
-      vTaskDelay(pdMS_TO_TICKS(100));
+
+  // 支持单个或多个收件人（逗号/分号分隔）
+  String recipients = smtpSendTo;
+  recipients.replace(";", ",");
+  int startIdx = 0;
+  while (startIdx < (int)recipients.length()) {
+    int commaIdx = recipients.indexOf(',', startIdx);
+    if (commaIdx < 0) commaIdx = recipients.length();
+    String rcpt = recipients.substring(startIdx, commaIdx);
+    rcpt.trim();
+    if (rcpt.length() > 0) {
+      String to;
+      to.reserve(rcpt.length() + 32);
+      to = "your_email <"; to += rcpt; to += ">";
+      msg.headers.add(rfc822_to, to.c_str());
     }
-    if (time(nullptr) < 100000) {
-      Serial.println("NTP同步超时，跳过本次邮件，避免邮件任务永久阻塞");
-      smtp.stop();
-      ssl_client.stop();
-      clearOperationDiagnostic();
-      return;
-    }
+    startIdx = commaIdx + 1;
   }
 
-  msg.timestamp = time(nullptr);
+  msg.headers.add(rfc822_subject, subject);
+  msg.text.body(body);
+
+  time_t now = time(nullptr);
+  msg.timestamp = (now >= 100000) ? (uint32_t)now : 0;
+
   recordOperationDiagnostic("smtp", "send");
   stageStart = millis();
   started = smtp.send(msg, "", false);
   if (started && waitForSmtpProgress("send", stageStart) && smtp.status().isComplete) {
     Serial.println("邮件发送完成");
+    stats.pushSuccess++;
   } else {
-    Serial.println("邮件发送失败");
+    SMTPStatus st = smtp.status();
+    Serial.printf("邮件发送失败 (error=%d, status=%d)\n", st.errorCode, st.statusCode);
+    stats.pushFailed++;
   }
 
+  msg.clear();
   smtp.stop();
   ssl_client.stop();
   clearOperationDiagnostic();

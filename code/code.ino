@@ -113,10 +113,12 @@ void setup() {
   
   // 初始化 NVS 互斥锁后再加载配置，避免后台推送任务与 Web 保存交叉访问 Preferences。
   initStatsLock();
+  // 初始化全局 TLS/SMTP 互斥锁，确保后台邮件任务与外部调用的独占并发安全 (C4)
+  initSmtpLock();
   // 加载配置
   loadConfig();
   configValid = isConfigValid();
-  Serial.printf("启动计数: %lu, 上次复位原因: %s (0x%02X)\n", stats.bootCount, lastResetReasonText.c_str(), (unsigned int)lastResetReasonCode);
+  Serial.printf("启动计数: %lu, 上次复位原因: %s (0x%02X)\n", (unsigned long)stats.bootCount.load(), lastResetReasonText.c_str(), (unsigned int)lastResetReasonCode);
   if (lastResetPowerSuspected) {
     Serial.println("提示: 上次复位属于供电/上电相关，优先排查电源、电缆和瞬时压降");
   }
@@ -139,6 +141,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   unsigned long wifiStart = millis();
   bool wifiConnected = false;
+  // 注释 (M1): 无符号整型 (unsigned long / uint32_t) 算术运算遵循模 2^32 减法回绕规则。
+  // 即便系统运行约 49.7 天发生 millis() 溢出回绕（从 0xFFFFFFFF 到 0），
+  // 表达式 (millis() - wifiStart) 的差值计算依然能够准确反映实际流逝的毫秒数，天然免疫溢出异常。
   while (millis() - wifiStart < 30000) {
     if (WiFiMulti.run() == WL_CONNECTED) {
       wifiConnected = true;
@@ -266,13 +271,13 @@ void setup() {
   
   // 发送启动通知
   if (configValid) {
-    String body = "设备已启动\n地址: " + getDeviceUrl() + "\n启动次数: " + String(stats.bootCount) + "\n上次复位原因: " + lastResetReasonText +
+    String body = "设备已启动\n地址: " + getDeviceUrl() + "\n启动次数: " + String((unsigned long)stats.bootCount.load()) + "\n上次复位原因: " + lastResetReasonText +
                   "\n供电相关嫌疑: " + String(lastResetPowerSuspected ? "是" : "否") +
-                  "\n欠压复位次数: " + String(stats.brownoutResets) +
-                  "\n上电复位次数: " + String(stats.powerOnResets) +
-                  "\n看门狗复位次数: " + String(stats.watchdogResets) +
-                  "\n软件重启次数: " + String(stats.softwareResets) +
-                  "\n异常崩溃次数: " + String(stats.panicResets);
+                  "\n欠压复位次数: " + String((unsigned long)stats.brownoutResets.load()) +
+                  "\n上电复位次数: " + String((unsigned long)stats.powerOnResets.load()) +
+                  "\n看门狗复位次数: " + String((unsigned long)stats.watchdogResets.load()) +
+                  "\n软件重启次数: " + String((unsigned long)stats.softwareResets.load()) +
+                  "\n异常崩溃次数: " + String((unsigned long)stats.panicResets.load());
     sendEmailNotification("短信转发器已启动", body.c_str());
   }
   
@@ -355,6 +360,7 @@ void loop() {
   server.handleClient();
   
   // 如果配置无效，每 30 秒打印一次提示
+  // 注释 (M1): 无符号整型差值 (millis() - lastPrintTime) 在 32 位溢出回绕时依然正确
   if (!configValid) {
     if (millis() - lastPrintTime >= 30000) {
       lastPrintTime = millis();
@@ -363,6 +369,7 @@ void loop() {
   }
   
   // 检查定时任务
+  // 注释 (M1): (millis() - lastTimerExec) 利用 unsigned long 回绕特性，49.7 天溢出后依然安全正确
   if (config.timerEnabled && timerIntervalSec > 0 && configValid) {
     unsigned long elapsedSec = (millis() - lastTimerExec) / 1000;
     if (elapsedSec >= timerIntervalSec) {
@@ -388,6 +395,7 @@ void loop() {
   if (config.mqttEnabled && WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       unsigned long now = millis();
+      // 注释 (M1): 无符号减法计算差值，即使 now 发生回绕也能得到正确流逝时间
       if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
         lastMqttReconnectAttempt = now;
         unsigned long mqttStepStart = millis();
@@ -398,6 +406,7 @@ void loop() {
     } else {
       unsigned long mqttStepStart = millis();
       static unsigned long lastMqttLoopSampleLog = 0;
+      // 注释 (M1): 同样满足无符号溢出安全
       bool logMqttLoopSample = (mqttStepStart - lastMqttLoopSampleLog >= 5000);
       if (logMqttLoopSample) {
         lastMqttLoopSampleLog = mqttStepStart;
@@ -410,6 +419,7 @@ void loop() {
       }
 
       unsigned long now = millis();
+      // 注释 (M1): 无符号周期比较，溢出回绕安全
       if (now - lastMqttStatusReport > MQTT_STATUS_INTERVAL) {
         lastMqttStatusReport = now;
         mqttStepStart = millis();

@@ -11,5 +11,6 @@ String getCurrentTimeString();
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
 void sendSMSToServer(const char* sender, const char* message, const char* timestamp);
 void sendEmailNotification(const char* subject, const char* body);
+void initSmtpLock();
 
 #endif // PUSH_SERVICE_H
