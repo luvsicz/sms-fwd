@@ -236,19 +236,34 @@ String assembleConcatSms(int slot) {
   int partsToAssemble = concatBuffer[slot].totalParts;
   if (partsToAssemble < 1) partsToAssemble = 1;
   if (partsToAssemble > MAX_CONCAT_PARTS) partsToAssemble = MAX_CONCAT_PARTS;
-  String result = "";
+
+  // 预估合并总长度并 reserve 减少内存碎片 (M5)
+  size_t totalLen = 0;
+  for (int i = 0; i < partsToAssemble; i++) {
+    if (concatBuffer[slot].parts[i].valid) {
+      totalLen += concatBuffer[slot].parts[i].text.length();
+    } else {
+      totalLen += 20; // 缺失分段占位符
+    }
+  }
+
+  String result;
+  result.reserve(totalLen + 16);
   for (int i = 0; i < partsToAssemble; i++) {
     if (concatBuffer[slot].parts[i].valid) {
       result += concatBuffer[slot].parts[i].text;
     } else {
-      result += "[缺失分段" + String(i + 1) + "]";
+      result += "[缺失分段";
+      result += String(i + 1);
+      result += "]";
     }
   }
   return result;
 }
 
-// 清空长短信槽位
+// 清空长短信槽位（增加边界安全检查）
 void clearConcatSlot(int slot) {
+  if (slot < 0 || slot >= MAX_CONCAT_MESSAGES) return;
   concatBuffer[slot].inUse = false;
   concatBuffer[slot].receivedParts = 0;
   concatBuffer[slot].sender = "";
@@ -264,6 +279,7 @@ void checkConcatTimeout() {
   unsigned long now = millis();
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (concatBuffer[i].inUse) {
+      // 注释 (M1): 无符号整型差值 (now - firstPartTime) 在 32 位溢出回绕时依然正确
       if (now - concatBuffer[i].firstPartTime >= CONCAT_TIMEOUT_MS) {
         Serial.println("长短信超时，强制转发不完整消息");
         Serial.printf("  参考号: %d, 已收到: %d/%d\n", 
@@ -420,10 +436,9 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
 }
 
 
-// 读取串口一行（含回车换行），返回行字符串，无新行时返回空
-String readSerialLine(HardwareSerial& port) {
-  static char lineBuf[SERIAL_BUFFER_SIZE];
-  static int linePos = 0;
+// 读取串口一行（使用调用方提供的独立缓冲区和位置指针，彻底消除 static 缓冲区并发竞争）(H4)
+String readSerialLine(HardwareSerial& port, char* lineBuf, size_t bufSize, int& linePos) {
+  if (lineBuf == nullptr || bufSize == 0) return "";
 
   while (port.available()) {
     char c = port.read();
@@ -433,11 +448,55 @@ String readSerialLine(HardwareSerial& port) {
       linePos = 0;
       return res;
     } else if (c != '\r') {  // 跳过 \r
-      if (linePos < SERIAL_BUFFER_SIZE - 1)
+      if (linePos < (int)bufSize - 1)
         lineBuf[linePos++] = c;
       else
         linePos = 0;  // 超长报错保护，重头计
     }
+  }
+  return "";
+}
+
+// 兼容单参版本：使用 FreeRTOS 互斥锁保护内部静态缓冲区，并在锁外构造 String，避免关中断与锁内 malloc (H4)
+String readSerialLine(HardwareSerial& port) {
+  static char fallbackBuf[SERIAL_BUFFER_SIZE];
+  static int fallbackPos = 0;
+  static SemaphoreHandle_t lineMutex = nullptr;
+
+  if (lineMutex == nullptr) {
+    lineMutex = xSemaphoreCreateMutex();
+    if (lineMutex == nullptr) {
+      return "";
+    }
+  }
+
+  char localBuf[SERIAL_BUFFER_SIZE];
+  bool hasLine = false;
+
+  if (xSemaphoreTake(lineMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    while (port.available()) {
+      char c = port.read();
+      if (c == '\n') {
+        fallbackBuf[fallbackPos] = '\0';
+        size_t copyLen = (fallbackPos < (int)sizeof(localBuf) - 1) ? fallbackPos : (sizeof(localBuf) - 1);
+        memcpy(localBuf, fallbackBuf, copyLen);
+        localBuf[copyLen] = '\0';
+        fallbackPos = 0;
+        hasLine = true;
+        break;
+      } else if (c != '\r') {
+        if (fallbackPos < (int)sizeof(fallbackBuf) - 1) {
+          fallbackBuf[fallbackPos++] = c;
+        } else {
+          fallbackPos = 0;  // 超长保护，重头计
+        }
+      }
+    }
+    xSemaphoreGive(lineMutex);
+  }
+
+  if (hasLine) {
+    return String(localBuf);
   }
   return "";
 }
@@ -947,7 +1006,11 @@ void checkSerial1URC() {
   static enum { IDLE,
                 WAIT_PDU } state = IDLE;
 
-  String line = readSerialLine(Serial1);
+  // 专属缓冲区，与其它串口调用上下文彻底隔离 (H4)
+  static char serial1LineBuf[SERIAL_BUFFER_SIZE];
+  static int serial1LinePos = 0;
+
+  String line = readSerialLine(Serial1, serial1LineBuf, sizeof(serial1LineBuf), serial1LinePos);
   if (line.length() == 0) return;
 
   // 打印到调试串口

@@ -2,6 +2,8 @@
 #define SMS_HANDLER_H
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "config.h"
 
 // 前向声明 (PDU 类型在 code.ino 中通过 pdulib.h 定义)
@@ -35,6 +37,7 @@ bool sendSMS(const char* phoneNumber, const char* message);
 void processSmsContent(const char* sender, const char* text, const char* timestamp);
 void checkSerial1URC();
 String readSerialLine(HardwareSerial& port);
+String readSerialLine(HardwareSerial& port, char* lineBuf, size_t bufSize, int& linePos);
 bool isHexString(const String& str);
 bool isPduLikelyStorableSms(const String& sender,
                             const String& timestamp,
