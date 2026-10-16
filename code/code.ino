@@ -291,21 +291,24 @@ void setup() {
   }
   
   // 启用看门狗 (30秒超时)
-  // 适配 ESP32 Arduino Core v3.0+；避免重复初始化 TWDT
+  // 适配 ESP32 Arduino Core v3.0+；core 启动时已初始化 TWDT（默认 5 秒），
+  // 必须用 esp_task_wdt_reconfigure 覆盖为 30 秒，否则主循环中的 AT 命令可能触发默认超时。
   esp_task_wdt_config_t wdt_config = {
       .timeout_ms = 30000,
       .idle_core_mask = (1 << 0), // ESP32-C3 是单核，使用 core 0
       .trigger_panic = true
   };
-  esp_err_t wdtStatus = esp_task_wdt_status(NULL);
-  if (wdtStatus == ESP_ERR_INVALID_STATE) {
-    esp_err_t initResult = esp_task_wdt_init(&wdt_config);
-    if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE) {
-      Serial.printf("看门狗初始化失败: %d\n", initResult);
+  esp_err_t wdtResult = esp_task_wdt_reconfigure(&wdt_config);
+  if (wdtResult != ESP_OK) {
+    // 如果 reconfigure 不可用（旧 IDF），回退到 deinit + init
+    esp_task_wdt_deinit();
+    wdtResult = esp_task_wdt_init(&wdt_config);
+    if (wdtResult != ESP_OK && wdtResult != ESP_ERR_INVALID_STATE) {
+      Serial.printf("看门狗初始化失败: %d\n", wdtResult);
     }
   }
 
-  wdtStatus = esp_task_wdt_status(NULL);
+  esp_err_t wdtStatus = esp_task_wdt_status(NULL);
   if (wdtStatus == ESP_ERR_NOT_FOUND) {
     esp_err_t addResult = esp_task_wdt_add(NULL);
     if (addResult != ESP_OK) {
@@ -429,6 +432,7 @@ void loop() {
       }
 
       processMqttLogQueue();
+      processMqttPendingCommands();  // P1: 执行 MQTT callback 中暂存的阻塞命令
     }
   }
   

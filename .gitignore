@@ -2,6 +2,8 @@
 code/call_forward_private.h
 
 # IDE 文件
+.idea/
+*.iml
 .vscode/
 *.code-workspace
 

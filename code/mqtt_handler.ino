@@ -9,6 +9,7 @@
 #include <PubSubClient.h>
 #include <esp_task_wdt.h>
 #include "push_service.h"
+#include "web_handlers.h"
 
 static bool publishMqttPayload(const char* topic, const char* payload, bool retained = false) {
   bool published = mqttClient.publish(topic, payload, retained);
@@ -487,6 +488,18 @@ void mqttReconnect() {
   logMqttElapsed("MQTT重连", reconnectStart);
 }
 
+// P1: MQTT 命令异步执行 —— callback 仅入队/设标志，loop 中执行阻塞操作
+struct MqttPendingSms {
+  String phone;
+  String message;
+};
+static const uint8_t MAX_PENDING_SMS = 4;
+static MqttPendingSms pendingSmsQueue[MAX_PENDING_SMS];
+static uint8_t pendingSmsCount = 0;
+
+static bool mqttPendingPing = false;
+static String mqttPendingPingHost;
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String message = "";
   for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
@@ -516,16 +529,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       if (msgRaw.startsWith("\"")) msgRaw = msgRaw.substring(1);
       if (msgRaw.endsWith("\"")) msgRaw = msgRaw.substring(0, msgRaw.length() - 1);
       
-      Serial.println("MQTT发送短信命令:");
+      Serial.println("MQTT发送短信命令(异步):");
       Serial.println("  目标: " + phoneRaw);
       Serial.println("  内容: " + msgRaw);
       
-      bool success = sendSMS(phoneRaw.c_str(), msgRaw.c_str());
-      if (success) {
-        stats.smsSent++;
-        saveStats();
+      // P1: 入队暂存，不在 callback 中执行阻塞 AT 命令
+      if (pendingSmsCount < MAX_PENDING_SMS) {
+        pendingSmsQueue[pendingSmsCount].phone = phoneRaw;
+        pendingSmsQueue[pendingSmsCount].message = msgRaw;
+        pendingSmsCount++;
+      } else {
+        Serial.println("MQTT待发送短信队列已满，丢弃命令");
+        publishMqttSmsSent(phoneRaw.c_str(), msgRaw.c_str(), false);
       }
-      publishMqttSmsSent(phoneRaw.c_str(), msgRaw.c_str(), success);
     } else {
       Serial.println("短信命令格式错误");
       publishMqttSmsSent("", "", false);
@@ -546,7 +562,71 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
     }
     
-    Serial.println("MQTT Ping命令: " + host);
+    Serial.println("MQTT Ping命令(异步): " + host);
+    // P1: 仅保存参数，不在 callback 中阻塞 50 秒
+    if (!mqttPendingPing) {
+      mqttPendingPingHost = host;
+      mqttPendingPing = true;
+    } else {
+      Serial.println("已有待执行Ping，忽略新请求: " + host);
+    }
+  } else if (String(topic) == mqttTopicCmd) {
+    int actionStart = message.indexOf("\"action\"");
+    if (actionStart >= 0) {
+      int actionValStart = message.indexOf(":", actionStart) + 1;
+      int actionValEnd = message.indexOf("\"", actionValStart + 2);
+      String actionRaw = message.substring(actionValStart, actionValEnd + 1);
+      actionRaw.trim();
+      if (actionRaw.startsWith("\"")) actionRaw = actionRaw.substring(1);
+      if (actionRaw.endsWith("\"")) actionRaw = actionRaw.substring(0, actionRaw.length() - 1);
+
+      Serial.println("MQTT控制命令: " + actionRaw);
+
+      if (actionRaw == "restart" || actionRaw == "reset") {
+        Serial.println("执行重启命令...");
+        publishMqttStatus("restarting");
+        delay(500);
+        ESP.restart();
+      } else if (actionRaw == "status") {
+        String statusJson = buildMqttStatusJson("online");
+        publishMqttPayload(mqttTopicStatus.c_str(), statusJson.c_str(), true);
+        if (config.mqttHaDiscovery) {
+          publishMqttPayload(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
+        }
+        Serial.println("已发送状态信息");
+      } else {
+        Serial.println("未知命令: " + actionRaw);
+      }
+    }
+  }
+}
+
+// P1: 在 loop 中调用，执行 MQTT callback 中暂存的阻塞命令
+void processMqttPendingCommands() {
+  // 处理待执行的短信发送（单次循环消费一条，避免连续阻塞）
+  if (pendingSmsCount > 0) {
+    String phone = pendingSmsQueue[0].phone;
+    String msg = pendingSmsQueue[0].message;
+    for (uint8_t i = 1; i < pendingSmsCount; i++) {
+      pendingSmsQueue[i - 1] = pendingSmsQueue[i];
+    }
+    pendingSmsCount--;
+
+    bool success = sendSMS(phone.c_str(), msg.c_str());
+    if (success) {
+      stats.smsSent++;
+      saveStats();
+    }
+    publishMqttSmsSent(phone.c_str(), msg.c_str(), success);
+  }
+
+  // 处理待执行的 Ping
+  if (mqttPendingPing) {
+    mqttPendingPing = false;
+    String host = mqttPendingPingHost;
+    mqttPendingPingHost = "";
+
+    Serial.println("执行MQTT Ping: " + host);
     sendATCommand("AT+CGACT=1,1", 10000);
     delay(500);
     
@@ -597,6 +677,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       }
       if (gotResult) break;
       esp_task_wdt_reset();
+      mqttClient.loop();
+      server.handleClient();
       yield();
       delay(10);
     }
@@ -604,34 +686,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     sendATCommand("AT+CGACT=0,1", 5000);
     if (!gotResult) resultMsg = "超时";
     publishMqttPingResult(host.c_str(), pingSuccess, resultMsg.c_str());
-  } else if (String(topic) == mqttTopicCmd) {
-    int actionStart = message.indexOf("\"action\"");
-    if (actionStart >= 0) {
-      int actionValStart = message.indexOf(":", actionStart) + 1;
-      int actionValEnd = message.indexOf("\"", actionValStart + 2);
-      String actionRaw = message.substring(actionValStart, actionValEnd + 1);
-      actionRaw.trim();
-      if (actionRaw.startsWith("\"")) actionRaw = actionRaw.substring(1);
-      if (actionRaw.endsWith("\"")) actionRaw = actionRaw.substring(0, actionRaw.length() - 1);
-      
-      Serial.println("MQTT控制命令: " + actionRaw);
-      
-      if (actionRaw == "restart" || actionRaw == "reset") {
-        Serial.println("执行重启命令...");
-        publishMqttStatus("restarting");
-        delay(500);
-        ESP.restart();
-      } else if (actionRaw == "status") {
-        String statusJson = buildMqttStatusJson("online");
-        publishMqttPayload(mqttTopicStatus.c_str(), statusJson.c_str(), true);
-        if (config.mqttHaDiscovery) {
-          publishMqttPayload(mqttHaStatusTopic.c_str(), statusJson.c_str(), true);
-        }
-        Serial.println("已发送状态信息");
-      } else {
-        Serial.println("未知命令: " + actionRaw);
-      }
-    }
   }
 }
 

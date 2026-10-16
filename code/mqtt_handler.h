@@ -72,6 +72,7 @@ void publishDeviceLog(const char* level, const char* module, const char* message
 void publishTimingLog(const char* module, const char* step, unsigned long elapsedMs, bool success);
 void publishErrorLog(const char* module, const char* step, const char* message, const char* error, unsigned long elapsedMs = 0);
 void processMqttLogQueue();
+void processMqttPendingCommands();  // P1: 在 loop 中调用，异步处理 MQTT 命令
 
 // Home Assistant 自动发现
 void publishHaDiscoveryConfig();     // 发布 HA 自动发现配置

@@ -49,15 +49,15 @@ struct SmtpLockGuard {
 // HTTP 推送必须短超时，避免单个通道阻塞 loopTask 触发看门狗
 static const uint16_t HTTP_PUSH_TIMEOUT_MS = 1000;
 static const uint8_t HTTP_PUSH_QUEUE_LENGTH = MAX_PUSH_CHANNELS * 2;
-static const uint32_t HTTP_PUSH_TASK_STACK_SIZE = 6144;
-static const uint8_t HTTP_PUSH_WORKER_COUNT = MAX_PUSH_CHANNELS;
+static const uint32_t HTTP_PUSH_TASK_STACK_SIZE = 16384;  // HTTPS TLS 握手需 10-16KB 栈
+static const uint8_t HTTP_PUSH_WORKER_COUNT = 1;          // 单 Worker 串行消费，节约栈空间并消除多通道并发 TLS 内存暴击 (OOM)
 static const uint8_t EMAIL_QUEUE_LENGTH = 4;
-static const uint32_t EMAIL_TASK_STACK_SIZE = 8192;
+static const uint32_t EMAIL_TASK_STACK_SIZE = 16384;     // SMTP TLS 握手需 10-16KB 栈
 static const uint32_t SMTP_STAGE_TIMEOUT_MS = 20000;
 static const TickType_t SMTP_PROGRESS_DELAY_TICKS = pdMS_TO_TICKS(10);
 
 struct HttpPushJob {
-  PushChannel channel;
+  PushChannel channel;  // 通道快照，确保任务出队时配置一致并避免跨线程读写竞争
   String sender;
   String message;
   String timestamp;
@@ -259,6 +259,7 @@ static bool enqueueEmail(const char* subject, const char* body) {
 // URL 编码辅助函数
 String urlEncode(const String& str) {
   String encoded = "";
+  encoded.reserve(str.length() * 3);  // P2: 预分配最坏情况空间，避免逐字符扩容
   for (unsigned int i = 0; i < str.length(); i++) {
     uint8_t c = (uint8_t)str.charAt(i);
     if (c == ' ') {
@@ -280,6 +281,7 @@ String urlEncode(const String& str) {
 // JSON 转义函数
 String jsonEscape(const String& str) {
   String result = "";
+  result.reserve(str.length() + str.length() / 4 + 8);  // P2: 预分配空间，减少堆碎片
   for (unsigned int i = 0; i < str.length(); i++) {
     uint8_t c = (uint8_t)str.charAt(i);
     if (c == '"') result += "\\\"";
@@ -303,6 +305,7 @@ String jsonEscape(const String& str) {
 // Telegram Markdown 转义函数
 String telegramEscape(const String& str) {
   String result = "";
+  result.reserve(str.length() * 2);  // P2: 预分配空间
   for (unsigned int i = 0; i < str.length(); i++) {
     char c = str.charAt(i);
     // 转义 Markdown 特殊字符: _ * [ ] ( ) ~ ` > # + - = | { } . !
