@@ -1,6 +1,7 @@
 /*
  * web_handlers.ino - Web 服务器处理函数实现
  */
+#include "web_stream.h"
 
 // 检查 HTTP Basic 认证
 bool checkAuth() {
@@ -108,160 +109,63 @@ void blink_short(unsigned long gap_time) {
   delay(gap_time);
 }
 
-// 处理配置页面请求
+// WebServer::sendContent 返回 void，无法检查短写。这里使用相同的 chunk
+// 格式，但用栈上的长度头并检查每次写入；HTTP/1.0 使用连接关闭定界。
+static bool sendWebChunk(const char* data, size_t length) {
+  if (!length) return true;
+  esp_task_wdt_reset();
+  yield();
+  auto& client = server.client();
+  if (!client.connected()) return false;
+  bool chunked = server.version() != "HTTP/1.0";
+  if (chunked) {
+    char header[16];
+    int headerLength = snprintf(header, sizeof(header), "%x\r\n", (unsigned int)length);
+    if (client.write((const uint8_t*)header, headerLength) != (size_t)headerLength) {
+      client.stop();
+      return false;
+    }
+  }
+  if (client.write((const uint8_t*)data, length) != length ||
+      (chunked && client.write((const uint8_t*)"\r\n", 2) != 2)) {
+    client.stop();
+    return false;
+  }
+  esp_task_wdt_reset();
+  yield();
+  return true;
+}
+
+// 处理配置页面请求 —— chunked streaming 版，峰值内存大幅降低
 void handleRoot() {
   if (!checkAuth()) return;
-  
-  const size_t htmlTemplateLength = strlen(htmlPage);
-  const size_t htmlReserveLength = htmlTemplateLength + strlen(commonCss) + 8192;
-  if (ESP.getFreeHeap() < htmlReserveLength + 4096) {
-    Serial.printf("首页响应内存不足，free=%u need=%u\n", ESP.getFreeHeap(), htmlReserveLength + 4096);
+
+  // 给网络栈保留余量；同时检查碎片化后最大的连续空闲块。
+  if (ESP.getFreeHeap() < 16384 || ESP.getMaxAllocHeap() < 4096) {
+    Serial.printf("首页响应内存不足，free=%u max=%u min=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
     return;
   }
-  String html;
-  if (!html.reserve(htmlReserveLength)) {
-    Serial.println("首页响应 String.reserve 失败");
-    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
-    return;
-  }
-  html = htmlPage;
-  if (html.length() != htmlTemplateLength) {
-    Serial.printf("首页模板分配失败，actual=%u expected=%u\n", html.length(), htmlTemplateLength);
-    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：设备内存不足，请稍后重试");
-    return;
-  }
-  html.replace("%COMMON_CSS%", commonCss);
-  // html.replace("%COMMON_JS%", commonJs); // JS 已合并
+
+  // 只保留短小的运行状态字符串；配置值直接引用，不复制长列表/模板。
   wifi_mode_t wifiMode = WiFi.getMode();
   bool apActive = (wifiMode & WIFI_AP) != 0;
   bool staConnected = WiFi.status() == WL_CONNECTED;
   String displayIp = apActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   String wifiModeBadge = apActive ? "<span class=\"badge b-warn\">AP模式</span>" : "<span class=\"badge b-ok\">STA模式</span>";
   String wifiInfoLine = "";
-
   if (apActive) {
     wifiInfoLine = "热点名: SMS-Forwarder-AP<br>热点IP: " + WiFi.softAPIP().toString();
-    if (staConnected) {
-      wifiInfoLine += "<br>上游WiFi: " + WiFi.SSID();
-    }
+    if (staConnected) { wifiInfoLine += "<br>上游WiFi: " + WiFi.SSID(); }
   } else if (staConnected) {
     wifiInfoLine = "已连接WiFi: " + WiFi.SSID() + "<br>设备IP: " + WiFi.localIP().toString();
   } else {
     wifiInfoLine = "WiFi未连接";
   }
 
-  html.replace("%IP%", displayIp);
-  html.replace("%WIFI_MODE_BADGE%", wifiModeBadge);
-  html.replace("%WIFI_INFO_LINE%", wifiInfoLine);
-
-  // 1. MQTT 状态 (概览页用)
   String mqttStatusText = config.mqttEnabled ? (mqttClient.connected() ? "已连接" : "未连接") : "未启用";
-  String mqttClass = config.mqttEnabled ? (mqttClient.connected() ? "b-ok" : "b-err") : "b-wait";
-  html.replace("%MQTT_STATUS%", mqttStatusText);
-  html.replace("%MQTT_CLASS%", mqttClass);
-  html.replace("%MQTT_PREFIX%", config.mqttPrefix);
-  html.replace("%MQTT_ENABLED%", config.mqttEnabled ? "true" : "false");
-  
-  // MQTT 主题列表
-  String mqttTopicsHtml = "";
-  if (config.mqttEnabled && config.mqttServer.length() > 0) {
-    mqttTopicsHtml = mqttTopicStatus + "<br>" + mqttTopicSmsReceived + "<br>" + mqttTopicCallReceived;
-  } else {
-    mqttTopicsHtml = "未配置";
-  }
-  html.replace("%MQTT_TOPICS%", mqttTopicsHtml);
-  
-  // 1.5 WiFi 网络配置 HTML
-  String wifiHtml = "";
-  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    String idx = String(i);
-    String enabledSw = config.wifiNetworks[i].enabled ? "on" : "";
-    String enabledVal = config.wifiNetworks[i].enabled ? "true" : "false";
-    String currentSsid = WiFi.SSID();
-    bool isCurrent = config.wifiNetworks[i].ssid.length() > 0 && config.wifiNetworks[i].ssid == currentSsid;
-    
-    wifiHtml += "<div style=\"padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:8px;border:1px solid " + String(isCurrent ? "var(--success)" : "#e2e8f0") + "\">";
-    wifiHtml += "<div class=\"sw-row\" onclick=\"wfTog(" + idx + ")\">";
-    wifiHtml += "<span style=\"font-weight:600\">网络 " + String(i + 1);
-    if (isCurrent) wifiHtml += " <span class=\"badge b-ok\">当前</span>";
-    wifiHtml += "</span>";
-    wifiHtml += "<div id=\"wfs" + idx + "\" class=\"sw " + enabledSw + "\"></div>";
-    wifiHtml += "<input type=\"hidden\" id=\"wfe" + idx + "\" name=\"wifi" + idx + "en\" value=\"" + enabledVal + "\">";
-    wifiHtml += "</div>";
-    wifiHtml += "<div class=\"grid-2\" style=\"margin-top:8px\">";
-    wifiHtml += "<div class=\"fg\" style=\"margin-bottom:0\"><label>SSID</label><input name=\"wifi" + idx + "ssid\" value=\"" + config.wifiNetworks[i].ssid + "\" placeholder=\"WiFi名称\"></div>";
-    // 密码不回显明文，使用占位符提示
-    String passPlaceholder = config.wifiNetworks[i].password.length() > 0 ? "（已保存，留空则保留）" : "WiFi密码";
-    wifiHtml += "<div class=\"fg\" style=\"margin-bottom:0\"><label>密码</label><input name=\"wifi" + idx + "pass\" type=\"password\" placeholder=\"" + passPlaceholder + "\"></div>";
-    wifiHtml += "</div></div>";
-  }
-  html.replace("%WIFI_NETWORKS%", wifiHtml);
 
-  // 2. 基础配置填写
-  html.replace("%WEB_USER%", config.webUser);
-  html.replace("%WEB_PASS%", config.webPass);
-
-  // 3. SMTP 配置
-  html.replace("%SMTP_EN_VAL%", config.emailEnabled ? "true" : "false");
-  html.replace("%SMTP_EN_SW%", config.emailEnabled ? "on" : "");
-  html.replace("%SMTP_DISP%", config.emailEnabled ? "block" : "none");
-  html.replace("%SMTP_SERVER%", config.smtpServer);
-  html.replace("%SMTP_PORT%", String(config.smtpPort));
-  html.replace("%SMTP_USER%", config.smtpUser);
-  html.replace("%SMTP_PASS%", config.smtpPass);
-  html.replace("%SMTP_SEND_TO%", config.smtpSendTo);
-
-  // 4. MQTT 配置
-  html.replace("%MQTT_EN_VAL%", config.mqttEnabled ? "true" : "false");
-  html.replace("%MQTT_EN_SW%", config.mqttEnabled ? "on" : "");
-  html.replace("%MQTT_DISP%", config.mqttEnabled ? "block" : "none");
-  html.replace("%MQTT_SERVER%", config.mqttServer);
-  html.replace("%MQTT_PORT%", String(config.mqttPort));
-  html.replace("%MQTT_USER%", config.mqttUser);
-  html.replace("%MQTT_PASS%", config.mqttPass);
-  
-  html.replace("%MQTT_CO_VAL%", config.mqttControlOnly ? "true" : "false");
-  html.replace("%MQTT_CO_SW%", config.mqttControlOnly ? "on" : "");
-  
-  // 4.5 Home Assistant 自动发现配置
-  html.replace("%MQTT_HA_VAL%", config.mqttHaDiscovery ? "true" : "false");
-  html.replace("%MQTT_HA_SW%", config.mqttHaDiscovery ? "on" : "");
-  html.replace("%MQTT_HA_DISP%", config.mqttHaDiscovery ? "block" : "none");
-  html.replace("%MQTT_HA_PREFIX%", config.mqttHaPrefix.length() > 0 ? config.mqttHaPrefix : "homeassistant");
-  
-  // 5. 黑白名单配置 (Js 对象初始化)
-  html.replace("%FILTER_EN_VAL%", config.filterEnabled ? "true" : "false");
-  html.replace("%FILTER_EN_BOOL%", config.filterEnabled ? "true" : "false"); // JS bool
-  html.replace("%FILTER_WL_BOOL%", config.filterIsWhitelist ? "true" : "false"); // JS bool
-  html.replace("%FILTER_WL_VAL%", config.filterIsWhitelist ? "true" : "false"); // hidden input value
-  
-  // 处理 filterList 换行符，避免破坏 JS 字符串
-  String safeFilterList = config.filterList;
-  safeFilterList.replace("\n", "");
-  safeFilterList.replace("\r", "");
-  html.replace("%FILTER_LIST%", safeFilterList);
-
-  // 5.5 内容关键词过滤配置
-  html.replace("%CF_EN_VAL%", config.contentFilterEnabled ? "true" : "false");
-  html.replace("%CF_EN_BOOL%", config.contentFilterEnabled ? "true" : "false");
-  html.replace("%CF_WL_BOOL%", config.contentFilterIsWhitelist ? "true" : "false");
-  html.replace("%CF_WL_VAL%", config.contentFilterIsWhitelist ? "true" : "false");
-  
-  String safeCfList = config.contentFilterList;
-  safeCfList.replace("\n", "");
-  safeCfList.replace("\r", "");
-  html.replace("%CF_LIST%", safeCfList);
-
-  // 6. 定时任务配置 (Js 对象初始化)
-  html.replace("%TIMER_EN_VAL%", config.timerEnabled ? "true" : "false");
-  html.replace("%TIMER_EN_BOOL%", config.timerEnabled ? "true" : "false"); // JS bool
-  html.replace("%TIMER_TP%", String(config.timerType));
-  html.replace("%TIMER_INT%", String(config.timerInterval));
-  html.replace("%TIMER_PH%", config.timerPhone);
-  html.replace("%TIMER_MS%", config.timerMessage);
-
-  // 计算剩余时间
   unsigned long remainSec = 0;
   if (config.timerEnabled && timerIntervalSec > 0) {
     unsigned long elapsedSec = (millis() - lastTimerExec) / 1000;
@@ -269,74 +173,180 @@ void handleRoot() {
       remainSec = timerIntervalSec - elapsedSec;
     }
   }
-  html.replace("%TIMER_RM%", String(remainSec));
 
-  // 7. 生成推送通道 HTML
-  String channelsHtml = "";
-  for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    String idx = String(i);
-    String enabledSw = config.pushChannels[i].enabled ? "on" : "";
-    String enabledVal = config.pushChannels[i].enabled ? "true" : "false";
-    
-    // 动态生成折叠卡片（虽然放在 details 下，但每个通道本身也是个小块）
-    // 为了美观，这里每个通道用一个带开关的面板
-    channelsHtml += "<div class=\"card\" style=\"border:1px solid #e2e8f0;padding:12px;margin-bottom:8px;box-shadow:none\">";
-    
-    // 头部开关行
-    channelsHtml += "<div class=\"sw-row\" onclick=\"chTog(" + idx + ")\">";
-    channelsHtml += "<span style=\"font-weight:600\">通道 " + String(i + 1) + "</span>";
-    channelsHtml += "<div id=\"chs" + idx + "\" class=\"sw " + enabledSw + "\"></div>";
-    channelsHtml += "<input type=\"hidden\" id=\"che" + idx + "\" name=\"push" + idx + "en\" value=\"" + enabledVal + "\">";
-    channelsHtml += "</div>";
+  // ---- 定位 htmlPage 中的 3 个大占位符，将模板拆成 4 段 ----
+  // 顺序: ... %COMMON_CSS% ... %WIFI_NETWORKS% ... %PUSH_CHANNELS% ...
+  const char* pCSS = strstr(htmlPage, "%COMMON_CSS%");
+  const char* pWIFI = strstr(htmlPage, "%WIFI_NETWORKS%");
+  const char* pPUSH = strstr(htmlPage, "%PUSH_CHANNELS%");
 
-    // 详情区域 (点击名称展开/点击折叠按钮? 简化处理，直接显示)
-    // 这里使用一个简单的折叠按钮
-    channelsHtml += "<div style=\"font-size:0.85em;color:var(--primary);text-align:right;cursor:pointer\" onclick=\"fd(" + idx + ")\">展开/收起 <span id=\"chi" + idx + "\" style=\"display:inline-block;transition:.2s\">></span></div>";
-    
-    channelsHtml += "<div id=\"chb" + idx + "\" style=\"display:none;margin-top:12px;border-top:1px solid #f1f5f9;padding-top:12px\">";
-    
-    channelsHtml += "<div class=\"fg\"><label>名称</label><input name=\"push" + idx + "name\" value=\"" + config.pushChannels[i].name + "\"></div>";
-    
-    channelsHtml += "<div class=\"fg\"><label>类型</label>";
-    channelsHtml += "<select name=\"push" + idx + "type\" id=\"tp" + idx + "\" onchange=\"upd(" + idx + ")\">";
-    channelsHtml += "<option value=\"1\"" + String(config.pushChannels[i].type == PUSH_TYPE_POST_JSON ? " selected" : "") + ">POST JSON</option>";
-    channelsHtml += "<option value=\"2\"" + String(config.pushChannels[i].type == PUSH_TYPE_BARK ? " selected" : "") + ">Bark</option>";
-    channelsHtml += "<option value=\"3\"" + String(config.pushChannels[i].type == PUSH_TYPE_GET ? " selected" : "") + ">GET请求</option>";
-    channelsHtml += "<option value=\"4\"" + String(config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? " selected" : "") + ">自定义模板</option>";
-    channelsHtml += "<option value=\"5\"" + String(config.pushChannels[i].type == PUSH_TYPE_TELEGRAM ? " selected" : "") + ">Telegram Bot</option>";
-    channelsHtml += "<option value=\"6\"" + String(config.pushChannels[i].type == PUSH_TYPE_WECOM ? " selected" : "") + ">企业微信</option>";
-    channelsHtml += "<option value=\"7\"" + String(config.pushChannels[i].type == PUSH_TYPE_DINGTALK ? " selected" : "") + ">钉钉</option>";
-    channelsHtml += "</select></div>";
-    
-    channelsHtml += "<div class=\"fg\"><label>URL</label><input name=\"push" + idx + "url\" value=\"" + config.pushChannels[i].url + "\" placeholder=\"https://...\"></div>";
-    
-    // Key1 输入框 (Telegram=Chat ID, 钉钉=加签密钥)
-    bool showK1 = (config.pushChannels[i].type == PUSH_TYPE_TELEGRAM || config.pushChannels[i].type == PUSH_TYPE_DINGTALK);
-    String k1Label = (config.pushChannels[i].type == PUSH_TYPE_TELEGRAM) ? "Chat ID" : "加签密钥 (可选)";
-    String k1Hint = (config.pushChannels[i].type == PUSH_TYPE_TELEGRAM) ? "如 123456789" : "SEC开头的密钥";
-    channelsHtml += "<div id=\"k1" + idx + "\" style=\"display:" + (showK1 ? "block" : "none") + "\"><div class=\"fg\"><label id=\"k1l" + idx + "\">" + k1Label + "</label><input name=\"push" + idx + "k1\" value=\"" + config.pushChannels[i].key1 + "\" placeholder=\"" + k1Hint + "\"></div></div>";
-
-    // Key2 输入框 (Bark=group)
-    bool showK2 = (config.pushChannels[i].type == PUSH_TYPE_BARK);
-    channelsHtml += "<div id=\"k2" + idx + "\" style=\"display:" + (showK2 ? "block" : "none") + "\"><div class=\"fg\"><label>Bark 分组 group (可选)</label><input name=\"push" + idx + "k2\" value=\"" + config.pushChannels[i].key2 + "\" placeholder=\"如 家庭短信 / 验证码\"></div></div>";
-
-    // 自定义模板 Body (显示条件: type == 4)
-    channelsHtml += "<div id=\"cf" + idx + "\" style=\"display:" + (config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? "block" : "none") + "\"><div class=\"fg\"><label>Body模板</label><textarea name=\"push" + idx + "body\" rows=\"3\">" + config.pushChannels[i].customBody + "</textarea></div></div>";
-    
-    channelsHtml += "</div></div>";
-  }
-  html.replace("%PUSH_CHANNELS%", channelsHtml);
-
-  // replace/拼接在低堆或碎片化时可能静默失败，禁止把 200 + 空响应发给客户端。
-  if (!html || html.length() == 0) {
-    Serial.printf("首页响应生成失败，free=%u\n", ESP.getFreeHeap());
-    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：响应生成失败，请稍后重试");
+  const char* pTOPICS = strstr(htmlPage, "%MQTT_TOPICS%");
+  if (!pCSS || !pWIFI || !pPUSH || !pTOPICS ||
+      !(pCSS < pTOPICS && pTOPICS < pWIFI && pWIFI < pPUSH) ||
+      strstr(pCSS + 1, "%COMMON_CSS%") || strstr(pWIFI + 1, "%WIFI_NETWORKS%") ||
+      strstr(pPUSH + 1, "%PUSH_CHANNELS%") || strstr(pTOPICS + 1, "%MQTT_TOPICS%")) {
+    Serial.println("handleRoot: 模板占位符定位失败");
+    server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：模板错误");
     return;
   }
-  esp_task_wdt_reset();
-  yield();
 
-  server.send(200, "text/html; charset=utf-8", html);
+  // 开始 chunked transfer
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html; charset=utf-8", "");
+  WebStream out(sendWebChunk);
+
+  if (!out.write(htmlPage, pCSS - htmlPage) || !out.text(commonCss)) return;
+
+  // ==== 段2: %COMMON_CSS% 之后 → %WIFI_NETWORKS% 之前 ====
+  // 跳过 "%COMMON_CSS%" 占位符本身 (12 字符)
+  {
+    const char* seg2Start = pCSS + strlen("%COMMON_CSS%");
+    // 本段包含的占位符: 概览页+控制页+配置页(WiFi之前)的所有占位符
+    const WebTemplateValue pairs[] = {
+      {"%IP%", displayIp.c_str()},
+      {"%WIFI_MODE_BADGE%", wifiModeBadge.c_str()},
+      {"%WIFI_INFO_LINE%", wifiInfoLine.c_str()},
+      {"%MQTT_STATUS%", mqttStatusText.c_str()},
+    };
+    if (!out.render(seg2Start, pTOPICS - seg2Start, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+    if (config.mqttEnabled && config.mqttServer.length() > 0) {
+      if (!out.text(mqttTopicStatus.c_str()) || !out.text("<br>") ||
+          !out.text(mqttTopicSmsReceived.c_str()) || !out.text("<br>") ||
+          !out.text(mqttTopicCallReceived.c_str())) return;
+    } else if (!out.text("未配置")) return;
+    const char* afterTopics = pTOPICS + strlen("%MQTT_TOPICS%");
+    if (!out.render(afterTopics, pWIFI - afterTopics, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+  }
+
+  // ==== 生成 WiFi 网络 HTML 并发送（替代 %WIFI_NETWORKS%） ====
+  {
+    for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+      char idx[12], number[12];
+      snprintf(idx, sizeof(idx), "%d", i);
+      snprintf(number, sizeof(number), "%d", i + 1);
+      String currentSsid = WiFi.SSID();
+      bool isCurrent = config.wifiNetworks[i].ssid.length() > 0 && config.wifiNetworks[i].ssid == currentSsid;
+      static const char wifiTemplate[] = R"html(<div style="padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:8px;border:1px solid %BORDER%"><div class="sw-row" onclick="wfTog(%IDX%)"><span style="font-weight:600">网络 %NUMBER%%CURRENT%</span><div id="wfs%IDX%" class="sw %EN_SW%"></div><input type="hidden" id="wfe%IDX%" name="wifi%IDX%en" value="%EN_VAL%"></div><div class="grid-2" style="margin-top:8px"><div class="fg" style="margin-bottom:0"><label>SSID</label><input name="wifi%IDX%ssid" value="%SSID%" placeholder="WiFi名称"></div><div class="fg" style="margin-bottom:0"><label>密码</label><input name="wifi%IDX%pass" type="password" placeholder="%PASS_HINT%"></div></div></div>)html";
+      const WebTemplateValue pairs[] = {
+        {"%IDX%", idx}, {"%NUMBER%", number},
+        {"%BORDER%", isCurrent ? "var(--success)" : "#e2e8f0"},
+        {"%CURRENT%", isCurrent ? " <span class=\"badge b-ok\">当前</span>" : ""},
+        {"%EN_SW%", config.wifiNetworks[i].enabled ? "on" : ""},
+        {"%EN_VAL%", config.wifiNetworks[i].enabled ? "true" : "false"},
+        {"%SSID%", config.wifiNetworks[i].ssid.c_str()},
+        {"%PASS_HINT%", config.wifiNetworks[i].password.length() > 0 ? "（已保存，留空则保留）" : "WiFi密码"},
+      };
+      if (!out.render(wifiTemplate, sizeof(wifiTemplate) - 1, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+    }
+  }
+
+  // ==== 段3: %WIFI_NETWORKS% 之后 → %PUSH_CHANNELS% 之前 ====
+  {
+    const char* seg3Start = pWIFI + strlen("%WIFI_NETWORKS%");
+    size_t seg3Len = pPUSH - seg3Start;
+    char smtpPort[12], mqttPort[12];
+    snprintf(smtpPort, sizeof(smtpPort), "%d", config.smtpPort);
+    snprintf(mqttPort, sizeof(mqttPort), "%d", config.mqttPort);
+
+    // 本段包含的占位符: Web管理/邮箱/MQTT 配置
+    const WebTemplateValue pairs[] = {
+      {"%WEB_USER%", config.webUser.c_str()},
+      {"%WEB_PASS%", config.webPass.c_str()},
+      {"%SMTP_EN_VAL%", config.emailEnabled ? "true" : "false"},
+      {"%SMTP_EN_SW%", config.emailEnabled ? "on" : ""},
+      {"%SMTP_DISP%", config.emailEnabled ? "block" : "none"},
+      {"%SMTP_SERVER%", config.smtpServer.c_str()},
+      {"%SMTP_PORT%", smtpPort},
+      {"%SMTP_USER%", config.smtpUser.c_str()},
+      {"%SMTP_PASS%", config.smtpPass.c_str()},
+      {"%SMTP_SEND_TO%", config.smtpSendTo.c_str()},
+      {"%MQTT_EN_VAL%", config.mqttEnabled ? "true" : "false"},
+      {"%MQTT_EN_SW%", config.mqttEnabled ? "on" : ""},
+      {"%MQTT_DISP%", config.mqttEnabled ? "block" : "none"},
+      {"%MQTT_SERVER%", config.mqttServer.c_str()},
+      {"%MQTT_PORT%", mqttPort},
+      {"%MQTT_USER%", config.mqttUser.c_str()},
+      {"%MQTT_PASS%", config.mqttPass.c_str()},
+      {"%MQTT_PREFIX%", config.mqttPrefix.c_str()},
+      {"%MQTT_CO_VAL%", config.mqttControlOnly ? "true" : "false"},
+      {"%MQTT_CO_SW%", config.mqttControlOnly ? "on" : ""},
+      {"%MQTT_HA_VAL%", config.mqttHaDiscovery ? "true" : "false"},
+      {"%MQTT_HA_SW%", config.mqttHaDiscovery ? "on" : ""},
+      {"%MQTT_HA_DISP%", config.mqttHaDiscovery ? "block" : "none"},
+      {"%MQTT_HA_PREFIX%", config.mqttHaPrefix.length() > 0 ? config.mqttHaPrefix.c_str() : "homeassistant"},
+    };
+    if (!out.render(seg3Start, seg3Len, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+  }
+
+  // ==== 生成推送通道 HTML 并发送（替代 %PUSH_CHANNELS%） ====
+  {
+    for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
+      char idx[12], number[12];
+      snprintf(idx, sizeof(idx), "%d", i);
+      snprintf(number, sizeof(number), "%d", i + 1);
+      const PushChannel& channel = config.pushChannels[i];
+      static const char pushTemplate[] = R"html(<div class="card" style="border:1px solid #e2e8f0;padding:12px;margin-bottom:8px;box-shadow:none"><div class="sw-row" onclick="chTog(%IDX%)"><span style="font-weight:600">通道 %NUMBER%</span><div id="chs%IDX%" class="sw %EN_SW%"></div><input type="hidden" id="che%IDX%" name="push%IDX%en" value="%EN_VAL%"></div><div style="font-size:0.85em;color:var(--primary);text-align:right;cursor:pointer" onclick="fd(%IDX%)">展开/收起 <span id="chi%IDX%" style="display:inline-block;transition:.2s">></span></div><div id="chb%IDX%" style="display:none;margin-top:12px;border-top:1px solid #f1f5f9;padding-top:12px"><div class="fg"><label>名称</label><input name="push%IDX%name" value="%NAME%"></div><div class="fg"><label>类型</label><select name="push%IDX%type" id="tp%IDX%" onchange="upd(%IDX%)"><option value="1"%SEL1%>POST JSON</option><option value="2"%SEL2%>Bark</option><option value="3"%SEL3%>GET请求</option><option value="4"%SEL4%>自定义模板</option><option value="5"%SEL5%>Telegram Bot</option><option value="6"%SEL6%>企业微信</option><option value="7"%SEL7%>钉钉</option></select></div><div class="fg"><label>URL</label><input name="push%IDX%url" value="%URL%" placeholder="https://..."></div><div id="k1%IDX%" style="display:%K1_DISP%"><div class="fg"><label id="k1l%IDX%">%K1_LABEL%</label><input name="push%IDX%k1" value="%KEY1%" placeholder="%K1_HINT%"></div></div><div id="k2%IDX%" style="display:%K2_DISP%"><div class="fg"><label>Bark 分组 group (可选)</label><input name="push%IDX%k2" value="%KEY2%" placeholder="如 家庭短信 / 验证码"></div></div><div id="cf%IDX%" style="display:%CUSTOM_DISP%"><div class="fg"><label>Body模板</label><textarea name="push%IDX%body" rows="3">%BODY%</textarea></div></div></div></div>)html";
+      const WebTemplateValue pairs[] = {
+        {"%IDX%", idx}, {"%NUMBER%", number},
+        {"%EN_SW%", channel.enabled ? "on" : ""},
+        {"%EN_VAL%", channel.enabled ? "true" : "false"},
+        {"%NAME%", channel.name.c_str()}, {"%URL%", channel.url.c_str()},
+        {"%SEL1%", channel.type == PUSH_TYPE_POST_JSON ? " selected" : ""},
+        {"%SEL2%", channel.type == PUSH_TYPE_BARK ? " selected" : ""},
+        {"%SEL3%", channel.type == PUSH_TYPE_GET ? " selected" : ""},
+        {"%SEL4%", channel.type == PUSH_TYPE_CUSTOM ? " selected" : ""},
+        {"%SEL5%", channel.type == PUSH_TYPE_TELEGRAM ? " selected" : ""},
+        {"%SEL6%", channel.type == PUSH_TYPE_WECOM ? " selected" : ""},
+        {"%SEL7%", channel.type == PUSH_TYPE_DINGTALK ? " selected" : ""},
+        {"%K1_DISP%", channel.type == PUSH_TYPE_TELEGRAM || channel.type == PUSH_TYPE_DINGTALK ? "block" : "none"},
+        {"%K1_LABEL%", channel.type == PUSH_TYPE_TELEGRAM ? "Chat ID" : "加签密钥 (可选)"},
+        {"%K1_HINT%", channel.type == PUSH_TYPE_TELEGRAM ? "如 123456789" : "SEC开头的密钥"},
+        {"%KEY1%", channel.key1.c_str()}, {"%KEY2%", channel.key2.c_str()},
+        {"%K2_DISP%", channel.type == PUSH_TYPE_BARK ? "block" : "none"},
+        {"%CUSTOM_DISP%", channel.type == PUSH_TYPE_CUSTOM ? "block" : "none"},
+        {"%BODY%", channel.customBody.c_str()},
+      };
+      if (!out.render(pushTemplate, sizeof(pushTemplate) - 1, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+    }
+  }
+
+  // ==== 段4: %PUSH_CHANNELS% 之后 → 模板结尾 ====
+  // 包含：号码名单过滤、内容过滤、定时任务、JS 初始化脚本
+  {
+    const char* seg4Start = pPUSH + strlen("%PUSH_CHANNELS%");
+    size_t seg4Len = strlen(seg4Start);
+    char timerType[12], timerInterval[12], timerRemain[12];
+    snprintf(timerType, sizeof(timerType), "%d", config.timerType);
+    snprintf(timerInterval, sizeof(timerInterval), "%d", config.timerInterval);
+    snprintf(timerRemain, sizeof(timerRemain), "%lu", remainSec);
+
+    const WebTemplateValue pairs[] = {
+      {"%FILTER_EN_VAL%", config.filterEnabled ? "true" : "false"},
+      {"%FILTER_EN_BOOL%", config.filterEnabled ? "true" : "false"},
+      {"%FILTER_WL_BOOL%", config.filterIsWhitelist ? "true" : "false"},
+      {"%FILTER_WL_VAL%", config.filterIsWhitelist ? "true" : "false"},
+      {"%FILTER_LIST%", config.filterList.c_str(), true},
+      {"%CF_EN_VAL%", config.contentFilterEnabled ? "true" : "false"},
+      {"%CF_EN_BOOL%", config.contentFilterEnabled ? "true" : "false"},
+      {"%CF_WL_BOOL%", config.contentFilterIsWhitelist ? "true" : "false"},
+      {"%CF_WL_VAL%", config.contentFilterIsWhitelist ? "true" : "false"},
+      {"%CF_LIST%", config.contentFilterList.c_str(), true},
+      {"%TIMER_EN_VAL%", config.timerEnabled ? "true" : "false"},
+      {"%TIMER_EN_BOOL%", config.timerEnabled ? "true" : "false"},
+      {"%TIMER_TP%", timerType},
+      {"%TIMER_INT%", timerInterval},
+      {"%TIMER_PH%", config.timerPhone.c_str()},
+      {"%TIMER_MS%", config.timerMessage.c_str()},
+      {"%TIMER_RM%", timerRemain},
+    };
+    if (!out.render(seg4Start, seg4Len, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+  }
+
+  // ==== 结束 chunked transfer ====
+  if (!out.flush()) return;
+  server.sendContent("", 0);
+  Serial.printf("首页流式响应完成，free=%u max=%u min=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
 }
 
 // 处理工具箱页面请求 (重定向到首页)
@@ -653,6 +663,8 @@ void handleStats() {
   json += "\"hasInterruptedOperation\":" + String(lastInterruptedOperation.valid ? "true" : "false") + ",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"maxAllocHeap\":" + String(ESP.getMaxAllocHeap()) + ",";
+  json += "\"minFreeHeap\":" + String(ESP.getMinFreeHeap()) + ",";
   json += "\"wifiRssi\":" + String(WiFi.RSSI());
   json += "}";
   
