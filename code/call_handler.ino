@@ -86,7 +86,10 @@ void processIncomingCall(const char* caller) {
   Serial.println("来电号码: " + callerStr);
   Serial.println("===================");
 
-  if (callerStr != "未知号码" && isNumberFiltered(callerStr.c_str())) {
+  const bool unknownCaller = callerStr == "未知号码";
+  const bool filtered = unknownCaller ? (config.filterEnabled && config.filterIsWhitelist)
+                                      : isNumberFiltered(callerStr.c_str());
+  if (filtered) {
     Serial.println("来电号码被过滤，忽略该来电通知");
     return;
   }
@@ -113,6 +116,10 @@ bool handleCallUrc(const String& line) {
 
   // CLIP 号码上报
   if (line.startsWith("+CLIP:")) {
+    // Status/test replies (e.g. +CLIP: 1,1) are not caller URCs; a quoted empty number is.
+    const char* number = line.c_str() + 6;
+    while (*number == ' ' || *number == '\t') number++;
+    if (*number != '"' || strchr(number + 1, '"') == nullptr) return false;
     String caller = parseClipNumber(line);
     if (caller.length() == 0) caller = "未知号码";
     Serial.println("检测到来电号码(+CLIP): " + caller);

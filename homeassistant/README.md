@@ -35,12 +35,12 @@
 
 | 实体 | 类型 | 说明 |
 |------|------|------|
-| 状态 | sensor | 设备在线状态 |
+| 状态 | sensor | 最近一次上报的状态（HA 遥测副本，非实时连接状态） |
 | WiFi信号 | sensor | WiFi 信号强度 (dBm) |
 | 4G信号 | sensor | 4G RSRP 信号强度 (dBm) |
 | IP地址 | sensor | 设备当前 IP |
 | 运行时间 | sensor | 设备运行时间（小时） |
-| 在线 | binary_sensor | 设备连接状态 |
+| 在线 | binary_sensor | MQTT 连接状态（`on` / `off`，读取用户 `/status`） |
 | 重启 | button | 远程重启设备 |
 | 最近短信发送者 | sensor | 最后收到短信的号码 |
 | 最近短信内容 | sensor | 最后收到的短信内容 |
@@ -52,12 +52,26 @@
 
 ### 双主题同步
 
-设备会同时向两类 MQTT 主题发送数据：
+启用自动发现时，设备正常上报状态会向两类 MQTT 主题发布 retained JSON：
 
-1. **用户自定义前缀**：`<你的前缀>/<设备ID>/...`（如 `sms/a1b2c3/status`）
-2. **HA 自动发现主题**：`homeassistant/sensor/sms_forwarder_<设备ID>/state`
+1. **用户状态主题**：`<MQTT前缀>/<设备ID>/status`（如 `sms/a1b2c3/status`）
+2. **HA 遥测副本**：`<HA前缀>/sensor/sms_forwarder_<设备ID>/state`（HA 前缀默认 `homeassistant`）
 
 这意味着即使启用了自动发现，你仍然可以使用自定义主题进行其他集成。
+
+首次连接及每次重连成功后，用户 `/status` 收到 `status` 字段为 `online` 的 retained JSON；异常断线由 broker 检测到后，同一主题收到 retained LWT `{"status":"offline","device":"<设备ID>"}`，并非断电即刻离线。
+
+自动发现的“在线” `binary_sensor` 的 `state_topic` 指向用户 `<MQTT前缀>/<设备ID>/status`，与 `online` 上报及 LWT 同源；通过 `{{ value_json.status }}` 将 `online` / `offline` 映射为 `on` / `off`。**不设置 `availability` / `availability_topic`**，收到离线 LWT 后为 `off` 而非 `unavailable`，保留离线告警蓝图所需的状态。
+
+HA `.../state` 仍是 retained 遥测副本，**不接收 LWT**，不能用作连接状态依据。其余 HA 状态遥测实体继续读取它，断线后可能保留旧值（包括“状态”实体的 `online`），并非所有实体都会自动变为 `unavailable`；判断连接请使用“在线”二值传感器。
+
+### 旧 retained 状态迁移（P2-02）
+
+旧版“在线”实体可能仍订阅 HA `.../state`，导致断线后保持在线。升级时按以下方式处理：
+
+1. **MQTT/HA 前缀及设备 ID 不变**：保持自动发现启用，升级后让设备重连。新 retained discovery 会覆盖同一 `<HA前缀>/binary_sensor/sms_forwarder_<设备ID>_online/config`；`unique_id` 仍为 `sms_forwarder_<设备ID>_online`，保留已有实体 ID，无需删除或重建实体。确认新配置的 `state_topic` 指向用户 `/status`，且没有 availability 配置。
+2. **不要盲清 HA `.../state`**：它仍供遥测实体使用，等待正常上报覆盖即可；不要为此次升级清空整个 discovery 或 retained 前缀。
+3. **前缀或设备 ID 变更**：先核对新旧主题及使用方，确认新配置生效后，仅对确认废弃、已无使用方的具体旧 discovery/状态主题发布零长度 retained 消息以清除旧记录。仅修改 MQTT 前缀、HA 前缀和设备 ID 不变时，`_online/config` 仍由重连覆盖，不应将其作为废弃主题清理。
 
 ### 日志上报主题
 

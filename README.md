@@ -156,10 +156,14 @@ Arduino IDE 建议：
 2. Partition Scheme 选择：**Huge App**
 3. 端口选择对应的 COM 口
 
+> ⚠️ **容量与分区**：最终 `precommit` 测量的 app 镜像为 `1,531,456` 字节，超过本机 `default.csv` 的单 app 槽 `0x140000`（`1,310,720` 字节）。实板需至少 **4MB 物理 Flash**，修改菜单不能扩容；本次 Huge App 的 app 槽为 `0x300000`（3MiB），只有一个 app 分区，**无双槽 OTA**。环境、布局和容量测量见 [编译验证记录](docs/BUILD_VALIDATION.md)。
+
 ### 3. 上传固件
 1. 使用 USB 连接 ESP32-C3
 2. 编译并上传
 3. 打开串口监视器，波特率 `115200`
+
+> ⚠️ **升级前备份**：切换分区布局或烧录整片 merged 镜像可能覆盖 NVS 配置和 SPIFFS 短信/来电历史，请先备份并核对现有分区；默认不要 `erase-all`。仓库 `code/build/` 是旧产物，不能当作本轮新固件，建议在 Arduino IDE 中重新编译后上传。本轮验证未烧录、擦除或修改设备分区；纯编译步骤见 [编译验证记录](docs/BUILD_VALIDATION.md)，离线测试入口与边界见 [测试说明](tests/README.md)。
 
 ---
 
@@ -383,7 +387,7 @@ Arduino IDE 建议：
 #### 上报主题
 | 主题 | 说明 |
 |---|---|
-| `sms/a1b2c3/status` | 设备状态/详细状态 |
+| `sms/a1b2c3/status` | 设备状态/详细状态，以及 LWT 离线状态（retained JSON） |
 | `sms/a1b2c3/sms/received` | 收到短信 |
 | `sms/a1b2c3/call/received` | 收到来电 |
 | `sms/a1b2c3/sms/sent` | 发送短信结果 |
@@ -426,9 +430,13 @@ Arduino IDE 建议：
 
 ### 设备状态上报
 设备连接 MQTT 后：
-- 连接成功会发布 `online`
-- 异常离线会通过遗嘱消息发布 `offline`
+- 首次连接及重连成功后，向 `<MQTT前缀>/<设备ID>/status` 发布 retained JSON，`status` 字段为 `online`
+- 异常断线由 broker 检测到后，向同一主题发布 retained 遗嘱消息 `{"status":"offline","device":"<设备ID>"}`；并非断电即刻离线
 - 每 **60 秒** 上报一次详细状态
+
+HA 自动发现的“在线”二值传感器读取同一主题的 `{{ value_json.status }}`，将 `online` / `offline` 映射为 `on` / `off`；不设置 availability，以保留离线告警所需的 `off`。启用自动发现时，`<HA前缀>/sensor/sms_forwarder_<设备ID>/state` 仍接收 retained 遥测副本，但不接收 LWT，不能用作连接状态依据。其余 HA 状态遥测实体仍读取该副本，断线后可能保留旧值，并非所有实体都会自动变为 `unavailable`。
+
+升级时，若 MQTT/HA 前缀和设备 ID 不变，重连后新 retained discovery 会覆盖原 `_online/config`，保留已有实体 ID；HA `.../state` 仍用于遥测，无需清空。更改前缀/ID 后只定向清理确认废弃的主题，详见 [Home Assistant 迁移说明](homeassistant/README.md#旧-retained-状态迁移p2-02)。
 
 状态 JSON 示例：
 

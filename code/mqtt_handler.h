@@ -6,6 +6,31 @@
 #include <PubSubClient.h>
 #include "config.h"
 
+// 出站预算按字节计算，不等同于 PubSubClient 的常驻收包缓冲。
+// 每段保守取 160 个字符、每字符 8 字节（UTF-8 最多 4，JSON 控制转义最多 6），
+// 再留 1 KiB 字段开销；10 段不会因固定 1024 字节缓冲而被拒绝。
+static const size_t MQTT_MAX_TOPIC_BYTES = 1024;
+static const size_t MQTT_MAX_PAYLOAD_BYTES = 16 * 1024;
+static const size_t MQTT_MAX_COMMAND_BYTES = 8192;
+// PubSubClient 接收整包：固定头 + 主题长度/主题 + QoS1 packet ID + JSON。
+static const size_t MQTT_RECEIVE_BUFFER_BYTES = MQTT_MAX_HEADER_SIZE + 2U + MQTT_MAX_TOPIC_BYTES + 2U + MQTT_MAX_COMMAND_BYTES;
+static const size_t MQTT_MAX_BUFFER_BYTES = MQTT_RECEIVE_BUFFER_BYTES;
+static const size_t MQTT_PUBLISH_CHUNK_BYTES = 512;
+static_assert(MQTT_MAX_PAYLOAD_BYTES >= MAX_CONCAT_PARTS * 160U * 8U + 1024U,
+              "MQTT payload budget must cover the maximum concatenated SMS");
+static_assert(MQTT_MAX_PAYLOAD_BYTES + MQTT_MAX_TOPIC_BYTES + 2U < 65536U,
+              "PubSubClient 2.8 buildHeader uses uint16_t remaining length");
+static_assert(MQTT_MAX_BUFFER_BYTES >= MQTT_MAX_HEADER_SIZE + 2U + MQTT_MAX_TOPIC_BYTES &&
+              MQTT_MAX_BUFFER_BYTES < 65536U,
+              "MQTT buffer must hold the topic header and fit setBufferSize");
+
+// 出站 JSON 构造器只引用调用期间有效的字段，不复制/截断输入。
+struct MqttJsonField {
+  const char* name;
+  const char* value;
+  bool quoted = true;  // false 仅用于内部 true/false 常量
+};
+
 // 外部 MQTT 变量声明
 extern WiFiClient mqttWifiClient;
 extern PubSubClient mqttClient;
@@ -58,6 +83,8 @@ struct MqttLogEntry {
 };
 
 // MQTT 函数声明
+bool ensureMqttBufferSize(size_t minimumBytes); // 有界分配，失败不使用未经确认的缓冲
+void serviceMqtt();  // 主任务/AT idle：仅 loop 保活和回调入队，不重连/执行待办
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void mqttReconnect();
 void initMqttTopics();

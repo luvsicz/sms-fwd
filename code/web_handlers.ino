@@ -1,7 +1,10 @@
 /*
  * web_handlers.ino - Web 服务器处理函数实现
  */
-#include "web_stream.h"
+#include "web_output.h"
+#include "modem_handler.h"
+#include "json_input.h"
+#include <utility>
 
 // 检查 HTTP Basic 认证
 bool checkAuth() {
@@ -12,93 +15,55 @@ bool checkAuth() {
   return true;
 }
 
+static const char* atResultText(ModemResult result) {
+  switch (result) {
+    case ModemResult::Pending: return "PENDING";
+    case ModemResult::Ok: return "OK";
+    case ModemResult::Error: return "ERROR";
+    case ModemResult::Timeout: return "TIMEOUT";
+    case ModemResult::Busy: return "BUSY";
+    case ModemResult::Overflow: return "OVERFLOW";
+    case ModemResult::Invalid: return "INVALID";
+  }
+  return "INVALID";
+}
+
 // 发送 AT 命令并获取响应
 String sendATCommand(const char* cmd, unsigned long timeout) {
   Serial.printf("[耗时] START AT命令: %s, timeout=%lums\n", cmd, timeout);
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
-  
   unsigned long start = millis();
   String resp;
-  resp.reserve(128); // 预分配响应缓冲区，避免频繁拼接再分配 (M5)
-  // 注释 (M1): 无符号整型差值 (millis() - start) 溢出回绕安全
-  while (millis() - start < timeout) {
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      resp += c;
-      if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
-        delay(50);  // 等待剩余数据
-        while (Serial1.available()) resp += (char)Serial1.read();
-        Serial.printf("[耗时] END AT命令: %s, elapsed=%lums, result=%s, respLen=%u\n",
-                      cmd,
-                      millis() - start,
-                      resp.indexOf("OK") >= 0 ? "OK" : "ERROR",
-                      resp.length());
-        return resp;
-      }
-    }
-  }
-  Serial.printf("[耗时] TIMEOUT AT命令: %s, elapsed=%lums, respLen=%u\n", cmd, millis() - start, resp.length());
+  ModemResult result = runModemCommand(cmd, timeout, &resp);
+  Serial.printf("[耗时] END AT命令: %s, elapsed=%lums, result=%s, respLen=%u\n",
+                cmd, millis() - start, atResultText(result), resp.length());
   return resp;
 }
 
 // AT 命令并等待 OK
 bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   Serial.printf("[耗时] START AT等待OK: %s, timeout=%lums\n", cmd, timeout);
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
   unsigned long start = millis();
   String resp;
-  resp.reserve(64);
-  // 注释 (M1): 无符号整型差值 (millis() - start) 溢出回绕安全
-  while (millis() - start < timeout) {
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      resp += c;
-      if (resp.indexOf("OK") >= 0) {
-        Serial.printf("[耗时] END AT等待OK: %s, elapsed=%lums, result=OK, respLen=%u\n", cmd, millis() - start, resp.length());
-        return true;
-      }
-      if (resp.indexOf("ERROR") >= 0) {
-        Serial.printf("[耗时] END AT等待OK: %s, elapsed=%lums, result=ERROR, respLen=%u\n", cmd, millis() - start, resp.length());
-        return false;
-      }
-    }
-  }
-  Serial.printf("[耗时] TIMEOUT AT等待OK: %s, elapsed=%lums, respLen=%u\n", cmd, millis() - start, resp.length());
-  return false;
+  ModemResult result = runModemCommand(cmd, timeout, &resp);
+  Serial.printf("[耗时] END AT等待OK: %s, elapsed=%lums, result=%s, respLen=%u\n",
+                cmd, millis() - start, atResultText(result), resp.length());
+  return result == ModemResult::Ok;
 }
 
 // 等待 CGATT 附着
 bool waitCGATT1() {
-  Serial1.println("AT+CGATT?");
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < 2000) {
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      resp += c;
-      if (resp.indexOf("+CGATT: 1") >= 0) return true;
-      if (resp.indexOf("+CGATT: 0") >= 0) return false;
-    }
-  }
-  return false;
+  String resultLine;
+  if (runModemCommand("AT+CGATT?", 2000, nullptr, &resultLine, "+CGATT:") != ModemResult::Ok) return false;
+  String state = resultLine.substring(7);
+  state.trim();
+  return state == "1";
 }
 
 // 重启模组
 void resetModule() {
   Serial.println("正在重启模组...");
-  Serial1.println("AT+CFUN=1,1");
-  delay(3000);
+  sendATandWaitOK("AT+CFUN=1,1", 3000);
+  modemDelay(3000);
 }
 
 // LED 闪烁
@@ -154,25 +119,11 @@ void handleRoot() {
   bool staConnected = WiFi.status() == WL_CONNECTED;
   String displayIp = apActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   String wifiModeBadge = apActive ? "<span class=\"badge b-warn\">AP模式</span>" : "<span class=\"badge b-ok\">STA模式</span>";
-  String wifiInfoLine = "";
-  if (apActive) {
-    wifiInfoLine = "热点名: SMS-Forwarder-AP<br>热点IP: " + WiFi.softAPIP().toString();
-    if (staConnected) { wifiInfoLine += "<br>上游WiFi: " + WiFi.SSID(); }
-  } else if (staConnected) {
-    wifiInfoLine = "已连接WiFi: " + WiFi.SSID() + "<br>设备IP: " + WiFi.localIP().toString();
-  } else {
-    wifiInfoLine = "WiFi未连接";
-  }
+  String currentSsid = WiFi.SSID();
 
   String mqttStatusText = config.mqttEnabled ? (mqttClient.connected() ? "已连接" : "未连接") : "未启用";
 
-  unsigned long remainSec = 0;
-  if (config.timerEnabled && timerIntervalSec > 0) {
-    unsigned long elapsedSec = (millis() - lastTimerExec) / 1000;
-    if (elapsedSec < timerIntervalSec) {
-      remainSec = timerIntervalSec - elapsedSec;
-    }
-  }
+  const uint64_t remainSec = timerRemainingSeconds();
 
   // ---- 定位 htmlPage 中的 3 个大占位符，将模板拆成 4 段 ----
   // 顺序: ... %COMMON_CSS% ... %WIFI_NETWORKS% ... %PUSH_CHANNELS% ...
@@ -180,10 +131,12 @@ void handleRoot() {
   const char* pWIFI = strstr(htmlPage, "%WIFI_NETWORKS%");
   const char* pPUSH = strstr(htmlPage, "%PUSH_CHANNELS%");
 
+  const char* pINFO = strstr(htmlPage, "%WIFI_INFO_LINE%");
   const char* pTOPICS = strstr(htmlPage, "%MQTT_TOPICS%");
-  if (!pCSS || !pWIFI || !pPUSH || !pTOPICS ||
-      !(pCSS < pTOPICS && pTOPICS < pWIFI && pWIFI < pPUSH) ||
+  if (!pCSS || !pWIFI || !pPUSH || !pINFO || !pTOPICS ||
+      !(pCSS < pINFO && pINFO < pTOPICS && pTOPICS < pWIFI && pWIFI < pPUSH) ||
       strstr(pCSS + 1, "%COMMON_CSS%") || strstr(pWIFI + 1, "%WIFI_NETWORKS%") ||
+      strstr(pINFO + 1, "%WIFI_INFO_LINE%") ||
       strstr(pPUSH + 1, "%PUSH_CHANNELS%") || strstr(pTOPICS + 1, "%MQTT_TOPICS%")) {
     Serial.println("handleRoot: 模板占位符定位失败");
     server.send(503, "text/plain; charset=utf-8", "首页暂时不可用：模板错误");
@@ -193,7 +146,7 @@ void handleRoot() {
   // 开始 chunked transfer
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html; charset=utf-8", "");
-  WebStream out(sendWebChunk);
+  WebOutput out(sendWebChunk);
 
   if (!out.write(htmlPage, pCSS - htmlPage) || !out.text(commonCss)) return;
 
@@ -202,17 +155,26 @@ void handleRoot() {
   {
     const char* seg2Start = pCSS + strlen("%COMMON_CSS%");
     // 本段包含的占位符: 概览页+控制页+配置页(WiFi之前)的所有占位符
-    const WebTemplateValue pairs[] = {
+    const WebOutputValue pairs[] = {
       {"%IP%", displayIp.c_str()},
-      {"%WIFI_MODE_BADGE%", wifiModeBadge.c_str()},
-      {"%WIFI_INFO_LINE%", wifiInfoLine.c_str()},
+      {"%WIFI_MODE_BADGE%", wifiModeBadge.c_str(), WebEncoding::Raw},
       {"%MQTT_STATUS%", mqttStatusText.c_str()},
     };
-    if (!out.render(seg2Start, pTOPICS - seg2Start, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+    if (!out.render(seg2Start, pINFO - seg2Start, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
+    // 静态换行与动态文本分开输出；SSID/主题不能作为 HTML。
+    if (apActive) {
+      if (!out.text("热点名: SMS-Forwarder-AP<br>热点IP: ") || !out.encoded(displayIp.c_str())) return;
+      if (staConnected && (!out.text("<br>上游WiFi: ") || !out.encoded(currentSsid.c_str()))) return;
+    } else if (staConnected) {
+      if (!out.text("已连接WiFi: ") || !out.encoded(currentSsid.c_str()) ||
+          !out.text("<br>设备IP: ") || !out.encoded(displayIp.c_str())) return;
+    } else if (!out.text("WiFi未连接")) return;
+    const char* afterInfo = pINFO + strlen("%WIFI_INFO_LINE%");
+    if (!out.render(afterInfo, pTOPICS - afterInfo, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
     if (config.mqttEnabled && config.mqttServer.length() > 0) {
-      if (!out.text(mqttTopicStatus.c_str()) || !out.text("<br>") ||
-          !out.text(mqttTopicSmsReceived.c_str()) || !out.text("<br>") ||
-          !out.text(mqttTopicCallReceived.c_str())) return;
+      if (!out.encoded(mqttTopicStatus.c_str()) || !out.text("<br>") ||
+          !out.encoded(mqttTopicSmsReceived.c_str()) || !out.text("<br>") ||
+          !out.encoded(mqttTopicCallReceived.c_str())) return;
     } else if (!out.text("未配置")) return;
     const char* afterTopics = pTOPICS + strlen("%MQTT_TOPICS%");
     if (!out.render(afterTopics, pWIFI - afterTopics, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
@@ -224,16 +186,15 @@ void handleRoot() {
       char idx[12], number[12];
       snprintf(idx, sizeof(idx), "%d", i);
       snprintf(number, sizeof(number), "%d", i + 1);
-      String currentSsid = WiFi.SSID();
       bool isCurrent = config.wifiNetworks[i].ssid.length() > 0 && config.wifiNetworks[i].ssid == currentSsid;
       static const char wifiTemplate[] = R"html(<div style="padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:8px;border:1px solid %BORDER%"><div class="sw-row" onclick="wfTog(%IDX%)"><span style="font-weight:600">网络 %NUMBER%%CURRENT%</span><div id="wfs%IDX%" class="sw %EN_SW%"></div><input type="hidden" id="wfe%IDX%" name="wifi%IDX%en" value="%EN_VAL%"></div><div class="grid-2" style="margin-top:8px"><div class="fg" style="margin-bottom:0"><label>SSID</label><input name="wifi%IDX%ssid" value="%SSID%" placeholder="WiFi名称"></div><div class="fg" style="margin-bottom:0"><label>密码</label><input name="wifi%IDX%pass" type="password" placeholder="%PASS_HINT%"></div></div></div>)html";
-      const WebTemplateValue pairs[] = {
+      const WebOutputValue pairs[] = {
         {"%IDX%", idx}, {"%NUMBER%", number},
         {"%BORDER%", isCurrent ? "var(--success)" : "#e2e8f0"},
-        {"%CURRENT%", isCurrent ? " <span class=\"badge b-ok\">当前</span>" : ""},
+        {"%CURRENT%", isCurrent ? " <span class=\"badge b-ok\">当前</span>" : "", WebEncoding::Raw},
         {"%EN_SW%", config.wifiNetworks[i].enabled ? "on" : ""},
         {"%EN_VAL%", config.wifiNetworks[i].enabled ? "true" : "false"},
-        {"%SSID%", config.wifiNetworks[i].ssid.c_str()},
+        {"%SSID%", config.wifiNetworks[i].ssid.c_str(), WebEncoding::HtmlAttribute},
         {"%PASS_HINT%", config.wifiNetworks[i].password.length() > 0 ? "（已保存，留空则保留）" : "WiFi密码"},
       };
       if (!out.render(wifiTemplate, sizeof(wifiTemplate) - 1, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
@@ -249,31 +210,31 @@ void handleRoot() {
     snprintf(mqttPort, sizeof(mqttPort), "%d", config.mqttPort);
 
     // 本段包含的占位符: Web管理/邮箱/MQTT 配置
-    const WebTemplateValue pairs[] = {
-      {"%WEB_USER%", config.webUser.c_str()},
-      {"%WEB_PASS%", config.webPass.c_str()},
+    const WebOutputValue pairs[] = {
+      {"%WEB_USER%", config.webUser.c_str(), WebEncoding::HtmlAttribute},
+      {"%WEB_PASS%", config.webPass.c_str(), WebEncoding::HtmlAttribute},
       {"%SMTP_EN_VAL%", config.emailEnabled ? "true" : "false"},
       {"%SMTP_EN_SW%", config.emailEnabled ? "on" : ""},
       {"%SMTP_DISP%", config.emailEnabled ? "block" : "none"},
-      {"%SMTP_SERVER%", config.smtpServer.c_str()},
+      {"%SMTP_SERVER%", config.smtpServer.c_str(), WebEncoding::HtmlAttribute},
       {"%SMTP_PORT%", smtpPort},
-      {"%SMTP_USER%", config.smtpUser.c_str()},
-      {"%SMTP_PASS%", config.smtpPass.c_str()},
-      {"%SMTP_SEND_TO%", config.smtpSendTo.c_str()},
+      {"%SMTP_USER%", config.smtpUser.c_str(), WebEncoding::HtmlAttribute},
+      {"%SMTP_PASS%", config.smtpPass.c_str(), WebEncoding::HtmlAttribute},
+      {"%SMTP_SEND_TO%", config.smtpSendTo.c_str(), WebEncoding::HtmlAttribute},
       {"%MQTT_EN_VAL%", config.mqttEnabled ? "true" : "false"},
       {"%MQTT_EN_SW%", config.mqttEnabled ? "on" : ""},
       {"%MQTT_DISP%", config.mqttEnabled ? "block" : "none"},
-      {"%MQTT_SERVER%", config.mqttServer.c_str()},
+      {"%MQTT_SERVER%", config.mqttServer.c_str(), WebEncoding::HtmlAttribute},
       {"%MQTT_PORT%", mqttPort},
-      {"%MQTT_USER%", config.mqttUser.c_str()},
-      {"%MQTT_PASS%", config.mqttPass.c_str()},
-      {"%MQTT_PREFIX%", config.mqttPrefix.c_str()},
+      {"%MQTT_USER%", config.mqttUser.c_str(), WebEncoding::HtmlAttribute},
+      {"%MQTT_PASS%", config.mqttPass.c_str(), WebEncoding::HtmlAttribute},
+      {"%MQTT_PREFIX%", config.mqttPrefix.c_str(), WebEncoding::HtmlAttribute},
       {"%MQTT_CO_VAL%", config.mqttControlOnly ? "true" : "false"},
       {"%MQTT_CO_SW%", config.mqttControlOnly ? "on" : ""},
       {"%MQTT_HA_VAL%", config.mqttHaDiscovery ? "true" : "false"},
       {"%MQTT_HA_SW%", config.mqttHaDiscovery ? "on" : ""},
       {"%MQTT_HA_DISP%", config.mqttHaDiscovery ? "block" : "none"},
-      {"%MQTT_HA_PREFIX%", config.mqttHaPrefix.length() > 0 ? config.mqttHaPrefix.c_str() : "homeassistant"},
+      {"%MQTT_HA_PREFIX%", config.mqttHaPrefix.length() > 0 ? config.mqttHaPrefix.c_str() : "homeassistant", WebEncoding::HtmlAttribute},
     };
     if (!out.render(seg3Start, seg3Len, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
   }
@@ -285,12 +246,15 @@ void handleRoot() {
       snprintf(idx, sizeof(idx), "%d", i);
       snprintf(number, sizeof(number), "%d", i + 1);
       const PushChannel& channel = config.pushChannels[i];
-      static const char pushTemplate[] = R"html(<div class="card" style="border:1px solid #e2e8f0;padding:12px;margin-bottom:8px;box-shadow:none"><div class="sw-row" onclick="chTog(%IDX%)"><span style="font-weight:600">通道 %NUMBER%</span><div id="chs%IDX%" class="sw %EN_SW%"></div><input type="hidden" id="che%IDX%" name="push%IDX%en" value="%EN_VAL%"></div><div style="font-size:0.85em;color:var(--primary);text-align:right;cursor:pointer" onclick="fd(%IDX%)">展开/收起 <span id="chi%IDX%" style="display:inline-block;transition:.2s">></span></div><div id="chb%IDX%" style="display:none;margin-top:12px;border-top:1px solid #f1f5f9;padding-top:12px"><div class="fg"><label>名称</label><input name="push%IDX%name" value="%NAME%"></div><div class="fg"><label>类型</label><select name="push%IDX%type" id="tp%IDX%" onchange="upd(%IDX%)"><option value="1"%SEL1%>POST JSON</option><option value="2"%SEL2%>Bark</option><option value="3"%SEL3%>GET请求</option><option value="4"%SEL4%>自定义模板</option><option value="5"%SEL5%>Telegram Bot</option><option value="6"%SEL6%>企业微信</option><option value="7"%SEL7%>钉钉</option></select></div><div class="fg"><label>URL</label><input name="push%IDX%url" value="%URL%" placeholder="https://..."></div><div id="k1%IDX%" style="display:%K1_DISP%"><div class="fg"><label id="k1l%IDX%">%K1_LABEL%</label><input name="push%IDX%k1" value="%KEY1%" placeholder="%K1_HINT%"></div></div><div id="k2%IDX%" style="display:%K2_DISP%"><div class="fg"><label>Bark 分组 group (可选)</label><input name="push%IDX%k2" value="%KEY2%" placeholder="如 家庭短信 / 验证码"></div></div><div id="cf%IDX%" style="display:%CUSTOM_DISP%"><div class="fg"><label>Body模板</label><textarea name="push%IDX%body" rows="3">%BODY%</textarea></div></div></div></div>)html";
-      const WebTemplateValue pairs[] = {
+      // HTML parser 吞掉 textarea 后的首个 LF；固定前导 LF 保留正文自己的首行。
+      static const char pushTemplate[] = R"html(<div class="card" style="border:1px solid #e2e8f0;padding:12px;margin-bottom:8px;box-shadow:none"><div class="sw-row" onclick="chTog(%IDX%)"><span style="font-weight:600">通道 %NUMBER%</span><div id="chs%IDX%" class="sw %EN_SW%"></div><input type="hidden" id="che%IDX%" name="push%IDX%en" value="%EN_VAL%"></div><div style="font-size:0.85em;color:var(--primary);text-align:right;cursor:pointer" onclick="fd(%IDX%)">展开/收起 <span id="chi%IDX%" style="display:inline-block;transition:.2s">></span></div><div id="chb%IDX%" style="display:none;margin-top:12px;border-top:1px solid #f1f5f9;padding-top:12px"><div class="fg"><label>名称</label><input name="push%IDX%name" value="%NAME%"></div><div class="fg"><label>类型</label><select name="push%IDX%type" id="tp%IDX%" onchange="upd(%IDX%)"><option value="1"%SEL1%>POST JSON</option><option value="2"%SEL2%>Bark</option><option value="3"%SEL3%>GET请求</option><option value="4"%SEL4%>自定义模板</option><option value="5"%SEL5%>Telegram Bot</option><option value="6"%SEL6%>企业微信</option><option value="7"%SEL7%>钉钉</option></select></div><div class="fg"><label>URL</label><input name="push%IDX%url" value="%URL%" placeholder="https://..."></div><div id="k1%IDX%" style="display:%K1_DISP%"><div class="fg"><label id="k1l%IDX%">%K1_LABEL%</label><input name="push%IDX%k1" value="%KEY1%" placeholder="%K1_HINT%"></div></div><div id="k2%IDX%" style="display:%K2_DISP%"><div class="fg"><label>Bark 分组 group (可选)</label><input name="push%IDX%k2" value="%KEY2%" placeholder="如 家庭短信 / 验证码"></div></div><div id="cf%IDX%" style="display:%CUSTOM_DISP%"><div class="fg"><label>Body模板</label><textarea name="push%IDX%body" rows="3">
+%BODY%</textarea></div></div></div></div>)html";
+      const WebOutputValue pairs[] = {
         {"%IDX%", idx}, {"%NUMBER%", number},
         {"%EN_SW%", channel.enabled ? "on" : ""},
         {"%EN_VAL%", channel.enabled ? "true" : "false"},
-        {"%NAME%", channel.name.c_str()}, {"%URL%", channel.url.c_str()},
+        {"%NAME%", channel.name.c_str(), WebEncoding::HtmlAttribute},
+        {"%URL%", channel.url.c_str(), WebEncoding::HtmlAttribute},
         {"%SEL1%", channel.type == PUSH_TYPE_POST_JSON ? " selected" : ""},
         {"%SEL2%", channel.type == PUSH_TYPE_BARK ? " selected" : ""},
         {"%SEL3%", channel.type == PUSH_TYPE_GET ? " selected" : ""},
@@ -301,7 +265,8 @@ void handleRoot() {
         {"%K1_DISP%", channel.type == PUSH_TYPE_TELEGRAM || channel.type == PUSH_TYPE_DINGTALK ? "block" : "none"},
         {"%K1_LABEL%", channel.type == PUSH_TYPE_TELEGRAM ? "Chat ID" : "加签密钥 (可选)"},
         {"%K1_HINT%", channel.type == PUSH_TYPE_TELEGRAM ? "如 123456789" : "SEC开头的密钥"},
-        {"%KEY1%", channel.key1.c_str()}, {"%KEY2%", channel.key2.c_str()},
+        {"%KEY1%", channel.key1.c_str(), WebEncoding::HtmlAttribute},
+        {"%KEY2%", channel.key2.c_str(), WebEncoding::HtmlAttribute},
         {"%K2_DISP%", channel.type == PUSH_TYPE_BARK ? "block" : "none"},
         {"%CUSTOM_DISP%", channel.type == PUSH_TYPE_CUSTOM ? "block" : "none"},
         {"%BODY%", channel.customBody.c_str()},
@@ -315,28 +280,28 @@ void handleRoot() {
   {
     const char* seg4Start = pPUSH + strlen("%PUSH_CHANNELS%");
     size_t seg4Len = strlen(seg4Start);
-    char timerType[12], timerInterval[12], timerRemain[12];
+    char timerType[12], timerInterval[12], timerRemain[21];
     snprintf(timerType, sizeof(timerType), "%d", config.timerType);
     snprintf(timerInterval, sizeof(timerInterval), "%d", config.timerInterval);
-    snprintf(timerRemain, sizeof(timerRemain), "%lu", remainSec);
+    snprintf(timerRemain, sizeof(timerRemain), "%llu", (unsigned long long)remainSec);
 
-    const WebTemplateValue pairs[] = {
+    const WebOutputValue pairs[] = {
       {"%FILTER_EN_VAL%", config.filterEnabled ? "true" : "false"},
       {"%FILTER_EN_BOOL%", config.filterEnabled ? "true" : "false"},
       {"%FILTER_WL_BOOL%", config.filterIsWhitelist ? "true" : "false"},
       {"%FILTER_WL_VAL%", config.filterIsWhitelist ? "true" : "false"},
-      {"%FILTER_LIST%", config.filterList.c_str(), true},
+      {"%FILTER_LIST%", config.filterList.c_str(), WebEncoding::JsString},
       {"%CF_EN_VAL%", config.contentFilterEnabled ? "true" : "false"},
       {"%CF_EN_BOOL%", config.contentFilterEnabled ? "true" : "false"},
       {"%CF_WL_BOOL%", config.contentFilterIsWhitelist ? "true" : "false"},
       {"%CF_WL_VAL%", config.contentFilterIsWhitelist ? "true" : "false"},
-      {"%CF_LIST%", config.contentFilterList.c_str(), true},
+      {"%CF_LIST%", config.contentFilterList.c_str(), WebEncoding::JsString},
       {"%TIMER_EN_VAL%", config.timerEnabled ? "true" : "false"},
       {"%TIMER_EN_BOOL%", config.timerEnabled ? "true" : "false"},
       {"%TIMER_TP%", timerType},
       {"%TIMER_INT%", timerInterval},
-      {"%TIMER_PH%", config.timerPhone.c_str()},
-      {"%TIMER_MS%", config.timerMessage.c_str()},
+      {"%TIMER_PH%", config.timerPhone.c_str(), WebEncoding::JsString},
+      {"%TIMER_MS%", config.timerMessage.c_str(), WebEncoding::JsString},
       {"%TIMER_RM%", timerRemain},
     };
     if (!out.render(seg4Start, seg4Len, pairs, sizeof(pairs) / sizeof(pairs[0]))) return;
@@ -355,143 +320,202 @@ void handleToolsPage() {
   server.send(302, "text/plain", "");
 }
 
+static void sendConfigSaveError(const char* reason) {
+  // saveConfig 返回的原因均为不含引号/配置值的静态文本。
+  server.send(503, "application/json", String("{\"success\":false,\"message\":\"") + reason + "\"}");
+}
+
+static void normalizeConfigList(String& value) {
+  // 仅缩短，不创建临时 String；低内存时不能静默漏做规范化。
+  for (int i = 0; i + 1 < static_cast<int>(value.length()); ++i) {
+    if (value.charAt(i) == '\r' && value.charAt(i + 1) == '\n') value.remove(i + 1, 1);
+  }
+  value.replace('\r', ',');
+  value.replace('\n', ',');
+  for (unsigned int i = 0; i + 2 < value.length(); ++i) {
+    if (memcmp(value.c_str() + i, "\xef\xbc\x8c", 3) == 0) {
+      value.setCharAt(i, ',');
+      value.remove(i + 1, 2);
+    }
+  }
+}
+
+static bool configCopyComplete(const Config& copy, const Config& original) {
+  const String* a[] = {&copy.smtpServer, &copy.smtpUser, &copy.smtpPass, &copy.smtpSendTo,
+    &copy.webUser, &copy.webPass, &copy.timerPhone, &copy.timerMessage, &copy.mqttServer,
+    &copy.mqttUser, &copy.mqttPass, &copy.mqttPrefix, &copy.mqttHaPrefix, &copy.filterList, &copy.contentFilterList};
+  const String* b[] = {&original.smtpServer, &original.smtpUser, &original.smtpPass, &original.smtpSendTo,
+    &original.webUser, &original.webPass, &original.timerPhone, &original.timerMessage, &original.mqttServer,
+    &original.mqttUser, &original.mqttPass, &original.mqttPrefix, &original.mqttHaPrefix, &original.filterList, &original.contentFilterList};
+  auto complete = [](const String& x, const String& y) { return x && x.length() == y.length() && x == y; };
+  for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); ++i) if (!complete(*a[i], *b[i])) return false;
+  for (int i = 0; i < MAX_WIFI_NETWORKS; ++i) {
+    if (!complete(copy.wifiNetworks[i].ssid, original.wifiNetworks[i].ssid) ||
+        !complete(copy.wifiNetworks[i].password, original.wifiNetworks[i].password)) return false;
+  }
+  for (int i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    const PushChannel& x = copy.pushChannels[i]; const PushChannel& y = original.pushChannels[i];
+    if (!complete(x.name, y.name) || !complete(x.url, y.url) || !complete(x.key1, y.key1) ||
+        !complete(x.key2, y.key2) || !complete(x.customBody, y.customBody)) return false;
+  }
+  return true;
+}
+
 // 处理保存配置请求 (全量保存)
 void handleSave() {
   if (!checkAuth()) return;
-  
-  // 喂狗防止超时
+
+  // 仅主任务更新配置。先在堆上构建候选，不能用未经检查的复制直接覆盖全局。
+  std::unique_ptr<Config> next(new (std::nothrow) Config(config));
+  if (!next) {
+    sendConfigSaveError("内存不足，未保存配置");
+    return;
+  }
+  if (!configCopyComplete(*next, config)) {
+    sendConfigSaveError("配置快照内存不足，未保存配置");
+    return;
+  }
+  bool formOk = true;
+  auto arg = [&formOk](const char* name) {
+    String key(name);
+    if (!key || key.length() != strlen(name)) formOk = false;
+    String value = server.arg(key);
+    // 表单原始文本也有界；规范化后的持久化字节预算在应用前统一检查。
+    if (!value || value.length() > JsonInput::MAX_INPUT_BYTES ||
+        memchr(value.c_str(), '\0', value.length())) formOk = false;
+    return value;
+  };
+  auto flag = [&arg, &formOk](const char* name, bool allowOn = false) {
+    String value = arg(name);
+    if (value.length() && value != "true" && value != "false" && !(allowOn && value == "on")) formOk = false;
+    return value == "true" || (allowOn && value == "on");
+  };
   esp_task_wdt_reset();
   yield();
-
   bool wifiChanged = false;
 
-  // WiFi 网络配置
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    String prefix = "wifi" + String(i);
-    String newSsid = server.arg(prefix + "ssid");
-    String newPass = server.arg(prefix + "pass");
-    String newEn = server.arg(prefix + "en");
-    bool nextEnabled = (newEn == "true");
-
-    if (newSsid.length() > 0 && newSsid != config.wifiNetworks[i].ssid) {
-      wifiChanged = true;
-    }
-    if (newPass.length() > 0 && newPass != config.wifiNetworks[i].password) {
-      wifiChanged = true;
-    }
-    if (nextEnabled != config.wifiNetworks[i].enabled) {
-      wifiChanged = true;
-    }
-
-    // 只有当 SSID 非空时才更新（避免清空已保存的配置）
-    if (newSsid.length() > 0) {
-      config.wifiNetworks[i].ssid = newSsid;
-    }
-    // 密码为空时保留原密码
-    if (newPass.length() > 0) {
-      config.wifiNetworks[i].password = newPass;
-    }
-    // enabled 状态始终更新
-    config.wifiNetworks[i].enabled = nextEnabled;
-
-    // 调试输出
-    Serial.printf("WiFi%d: SSID=%s, Pass=%s, En=%d\n", 
-      i, config.wifiNetworks[i].ssid.c_str(), 
-      config.wifiNetworks[i].password.length() > 0 ? "***" : "(empty)",
-      config.wifiNetworks[i].enabled);
+    char key[24];
+    snprintf(key, sizeof(key), "wifi%dssid", i); String ssid = arg(key);
+    snprintf(key, sizeof(key), "wifi%dpass", i); String pass = arg(key);
+    snprintf(key, sizeof(key), "wifi%den", i); bool enabled = flag(key);
+    WifiNetwork& wifi = next->wifiNetworks[i];
+    if (ssid.length()) wifi.ssid = std::move(ssid);
+    if (pass.length()) wifi.password = std::move(pass);  // 留空保留
+    wifi.enabled = enabled;
+    wifiChanged |= wifi.ssid != config.wifiNetworks[i].ssid ||
+                   wifi.password != config.wifiNetworks[i].password || enabled != config.wifiNetworks[i].enabled;
   }
-  
+
   esp_task_wdt_reset();
   yield();
-  
-  // 获取新的 Web 账号密码
-  String newWebUser = server.arg("webUser");
-  String newWebPass = server.arg("webPass");
+  String newWebUser = arg("webUser");
+  String newWebPass = arg("webPass");
+  // 保留已有策略：两个字段均非空才更换 Web 凭据。
   if (newWebUser.length() > 0 && newWebPass.length() > 0) {
-    config.webUser = newWebUser;
-    config.webPass = newWebPass;
+    next->webUser = std::move(newWebUser);
+    next->webPass = std::move(newWebPass);
   }
-  
-  // SMTP 配置
-  config.emailEnabled = server.arg("smtpEn") == "true";
-  String nextSmtpServer = server.arg("smtpServer");
-  nextSmtpServer.trim();
-  config.smtpServer = nextSmtpServer;
-  config.smtpPort = server.arg("smtpPort").toInt();
-  if (config.smtpPort <= 0) config.smtpPort = 465;
-  String nextSmtpUser = server.arg("smtpUser");
-  nextSmtpUser.trim();
-  config.smtpUser = nextSmtpUser;
-  String nextSmtpPass = server.arg("smtpPass");
-  nextSmtpPass.trim();
-  if (nextSmtpPass.length() > 0) {
-    config.smtpPass = nextSmtpPass;
-  }
-  String nextSmtpSendTo = server.arg("smtpSendTo");
-  nextSmtpSendTo.trim();
-  config.smtpSendTo = nextSmtpSendTo;
+  next->emailEnabled = flag("smtpEn");
+  next->smtpServer = arg("smtpServer"); next->smtpServer.trim();
+  next->smtpPort = arg("smtpPort").toInt();
+  if (next->smtpPort <= 0) next->smtpPort = 465;
+  next->smtpUser = arg("smtpUser"); next->smtpUser.trim();
+  String smtpPass = arg("smtpPass"); smtpPass.trim();
+  if (smtpPass.length()) next->smtpPass = std::move(smtpPass);
+  next->smtpSendTo = arg("smtpSendTo"); next->smtpSendTo.trim();
 
   esp_task_wdt_reset();
   yield();
-  
-  // 推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    String prefix = "push" + String(i);
-    config.pushChannels[i].enabled = server.arg(prefix + "en") == "true";
-    config.pushChannels[i].type = (PushType)server.arg(prefix + "type").toInt();
-    config.pushChannels[i].url = server.arg(prefix + "url");
-    config.pushChannels[i].name = server.arg(prefix + "name");
-    config.pushChannels[i].key1 = server.arg(prefix + "k1"); // Telegram Chat ID
-    config.pushChannels[i].key2 = server.arg(prefix + "k2"); // Bark group
-    config.pushChannels[i].customBody = server.arg(prefix + "body");
-  }
-  
-  esp_task_wdt_reset();
-  yield();
-  
-  // MQTT 配置
-  config.mqttEnabled = server.arg("mqttEn") == "true";
-  config.mqttServer = server.arg("mqttServer");
-  config.mqttPort = server.arg("mqttPort").toInt();
-  if (config.mqttPort == 0) config.mqttPort = 1883;
-  config.mqttUser = server.arg("mqttUser");
-  config.mqttPass = server.arg("mqttPass");
-  config.mqttPrefix = server.arg("mqttPrefix");
-  if (config.mqttPrefix.length() == 0) config.mqttPrefix = "sms";
-  config.mqttControlOnly = server.arg("mqttCtrlOnly") == "on" || server.arg("mqttCtrlOnly") == "true"; 
-  
-  // HA 自动发现配置
-  config.mqttHaDiscovery = server.arg("mqttHaDiscovery") == "true";
-  config.mqttHaPrefix = server.arg("mqttHaPrefix");
-  if (config.mqttHaPrefix.length() == 0) config.mqttHaPrefix = "homeassistant";
-  
-  esp_task_wdt_reset();
-  yield();
-  
-  // 黑白名单配置 (全量保存时也更新)
-  if (server.hasArg("filterEn")) { // 只有当前端提交了这些字段才更新
-      config.filterEnabled = server.arg("filterEn") == "true";
-      config.filterIsWhitelist = server.arg("filterIsWhitelist") == "true";
-      config.filterList = server.arg("filterList");
-      config.filterList.replace("\r", "");
-      config.filterList.replace("\n", ","); // 换行转逗号
+    char key[24];
+    PushChannel& channel = next->pushChannels[i];
+    snprintf(key, sizeof(key), "push%den", i); channel.enabled = flag(key);
+    snprintf(key, sizeof(key), "push%dtype", i); channel.type = (PushType)arg(key).toInt();
+    snprintf(key, sizeof(key), "push%durl", i); channel.url = arg(key);
+    snprintf(key, sizeof(key), "push%dname", i); channel.name = arg(key);
+    snprintf(key, sizeof(key), "push%dk1", i); channel.key1 = arg(key);
+    snprintf(key, sizeof(key), "push%dk2", i); channel.key2 = arg(key);
+    snprintf(key, sizeof(key), "push%dbody", i); channel.customBody = arg(key);
   }
 
-  // 定时任务配置 (全量保存时)
-  if (server.hasArg("timerEn")) {
-      config.timerEnabled = server.arg("timerEn") == "true";
-      config.timerType = server.arg("timerType").toInt();
-      config.timerInterval = server.arg("timerInterval").toInt();
-      if (config.timerInterval < 1) config.timerInterval = 1;
-      config.timerPhone = server.arg("timerPhone");
-      config.timerMessage = server.arg("timerMessage");
-      timerIntervalSec = (unsigned long)config.timerInterval * 24UL * 60UL * 60UL;
-  }
-  
-  // 喂狗并保存配置
   esp_task_wdt_reset();
   yield();
-  saveConfig();
+  next->mqttEnabled = flag("mqttEn");
+  next->mqttServer = arg("mqttServer");
+  next->mqttPort = arg("mqttPort").toInt();
+  if (next->mqttPort == 0) next->mqttPort = 1883;
+  next->mqttUser = arg("mqttUser");
+  next->mqttPass = arg("mqttPass");  // MQTT 留空仍按原接口清空，不改变协议。
+  next->mqttPrefix = arg("mqttPrefix");
+  if (next->mqttPrefix.length() == 0) next->mqttPrefix = "sms";
+  next->mqttControlOnly = flag("mqttCtrlOnly", true);
+  next->mqttHaDiscovery = flag("mqttHaDiscovery");
+  next->mqttHaPrefix = arg("mqttHaPrefix");
+  if (next->mqttHaPrefix.length() == 0) next->mqttHaPrefix = "homeassistant";
+
+  if (server.hasArg("filterEn")) {
+    next->filterEnabled = flag("filterEn");
+    next->filterIsWhitelist = flag("filterIsWhitelist");
+    next->filterList = arg("filterList");
+    normalizeConfigList(next->filterList);
+  }
+  // 内容过滤保留三个独立可选字段：省略保留，显式空名单清空。
+  if (server.hasArg("contentFilterEn")) {
+    String value = arg("contentFilterEn");
+    if (value != "true" && value != "false") formOk = false;
+    next->contentFilterEnabled = value == "true";
+  }
+  if (server.hasArg("contentFilterIsWhitelist")) {
+    String value = arg("contentFilterIsWhitelist");
+    if (value != "true" && value != "false") formOk = false;
+    next->contentFilterIsWhitelist = value == "true";
+  }
+  if (server.hasArg("contentFilterList")) {
+    next->contentFilterList = arg("contentFilterList");
+    normalizeConfigList(next->contentFilterList);
+  }
+
+  if (server.hasArg("timerEn")) {
+    next->timerEnabled = flag("timerEn");
+    next->timerType = arg("timerType").toInt();
+    next->timerInterval = arg("timerInterval").toInt();
+    if (next->timerInterval < 1) next->timerInterval = 1;
+    next->timerPhone = arg("timerPhone");
+    next->timerMessage = arg("timerMessage");
+    if ((next->timerType != 0 && next->timerType != 1) ||
+        (next->timerEnabled && next->timerType == 1 &&
+         (!next->timerPhone.length() || strspn(next->timerPhone.c_str(), " \t\r\n\f\v") == next->timerPhone.length() ||
+          !next->timerMessage.length()))) {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"type仅支持0或1，启用短信任务时号码和正文不能为空\"}");
+      return;
+    }
+  }
+  if (!formOk || !configFitsNvs(*next)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"配置字段无效、内存不足或过长；每个持久化字符串最多3999个UTF-8字节\"}");
+    return;
+  }
+
+  // 全量表单总含定时字段；比较规范化后的设置，未变更时保留原起点。
+  const bool timerChanged = next->timerEnabled != config.timerEnabled ||
+                            next->timerType != config.timerType ||
+                            next->timerInterval != config.timerInterval ||
+                            next->timerPhone != config.timerPhone ||
+                            next->timerMessage != config.timerMessage;
+
+  // 移动交换不分配 String。保存失败恢复所有字段和起点，不留下部分 RAM 应用。
+  const uint64_t priorExec = lastTimerExec, priorInterval = timerIntervalSec;
+  std::swap(config, *next);
+  if (timerChanged) resetTimerSchedule();
+  esp_task_wdt_reset();
+  yield();
+  const char* error = nullptr;
+  if (!saveConfig(&error)) {
+    std::swap(config, *next);
+    lastTimerExec = priorExec; timerIntervalSec = priorInterval;
+    sendConfigSaveError(error);
+    return;
+  }
   esp_task_wdt_reset();
   yield();
   configValid = isConfigValid();
@@ -506,56 +530,38 @@ void handleSave() {
 // 处理发送短信请求
 void handleSendSms() {
   if (!checkAuth()) return;
-  
-  // 解析 JSON body (前端 postJ 发送 JSON 格式)
-  String body = server.arg("plain");
-  String phone = "";
-  String content = "";
-  
-  // 简易 JSON 解析
-  int phoneIdx = body.indexOf("\"phone\"");
-  if (phoneIdx >= 0) {
-    int colonIdx = body.indexOf(":", phoneIdx);
-    int startQuote = body.indexOf("\"", colonIdx);
-    int endQuote = body.indexOf("\"", startQuote + 1);
-    if (startQuote >= 0 && endQuote > startQuote) {
-      phone = body.substring(startQuote + 1, endQuote);
-    }
+
+  const int length = server.clientContentLength();
+  if (length < 2 || static_cast<size_t>(length) > JsonInput::MAX_INPUT_BYTES) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON请求长度无效，最多8192字节\"}");
+    return;
   }
-  
-  int contentIdx = body.indexOf("\"content\"");
-  if (contentIdx >= 0) {
-    int colonIdx = body.indexOf(":", contentIdx);
-    int startQuote = body.indexOf("\"", colonIdx);
-    int endQuote = body.indexOf("\"", startQuote + 1);
-    if (startQuote >= 0 && endQuote > startQuote) {
-      content = body.substring(startQuote + 1, endQuote);
-    }
+  const String& body = server.arg("plain");
+  JsonInput input;
+  String phone, content;
+  if (body.length() != static_cast<unsigned int>(length) || !input.parse(body) ||
+      !input.getString("phone", phone) || !input.getString("content", content)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"无效JSON：phone/content须为字符串，最多8192字节\"}");
+    return;
   }
-  
+
   phone.trim();
-  content.trim();
-  
-  bool success = false;
-  String resultMsg = "";
-  
-  if (phone.length() == 0) {
-    resultMsg = "错误：请输入目标号码";
-  } else if (content.length() == 0) {
-    resultMsg = "错误：请输入短信内容";
-  } else {
-    Serial.println("网页端发送短信请求");
-    Serial.println("目标号码: " + phone);
-    Serial.println("短信内容: " + content);
-    
-    success = sendSMS(phone.c_str(), content.c_str());
-    if (success) {
-      stats.smsSent++;
-      saveStats();
-    }
-    resultMsg = success ? "短信发送成功！" : "短信发送失败，请检查模组状态";
+  // 正文不 trim：解码后的空白、换行及引号都是短信内容。
+  if (phone.length() == 0 || content.length() == 0) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"目标号码和短信内容不能为空\"}");
+    return;
   }
-  
+
+  Serial.println("网页端发送短信请求");
+  Serial.print("目标号码: "); Serial.println(phone);
+  Serial.print("短信内容: "); Serial.println(content);
+  bool success = sendSMS(phone.c_str(), content.c_str());
+  if (success) {
+    stats.smsSent++;
+    saveStats();
+  }
+  String resultMsg = success ? "短信发送成功！" : "短信发送失败，请检查模组状态";
+
   String json = "{";
   json += "\"success\":" + String(success ? "true" : "false") + ",";
   json += "\"message\":\"" + resultMsg + "\"";
@@ -567,40 +573,64 @@ void handleSendSms() {
 // 处理定时任务配置保存 (API: /timer)
 void handleTimer() {
   if (!checkAuth()) return;
-  
-  String body = server.arg("plain");
-  
-  config.timerEnabled = body.indexOf("\"enabled\":true") >= 0;
-  
-  // 简易解析 JSON (假设标准格式)
-  // type
-  int typeIdx = body.indexOf("\"type\":");
-  if (typeIdx > 0) config.timerType = body.substring(typeIdx+7).toInt();
-  
-  // interval
-  int intIdx = body.indexOf("\"interval\":");
-  if (intIdx > 0) config.timerInterval = body.substring(intIdx+11).toInt();
-  if (config.timerInterval < 1) config.timerInterval = 1;
-  
-  // phone
-  int phIdx = body.indexOf("\"phone\":\"");
-  if (phIdx > 0) {
-      int end = body.indexOf("\"", phIdx+9);
-      config.timerPhone = body.substring(phIdx+9, end);
+
+  const int length = server.clientContentLength();
+  if (length < 2 || static_cast<size_t>(length) > JsonInput::MAX_INPUT_BYTES) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON请求长度无效，最多8192字节\"}");
+    return;
   }
-  
-  // message
-  int msgIdx = body.indexOf("\"message\":\"");
-  if (msgIdx > 0) {
-      int end = body.indexOf("\"", msgIdx+11);
-      config.timerMessage = body.substring(msgIdx+11, end);
+  const String& body = server.arg("plain");
+  JsonInput input;
+  bool enabled = false;
+  int type = config.timerType, interval = config.timerInterval;
+  String phone, message;
+  if (body.length() != static_cast<unsigned int>(length) || !input.parse(body) || !input.getBool("enabled", enabled) ||
+      (input.has("type") && !input.getInt("type", type)) ||
+      (input.has("interval") && !input.getInt("interval", interval)) ||
+      (input.has("phone") && !input.getString("phone", phone)) ||
+      (input.has("message") && !input.getString("message", message))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"无效JSON或字段类型：enabled须为布尔值，可选type/interval须为整数、phone/message须为字符串，最多8192字节\"}");
+    return;
   }
-  
-  timerIntervalSec = (unsigned long)config.timerInterval * 24UL * 60UL * 60UL;
-  lastTimerExec = millis();
-  saveConfig();
-  
-  String json = "{\"success\":true,\"remain\":" + String(timerIntervalSec) + "}";
+  const bool hasPhone = input.has("phone"), hasMessage = input.has("message");
+  if (hasPhone) phone.trim();
+  // 省略字符串只读引用，保留原值，避免隐式复制分配失败；正文始终不 trim。
+  const String& nextPhone = hasPhone ? phone : config.timerPhone;
+  const String& nextMessage = hasMessage ? message : config.timerMessage;
+  if ((type != 0 && type != 1) ||
+      (enabled && type == 1 && (nextPhone.length() == 0 ||
+       strspn(nextPhone.c_str(), " \t\r\n\f\v") == nextPhone.length() || nextMessage.length() == 0))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"type仅支持0或1，启用短信任务时号码和正文不能为空\"}");
+    return;
+  }
+  if (interval < 1) interval = 1;  // 合法非正整数沿用旧接口的 1 天最小值。
+  if (!configStringFitsNvs(nextPhone) || !configStringFitsNvs(nextMessage)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"定时号码和正文各最多3999个UTF-8字节，未保存\"}");
+    return;
+  }
+
+  // 只备份提供的字符串，不复制省略字段；失败回滚，成功维持原有重置时点。
+  const bool priorEnabled = config.timerEnabled;
+  const int priorType = config.timerType, priorDays = config.timerInterval;
+  const uint64_t priorExec = lastTimerExec, priorInterval = timerIntervalSec;
+  if (hasPhone) std::swap(config.timerPhone, phone);
+  if (hasMessage) std::swap(config.timerMessage, message);
+  config.timerEnabled = enabled;
+  config.timerType = type;
+  config.timerInterval = interval;
+  resetTimerSchedule();
+  const char* error = nullptr;
+  if (!saveConfig(&error)) {
+    if (hasPhone) std::swap(config.timerPhone, phone);
+    if (hasMessage) std::swap(config.timerMessage, message);
+    config.timerEnabled = priorEnabled; config.timerType = priorType; config.timerInterval = priorDays;
+    lastTimerExec = priorExec; timerIntervalSec = priorInterval;
+    sendConfigSaveError(error);
+    return;
+  }
+
+  // /timer 的 remain 沿用完整周期；首页倒计时仍由 timerRemainingSeconds() 计算。
+  String json = "{\"success\":true,\"message\":\"定时任务已保存\",\"remain\":" + String(timerIntervalSec) + "}";
   server.send(200, "application/json", json);
 }
 
@@ -618,19 +648,20 @@ void handleSmsHistory() {
   
   String historyJson = getSmsHistory();
   String callHistoryJson = getCallHistory();
-
-  // 预估大小并 reserve，仅保留单份 smsHistory 避免重复存放导致 OOM (M5)
-  size_t estLen = historyJson.length() + callHistoryJson.length() + 64;
-  String json;
-  json.reserve(estLen);
-  json = "{";
-  json += "\"smsHistory\":";
-  json += historyJson;
-  json += ",\"callHistory\":";
-  json += callHistoryJson;
-  json += "}";
-
-  server.send(200, "application/json", json);
+  if (!historyJson.length() || !callHistoryJson.length()) {
+    server.send(503, "application/json", "{\"success\":false,\"message\":\"历史读取失败，请稍后重试\"}");
+    return;
+  }
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  WebStream output(sendWebChunk);
+  if (!output.text("{\"smsHistory\":") || !output.text(historyJson.c_str()) ||
+      !output.text(",\"callHistory\":") || !output.text(callHistoryJson.c_str()) ||
+      !output.text("}") || !output.flush()) {
+    server.client().stop();
+    return;
+  }
+  server.sendContent("", 0);
 }
 
 // 获取统计信息
@@ -736,57 +767,76 @@ void handleCleanupHistory() {
 // 保存黑白名单配置
 void handleFilterSave() {
   if (!checkAuth()) return;
-  
-  String body = server.arg("plain");
-  // 简单 JSON 解析
-  config.filterEnabled = body.indexOf("\"enabled\":true") >= 0;
-  config.filterIsWhitelist = body.indexOf("\"whitelist\":true") >= 0;
-  
-  // 解析 numbers 数组或字符串
-  int numStart = body.indexOf("\"numbers\":");
-  if (numStart > 0) {
-      int arrStart = body.indexOf("[", numStart);
-      int arrEnd = body.indexOf("]", numStart);
-      if (arrStart > 0 && arrEnd > arrStart) {
-          String arrStr = body.substring(arrStart + 1, arrEnd);
-          // 将 JSON 数组 "a","b" 转换为 a,b 存入 filterList
-          config.filterList = "";
-          int lastQ = -1;
-          while (true) {
-              int startQ = arrStr.indexOf("\"", lastQ + 1);
-              if (startQ < 0) break;
-              int endQ = arrStr.indexOf("\"", startQ + 1);
-              if (endQ < 0) break;
-              if (config.filterList.length() > 0) config.filterList += ",";
-              config.filterList += arrStr.substring(startQ + 1, endQ);
-              lastQ = endQ;
-          }
-      }
+
+  const int length = server.clientContentLength();
+  if (length < 2 || static_cast<size_t>(length) > JsonInput::MAX_INPUT_BYTES) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON请求长度无效，最多8192字节\"}");
+    return;
   }
-  
-  saveConfig();
+  const String& body = server.arg("plain");
+  JsonInput input;
+  bool enabled = false, whitelist = false;
+  String numbers;
+  if (body.length() != static_cast<unsigned int>(length) || !input.parse(body) || !input.getBool("enabled", enabled) ||
+      !input.getBool("whitelist", whitelist) || !input.getStringList("numbers", numbers)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"无效JSON：enabled/whitelist须为布尔值，numbers须为字符串或字符串数组，最多8192字节\"}");
+    return;
+  }
+
+  // 仅规范化已解码文本的分隔符，不再把引号或方括号解释为 JSON。
+  normalizeConfigList(numbers);
+  if (!configStringFitsNvs(numbers)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"号码名单最多3999个UTF-8字节，未保存\"}");
+    return;
+  }
+  const bool priorEnabled = config.filterEnabled, priorWhitelist = config.filterIsWhitelist;
+  std::swap(config.filterList, numbers);
+  config.filterEnabled = enabled;
+  config.filterIsWhitelist = whitelist;
+  const char* error = nullptr;
+  if (!saveConfig(&error)) {
+    std::swap(config.filterList, numbers);
+    config.filterEnabled = priorEnabled; config.filterIsWhitelist = priorWhitelist;
+    sendConfigSaveError(error);
+    return;
+  }
   server.send(200, "application/json", "{\"success\":true,\"message\":\"号码名单已更新\"}");
 }
 
 // 保存内容关键词过滤配置
 void handleContentFilterSave() {
   if (!checkAuth()) return;
-  
-  String body = server.arg("plain");
-  // 简单 JSON 解析
-  config.contentFilterEnabled = body.indexOf("\"enabled\":true") >= 0;
-  config.contentFilterIsWhitelist = body.indexOf("\"whitelist\":true") >= 0;
-  
-  // 解析 keywords 字符串
-  int kwStart = body.indexOf("\"keywords\":\"");
-  if (kwStart > 0) {
-    int valStart = kwStart + 12;  // 跳过 "keywords":"
-    int valEnd = body.indexOf("\"", valStart);
-    if (valEnd > valStart) {
-      config.contentFilterList = body.substring(valStart, valEnd);
-    }
+
+  const int length = server.clientContentLength();
+  if (length < 2 || static_cast<size_t>(length) > JsonInput::MAX_INPUT_BYTES) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON请求长度无效，最多8192字节\"}");
+    return;
   }
-  
-  saveConfig();
+  const String& body = server.arg("plain");
+  JsonInput input;
+  bool enabled = false, whitelist = false;
+  String keywords;
+  if (body.length() != static_cast<unsigned int>(length) || !input.parse(body) || !input.getBool("enabled", enabled) ||
+      !input.getBool("whitelist", whitelist) || !input.getString("keywords", keywords)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"无效JSON：enabled/whitelist须为布尔值，keywords须为字符串（可为空），最多8192字节\"}");
+    return;
+  }
+
+  normalizeConfigList(keywords);
+  if (!configStringFitsNvs(keywords)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"关键词名单最多3999个UTF-8字节，未保存\"}");
+    return;
+  }
+  const bool priorEnabled = config.contentFilterEnabled, priorWhitelist = config.contentFilterIsWhitelist;
+  std::swap(config.contentFilterList, keywords);
+  config.contentFilterEnabled = enabled;
+  config.contentFilterIsWhitelist = whitelist;
+  const char* error = nullptr;
+  if (!saveConfig(&error)) {
+    std::swap(config.contentFilterList, keywords);
+    config.contentFilterEnabled = priorEnabled; config.contentFilterIsWhitelist = priorWhitelist;
+    sendConfigSaveError(error);
+    return;
+  }
   server.send(200, "application/json", "{\"success\":true,\"message\":\"关键词过滤已更新\"}");
 }

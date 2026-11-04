@@ -43,6 +43,7 @@
 #include "web_handlers.h"
 #include "call_handler.h"
 #include "sms_handler.h"
+#include "modem_handler.h"
 #include "push_service.h"
 #include "mqtt_handler.h"
 
@@ -57,8 +58,8 @@ WebServer server(80);
 
 bool configValid = false;
 unsigned long lastPrintTime = 0;
-unsigned long lastTimerExec = 0;
-unsigned long timerIntervalSec = 0;  // 使用秒避免溢出（支持到 136 年）
+uint64_t lastTimerExec = 0;     // esp_timer 单调毫秒，启动/保存计划后重新计时
+uint64_t timerIntervalSec = 0;  // 64 位秒，完整支持正 int 天数的换算
 
 char serialBuf[SERIAL_BUFFER_SIZE];
 int serialBufLen = 0;
@@ -102,8 +103,15 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.begin(115200);
+  const size_t rxBufferSize = Serial1.setRxBufferSize(SERIAL_RX_BUFFER_SIZE);
+  if (rxBufferSize < SERIAL_RX_BUFFER_SIZE) {
+    Serial.printf("错误: UART RX缓冲配置失败，请求=%u，返回=%u\n",
+                  (unsigned int)SERIAL_RX_BUFFER_SIZE, (unsigned int)rxBufferSize);
+  }
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
-  Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);
+  if (!Serial1) {
+    Serial.println("错误: UART初始化/接收缓冲分配失败，模组串口不可用");
+  }
   
   // 初始化长短信缓存
   initConcatBuffer();
@@ -284,7 +292,8 @@ void setup() {
   // MQTT 初始化
   initMqttTopics();
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1024);
+  setModemIdleHook(serviceMqtt);
+  if (config.mqttEnabled && !ensureMqttBufferSize(MQTT_RECEIVE_BUFFER_BYTES)) Serial.println("MQTT缓冲初始化失败，重连前重试");
   if (config.mqttEnabled && config.mqttServer.length() > 0) {
     mqttClient.setServer(config.mqttServer.c_str(), config.mqttPort);
     mqttReconnect();
@@ -321,9 +330,15 @@ void setup() {
 // ========== loop 函数 ==========
 void handleDebugSerialCommand() {
   static String debugLine = "";
+  static bool discardDebugLine = false;
 
   while (Serial.available()) {
     char c = Serial.read();
+
+    if (discardDebugLine) {
+      if (c == '\n') discardDebugLine = false;
+      continue;
+    }
 
     if (c == '\r') {
       continue;
@@ -342,19 +357,69 @@ void handleDebugSerialCommand() {
         );
         Serial.println("TESTPUSH 调试命令处理完成");
       } else if (debugLine.length() > 0) {
-        // 非调试命令继续作为 AT 命令透传到模组
-        Serial1.println(debugLine);
+        String normalized = debugLine;
+        bool copied = normalized.length() == debugLine.length();
+        normalized.toUpperCase();
+        normalized.replace(" ", "");
+        normalized.replace("\t", "");
+        // 仅单条 AT；忽略大小写/空白检查，不能从调试口开启短信输入态。
+        bool safeCommand = copied && normalized.startsWith("AT") && normalized.indexOf(';') < 0 &&
+                           normalized.indexOf("+CMGS") < 0 && normalized.indexOf("+CMGW") < 0 &&
+                           normalized.indexOf("+CMGC") < 0 && normalized.indexOf("+CNMA") < 0;
+        if (!safeCommand) {
+          Serial.println("调试口仅支持单条普通 AT，禁止 CMGS/CMGW/CMGC/CNMA 输入态命令；发短信请使用发送接口");
+        } else {
+          String response;
+          bool isPing = normalized.startsWith("AT+MPING=");
+          ModemResult result = runModemCommand(debugLine.c_str(), isPing ? 35000 : 5000,
+                                               &response, nullptr, isPing ? "+MPING:" : nullptr);
+          Serial.print(response);
+          if (result == ModemResult::Ok) Serial.println("[AT] OK");
+          else if (result == ModemResult::Timeout) Serial.println("[AT] 超时");
+          else if (result == ModemResult::Busy) Serial.println("[AT] 模组忙，命令未发送");
+          else Serial.printf("[AT] 失败 (result=%d)\n", (int)result);
+        }
       }
 
       debugLine = "";
       return;
     }
 
-    debugLine += c;
-    if (debugLine.length() > 200) {
+    if (((uint8_t)c < 0x20 && c != '\t') || (uint8_t)c == 0x7F) {
+      Serial.println("串口调试命令含控制字节，已丢弃");
+      debugLine = "";
+      discardDebugLine = true;
+      continue;
+    }
+    if (debugLine.length() >= 200 || !debugLine.concat(c)) {
       Serial.println("串口调试命令过长，已丢弃");
       debugLine = "";
+      discardDebugLine = true;  // 丢弃到换行，不能把超长命令尾部当作下一条 AT。
     }
+  }
+}
+
+void processTimerTask() {
+  if (!config.timerEnabled || timerIntervalSec == 0 || !configValid) return;
+  const uint64_t now = monotonicMillis();
+  if ((now - lastTimerExec) / 1000ULL < timerIntervalSec) return;
+
+  // 执行前推进起点；成功、错误、超时都等待下一个完整周期，不补发/忙重试。
+  lastTimerExec = now;
+  if (config.timerType == 0) {
+    if (sendATandWaitOK("AT+CGACT=1,1", 10000)) {
+      sendATandWaitOK("AT+MPING=1,\"8.8.8.8\",4,32,255", 30000);
+      modemDelay(2000);
+      sendATandWaitOK("AT+CGACT=0,1", 5000);
+      publishMqttStatus("active_ping");
+    }
+  } else if (config.timerType == 1 && config.timerPhone.length() > 0) {
+    const bool success = sendSMS(config.timerPhone.c_str(), config.timerMessage.c_str());
+    if (success) {
+      statsIncrementSmsSent();
+      saveStats();
+    }
+    publishMqttSmsSent(config.timerPhone.c_str(), config.timerMessage.c_str(), success);
   }
 }
 
@@ -371,28 +436,8 @@ void loop() {
     }
   }
   
-  // 检查定时任务
-  // 注释 (M1): (millis() - lastTimerExec) 利用 unsigned long 回绕特性，49.7 天溢出后依然安全正确
-  if (config.timerEnabled && timerIntervalSec > 0 && configValid) {
-    unsigned long elapsedSec = (millis() - lastTimerExec) / 1000;
-    if (elapsedSec >= timerIntervalSec) {
-      lastTimerExec = millis();
-      
-      if (config.timerType == 0) {
-        if (sendATandWaitOK("AT+CGACT=1,1", 10000)) {
-          sendATandWaitOK("AT+MPING=1,\"8.8.8.8\",4,32,255", 30000);
-          delay(2000);
-          sendATandWaitOK("AT+CGACT=0,1", 5000);
-          publishMqttStatus("active_ping");
-        }
-      } else if (config.timerType == 1 && config.timerPhone.length() > 0) {
-        sendSMS(config.timerPhone.c_str(), config.timerMessage.c_str());
-        stats.smsSent++;
-        saveStats();
-        publishMqttSmsSent(config.timerPhone.c_str(), config.timerMessage.c_str(), true);
-      }
-    }
-  }
+  // 长周期使用 64 位单调毫秒；短周期 millis() 的无符号差值比较保持不变。
+  processTimerTask();
   
   // MQTT 处理
   if (config.mqttEnabled && WiFi.status() == WL_CONNECTED) {
@@ -415,7 +460,7 @@ void loop() {
         lastMqttLoopSampleLog = mqttStepStart;
         Serial.println("[耗时] START loop-MQTT.loop");
       }
-      mqttClient.loop();
+      serviceMqtt();
       unsigned long mqttLoopElapsed = millis() - mqttStepStart;
       if (logMqttLoopSample || mqttLoopElapsed > 100) {
         Serial.printf("[耗时] END loop-MQTT.loop: elapsed=%lums\n", mqttLoopElapsed);

@@ -2,146 +2,248 @@
  * sms_handler.ino - 短信处理函数实现
  */
 
-// 清理短信内容（去除自动填充标识符）
+#include "sms_handler.h"
+#include "modem_handler.h"
+#include <limits.h>
+
+static void expireSmsPduWait();
+static void processPreparedSmsContent(const char* sender, const String& cleanedText, const String& formattedTime);
+
+// 不保留已转发正文；固定数组只存数字地址、逐段 SCTS/正文的 64 位签名。
+// 活跃槽仍保留疑似重放正文，直到收齐或超时，避免复用参考号且前缀相同的新短信丢段。
+static_assert(MAX_CONCAT_PARTS <= 16, "concat masks must hold every segment");
+struct SmsRecentConcat {
+  bool inUse;
+  char sender[22];  // 最多 20 位数字及 '+'、NUL
+  int refNumber;
+  int totalParts;
+  unsigned long completedAt;
+  uint32_t id;
+  uint16_t forwardedMask;
+  uint64_t signatures[MAX_CONCAT_PARTS];
+  uint64_t timestamps[MAX_CONCAT_PARTS];
+};
+struct SmsConcatReceiveState {
+  uint64_t signatures[MAX_CONCAT_PARTS];
+  uint64_t timestamps[MAX_CONCAT_PARTS];
+  uint16_t forwardedMask;
+  bool replayOnly;
+  int recentSlot;
+  uint32_t recentId;
+};
+static SmsRecentConcat smsRecentConcat[SMS_CONCAT_RECENT_CAPACITY];
+static SmsConcatReceiveState smsConcatState[MAX_CONCAT_MESSAGES];
+static uint32_t smsRecentConcatId = 0;
+static_assert(sizeof(smsRecentConcat) + sizeof(smsConcatState) <= 2048, "concat dedup metadata exceeds 2 KiB");
+
+static uint64_t smsConcatFingerprint(const String& value, uint64_t hash = 0xCBF29CE484222325ULL) {
+  for (unsigned int i = 0; i < value.length(); i++) {
+    hash = (hash ^ (uint8_t)value.charAt(i)) * 0x100000001B3ULL;
+  }
+  return hash;
+}
+
+static void expireRecentConcatSms() {
+  unsigned long now = millis();
+  for (int i = 0; i < SMS_CONCAT_RECENT_CAPACITY; i++) {
+    if (smsRecentConcat[i].inUse && now - smsRecentConcat[i].completedAt >= SMS_CONCAT_RECENT_MS) {
+      smsRecentConcat[i].inUse = false;
+    }
+  }
+}
+
+static uint16_t receivedConcatMask(int slot) {
+  uint16_t mask = 0;
+  for (int i = 0; i < concatBuffer[slot].totalParts; i++) {
+    if (concatBuffer[slot].parts[i].valid) mask |= (uint16_t)(1U << i);
+  }
+  return mask;
+}
+
+// 只在收到分段时重新分类；缓存过期不能把之前已确认的重放变成超时通知。
+static void classifyConcatReplay(int slot) {
+  expireRecentConcatSms();
+  auto& state = smsConcatState[slot];
+  const auto& message = concatBuffer[slot];
+  uint16_t received = receivedConcatMask(slot);
+  int best = -1, bestOverlap = -1;
+  for (int i = 0; i < SMS_CONCAT_RECENT_CAPACITY; i++) {
+    const auto& recent = smsRecentConcat[i];
+    if (!recent.inUse || recent.refNumber != message.refNumber || recent.totalParts != message.totalParts ||
+        !message.sender.equals(recent.sender)) continue;
+    bool matches = true;
+    int overlap = 0;
+    for (int part = 0; part < message.totalParts && matches; part++) {
+      uint16_t bit = (uint16_t)(1U << part);
+      if (!(received & bit)) continue;
+      if (recent.forwardedMask & bit) {
+        matches = state.signatures[part] == recent.signatures[part];
+        overlap++;
+      } else {
+        // 超时后未见过的段只能按同一 key 且与已发段相同的 SCTS 关联。
+        // 不同 SCTS 或已发段正文冲突均视为新短信，不按参考号一概屏蔽。
+        matches = false;
+        for (int known = 0; known < message.totalParts; known++) {
+          if ((recent.forwardedMask & (1U << known)) && state.timestamps[part] == recent.timestamps[known]) {
+            matches = true;
+            break;
+          }
+        }
+      }
+    }
+    if (matches && overlap > bestOverlap) { best = i; bestOverlap = overlap; }
+  }
+  state.recentSlot = best;
+  state.recentId = best < 0 ? 0 : smsRecentConcat[best].id;
+  state.forwardedMask = best < 0 ? 0 : smsRecentConcat[best].forwardedMask;
+  state.replayOnly = received != 0 && (received & ~state.forwardedMask) == 0;
+  if (best >= 0) {
+    // 保存已发但本轮未收到的签名，使迟到段等待期间的缓存过期/淘汰不重发旧正文。
+    for (int part = 0; part < message.totalParts; part++) {
+      if ((state.forwardedMask & (1U << part)) && !(received & (1U << part))) {
+        state.signatures[part] = smsRecentConcat[best].signatures[part];
+        state.timestamps[part] = smsRecentConcat[best].timestamps[part];
+      }
+    }
+  }
+}
+
+static void rememberForwardedConcat(int slot) {
+  expireRecentConcatSms();
+  const auto& state = smsConcatState[slot];
+  const auto& message = concatBuffer[slot];
+  if (message.sender.length() >= sizeof(smsRecentConcat[0].sender)) return;
+  int target = state.recentSlot;
+  bool updating = target >= 0 && target < SMS_CONCAT_RECENT_CAPACITY &&
+                  smsRecentConcat[target].inUse && smsRecentConcat[target].id == state.recentId;
+  if (!updating) {
+    target = 0;
+    unsigned long now = millis();
+    for (int i = 0; i < SMS_CONCAT_RECENT_CAPACITY; i++) {
+      if (!smsRecentConcat[i].inUse) { target = i; break; }
+      if (now - smsRecentConcat[i].completedAt > now - smsRecentConcat[target].completedAt) target = i;
+    }
+    smsRecentConcat[target] = SmsRecentConcat{};
+    smsRecentConcat[target].completedAt = now;
+    smsRecentConcat[target].id = ++smsRecentConcatId;
+  }
+  auto& recent = smsRecentConcat[target];
+  recent.inUse = true;
+  memcpy(recent.sender, message.sender.c_str(), message.sender.length() + 1);
+  recent.refNumber = message.refNumber;
+  recent.totalParts = message.totalParts;
+  recent.forwardedMask = state.forwardedMask | receivedConcatMask(slot);
+  for (int part = 0; part < message.totalParts; part++) {
+    if (recent.forwardedMask & (1U << part)) {
+      recent.signatures[part] = state.signatures[part];
+      recent.timestamps[part] = state.timestamps[part];
+    }
+  }
+  // 更新迟到段不延长原记录的期限；纯重复段从不调用此函数。
+}
+
+static void finishConcatSms(int slot) {
+  if (slot < 0 || slot >= MAX_CONCAT_MESSAGES || !concatBuffer[slot].inUse) return;
+  if (concatBuffer[slot].receivedParts == 0) {
+    clearConcatSlot(slot);  // 缓存首段失败不能生成只有占位符的短信。
+    return;
+  }
+  if (smsConcatState[slot].replayOnly) {
+    Serial.println("已转发长短信的重复分段，跳过通知");
+    clearConcatSlot(slot);
+    return;
+  }
+  String fullText = assembleConcatSms(slot);
+  if (fullText.length() == 0) {
+    // 合并失败不登记已转发；保留正文供重投触发或下一个超时周期重试，避免忙循环。
+    concatBuffer[slot].firstPartTime = millis();
+    return;
+  }
+  String sender = concatBuffer[slot].sender;
+  String timestamp = concatBuffer[slot].timestamp;
+  if (sender.length() == 0 || sender.length() != concatBuffer[slot].sender.length() ||
+      timestamp.length() == 0 || timestamp.length() != concatBuffer[slot].timestamp.length()) {
+    Serial.printf("[sms] ERROR: concat_snapshot_allocation_failed ref=%d; retry pending\n", concatBuffer[slot].refNumber);
+    concatBuffer[slot].firstPartTime = millis();
+    return;
+  }
+  rememberForwardedConcat(slot);
+  clearConcatSlot(slot);  // 先记录并释放，再进入历史/转发回调，避免重入重复发送。
+  processPreparedSmsContent(sender.c_str(), fullText, timestamp);
+}
+
+// PDU 解码结果已由 TP-UDL 界定正文；AT 行由串口层分离，不能猜测并删除正文尾行。
 String cleanSmsContent(const String& text) {
-  String cleaned = text;
-  
-  // 去除开头的 <#> 标记
-  if (cleaned.startsWith("<#>")) {
-    cleaned = cleaned.substring(3);
-    cleaned.trim();
-  }
-  
-  // 去除末尾的 hash 标识（以 / 开头的随机字符串）
-  int slashIdx = cleaned.lastIndexOf('/');
-  if (slashIdx > 0) {
-    String suffix = cleaned.substring(slashIdx + 1);
-    suffix.trim();
-    // 检查是否是自动填充标识（全是字母数字，长度在6-15之间）
-    bool isAutoFillCode = suffix.length() >= 6 && suffix.length() <= 15;
-    for (unsigned int i = 0; i < suffix.length() && isAutoFillCode; i++) {
-      char c = suffix.charAt(i);
-      if (!isalnum(c)) isAutoFillCode = false;
-    }
-    if (isAutoFillCode) {
-      cleaned = cleaned.substring(0, slashIdx);
-      cleaned.trim();
-    }
-  }
-  
-  // 去除末尾单独的随机字符串（换行后的字母数字串）
-  int lastNewline = cleaned.lastIndexOf('\n');
-  if (lastNewline > 0) {
-    String lastLine = cleaned.substring(lastNewline + 1);
-    lastLine.trim();
-    // 检查是否是自动填充标识
-    bool isAutoFillCode = lastLine.length() >= 6 && lastLine.length() <= 15;
-    for (unsigned int i = 0; i < lastLine.length() && isAutoFillCode; i++) {
-      char c = lastLine.charAt(i);
-      if (!isalnum(c)) isAutoFillCode = false;
-    }
-    if (isAutoFillCode) {
-      cleaned = cleaned.substring(0, lastNewline);
-      cleaned.trim();
-    }
-  }
-  
-  return cleaned;
+  return text;
 }
 
-// 清理可能破坏 JSON / Web / MQTT 的控制字符，尽量保留可见文本
-String sanitizeTextPayload(const String& text) {
-  String sanitized = "";
-  sanitized.reserve(text.length());
-
-  for (unsigned int i = 0; i < text.length(); i++) {
-    uint8_t c = (uint8_t)text.charAt(i);
-
-    if (c == '\r') {
-      continue;
-    }
-
-    if (c == '\n' || c == '\t' || c >= 0x20) {
-      sanitized += (char)c;
-    }
+static int smsDaysInMonth(int year, int month) {
+  static const uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 1 || month > 12) return 0;
+  if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) {
+    return 29;
   }
-
-  return sanitized;
+  return days[month - 1];
 }
 
-// 格式化时间戳（从 PDU 格式转为可读格式，转换为中国时区 UTC+8）
-// 输入: 25121615142620 (YYMMDDHHMMSSZZ) 其中 ZZ 是时区偏移（以15分钟为单位）
-// 输出: 2025-12-16 15:14:26
+static bool readSmsDecimal(const String& value, int start, int count, int& result) {
+  if (start < 0 || count < 1 || start + count > (int)value.length()) return false;
+  result = 0;
+  for (int i = start; i < start + count; i++) {
+    char c = value.charAt(i);
+    if (c < '0' || c > '9') return false;
+    result = result * 10 + (c - '0');
+  }
+  return true;
+}
+
+// pdulib 0.5.x 输出 14 字符：每个 SCTS 字节的低/高半字节分别加 '0'。
+// 时区低半字节的 bit 3 是负号，因此负时区可能含 ':' 等字符，不能用 toInt()。
+// 归一为 UTC+8 的 YYYY-MM-DD HH:MM:SS；19 字符输入视为已归一，非法输入返回空串。
 String formatTimestamp(const String& pduTimestamp) {
-  // 已经是可读格式（如 2026-04-18 12:34:56）时直接返回
-  if (pduTimestamp.indexOf('-') >= 0 && pduTimestamp.indexOf(':') >= 0) {
-    return pduTimestamp;
+  if (pduTimestamp.length() == 19) {
+    return isTimestampLikelyValidSms(pduTimestamp) ? pduTimestamp : String("");
+  }
+  if (pduTimestamp.length() != 14) return "";
+
+  int year, month, day, hour, minute, second;
+  if (!readSmsDecimal(pduTimestamp, 0, 2, year) ||
+      !readSmsDecimal(pduTimestamp, 2, 2, month) ||
+      !readSmsDecimal(pduTimestamp, 4, 2, day) ||
+      !readSmsDecimal(pduTimestamp, 6, 2, hour) ||
+      !readSmsDecimal(pduTimestamp, 8, 2, minute) ||
+      !readSmsDecimal(pduTimestamp, 10, 2, second)) return "";
+  year += 2000;
+  if (day < 1 || day > smsDaysInMonth(year, month) ||
+      hour > 23 || minute > 59 || second > 59) return "";
+
+  int tzTens = pduTimestamp.charAt(12) - '0';
+  int tzUnits = pduTimestamp.charAt(13) - '0';
+  if (tzTens < 0 || tzTens > 15 || tzUnits < 0 || tzUnits > 9) return "";
+  int tzQuarters = (tzTens & 7) * 10 + tzUnits;
+  if (tzTens & 8) tzQuarters = -tzQuarters;
+  int totalMinutes = hour * 60 + minute + (32 - tzQuarters) * 15;
+
+  while (totalMinutes < 0) {
+    totalMinutes += 24 * 60;
+    if (--day < 1) {
+      if (--month < 1) { month = 12; year--; }
+      day = smsDaysInMonth(year, month);
+    }
+  }
+  while (totalMinutes >= 24 * 60) {
+    totalMinutes -= 24 * 60;
+    if (++day > smsDaysInMonth(year, month)) {
+      day = 1;
+      if (++month > 12) { month = 1; year++; }
+    }
   }
 
-  if (pduTimestamp.length() < 12) return pduTimestamp;
-  
-  int year = 2000 + pduTimestamp.substring(0, 2).toInt();
-  int month = pduTimestamp.substring(2, 4).toInt();
-  int day = pduTimestamp.substring(4, 6).toInt();
-  int hour = pduTimestamp.substring(6, 8).toInt();
-  int minute = pduTimestamp.substring(8, 10).toInt();
-  int second = pduTimestamp.substring(10, 12).toInt();
-  
-  // 解析时区偏移（最后两位，以15分钟为单位，可能带符号）
-  // PDU 时区格式：正数表示 UTC+，负数表示 UTC-
-  int tzOffset = 0;
-  if (pduTimestamp.length() >= 14) {
-    String tzStr = pduTimestamp.substring(12, 14);
-    tzOffset = tzStr.toInt();
-    // 检查是否为负数（最高位为1表示负数，但通常以十六进制表示）
-    // 一般情况下直接用整数值，中国是 +8 小时 = +32（32*15=480分钟=8小时）
-  }
-  
-  // 中国时区目标偏移：UTC+8 = 32 (32 * 15分钟 = 480分钟 = 8小时)
-  const int TARGET_TZ = 32;
-  int tzDiff = TARGET_TZ - tzOffset;  // 需要调整的时区差（以15分钟为单位）
-  
-  // 如果时区偏移不是中国时区，进行转换
-  if (tzDiff != 0) {
-    // 转换为总分钟数进行计算
-    int totalMinutes = hour * 60 + minute;
-    totalMinutes += tzDiff * 15;  // 加上时区差异（分钟）
-    
-    // 处理日期进位/退位
-    while (totalMinutes < 0) {
-      totalMinutes += 24 * 60;
-      day--;
-    }
-    while (totalMinutes >= 24 * 60) {
-      totalMinutes -= 24 * 60;
-      day++;
-    }
-    
-    // 简单处理月份边界（不做完整的日期计算）
-    int daysInMonth[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    // 闰年判断
-    if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
-      daysInMonth[2] = 29;
-    }
-    
-    if (day < 1) {
-      month--;
-      if (month < 1) { month = 12; year--; }
-      day = daysInMonth[month];
-    } else if (day > daysInMonth[month]) {
-      day = 1;
-      month++;
-      if (month > 12) { month = 1; year++; }
-    }
-    
-    hour = totalMinutes / 60;
-    minute = totalMinutes % 60;
-  }
-  
-  // 格式化输出
   char buf[20];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, second);
-  return String(buf);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           year, month, day, totalMinutes / 60, totalMinutes % 60, second);
+  String result(buf);
+  return isTimestampLikelyValidSms(result) ? result : String("");
 }
 
 // 提取验证码（用于邮件主题）
@@ -168,32 +270,36 @@ String extractVerifyCode(const String& text) {
 // 初始化长短信缓存
 void initConcatBuffer() {
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
-    concatBuffer[i].inUse = false;
-    concatBuffer[i].receivedParts = 0;
-    for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
-      concatBuffer[i].parts[j].valid = false;
-      concatBuffer[i].parts[j].text = "";
-    }
+    clearConcatSlot(i);
   }
+  for (int i = 0; i < SMS_CONCAT_RECENT_CAPACITY; i++) smsRecentConcat[i] = SmsRecentConcat{};
+  smsRecentConcatId = 0;
 }
 
 // 查找或创建长短信缓存槽位
 int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
+  if (!sender || refNumber < 0 || refNumber > 0xFFFF || totalParts < 2 || totalParts > MAX_CONCAT_PARTS) return -1;
   // 先查找是否已存在
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (concatBuffer[i].inUse && 
         concatBuffer[i].refNumber == refNumber &&
         concatBuffer[i].sender.equals(sender)) {
-      return i;
+      // 同一参考号/发送者的总段数不能中途改变，避免提前合并或丢段。
+      return concatBuffer[i].totalParts == totalParts ? i : -1;
     }
   }
   
   // 查找空闲槽位
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (!concatBuffer[i].inUse) {
+      clearConcatSlot(i);
+      concatBuffer[i].sender = sender;
+      if (concatBuffer[i].sender.length() != strlen(sender)) {
+        Serial.printf("[sms] ERROR: concat_sender_allocation_failed ref=%d; awaiting retransmission\n", refNumber);
+        return -1;
+      }
       concatBuffer[i].inUse = true;
       concatBuffer[i].refNumber = refNumber;
-      concatBuffer[i].sender = String(sender);
       concatBuffer[i].totalParts = totalParts;
       concatBuffer[i].receivedParts = 0;
       concatBuffer[i].firstPartTime = millis();
@@ -207,19 +313,25 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
   
   // 没有空闲槽位，查找最老的槽位覆盖
   int oldestSlot = 0;
-  unsigned long oldestTime = concatBuffer[0].firstPartTime;
+  unsigned long now = millis();
+  unsigned long oldestAge = now - concatBuffer[0].firstPartTime;
   for (int i = 1; i < MAX_CONCAT_MESSAGES; i++) {
-    if (concatBuffer[i].firstPartTime < oldestTime) {
-      oldestTime = concatBuffer[i].firstPartTime;
+    if (now - concatBuffer[i].firstPartTime > oldestAge) {
+      oldestAge = now - concatBuffer[i].firstPartTime;
       oldestSlot = i;
     }
   }
   
   // 覆盖最老的槽位
   Serial.println("长短信缓存已满，覆盖最老的槽位");
+  clearConcatSlot(oldestSlot);
+  concatBuffer[oldestSlot].sender = sender;
+  if (concatBuffer[oldestSlot].sender.length() != strlen(sender)) {
+    Serial.printf("[sms] ERROR: concat_sender_allocation_failed ref=%d; awaiting retransmission\n", refNumber);
+    return -1;
+  }
   concatBuffer[oldestSlot].inUse = true;
   concatBuffer[oldestSlot].refNumber = refNumber;
-  concatBuffer[oldestSlot].sender = String(sender);
   concatBuffer[oldestSlot].totalParts = totalParts;
   concatBuffer[oldestSlot].receivedParts = 0;
   concatBuffer[oldestSlot].firstPartTime = millis();
@@ -230,33 +342,46 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
   return oldestSlot;
 }
 
-// 合并长短信各分段
-String assembleConcatSms(int slot) {
-  if (slot < 0 || slot >= MAX_CONCAT_MESSAGES || !concatBuffer[slot].inUse) return "";
-  int partsToAssemble = concatBuffer[slot].totalParts;
-  if (partsToAssemble < 1) partsToAssemble = 1;
-  if (partsToAssemble > MAX_CONCAT_PARTS) partsToAssemble = MAX_CONCAT_PARTS;
-
-  // 预估合并总长度并 reserve 减少内存碎片 (M5)
+// 两遍遍历：先精确计算 UTF-8 字节数，再检查每次追加；占位符不构造临时 String。
+static bool appendPendingConcatContent(int slot, String& result) {
+  const auto& message = concatBuffer[slot];
   size_t totalLen = 0;
-  for (int i = 0; i < partsToAssemble; i++) {
-    if (concatBuffer[slot].parts[i].valid) {
-      totalLen += concatBuffer[slot].parts[i].text.length();
-    } else {
-      totalLen += 20; // 缺失分段占位符
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1 && !result.reserve(totalLen)) return false;
+    for (int i = 0; i < message.totalParts; i++) {
+      const auto& part = message.parts[i];
+      bool forwarded = smsConcatState[slot].forwardedMask & (1U << i);
+      const char* content = part.text.c_str();
+      size_t length = part.text.length();
+      char placeholder[32];
+      if (forwarded || !part.valid) {
+        int written = snprintf(placeholder, sizeof(placeholder),
+                               forwarded ? "[已转发分段%d]" : "[缺失分段%d]", i + 1);
+        if (written < 0 || (size_t)written >= sizeof(placeholder)) return false;
+        content = placeholder;
+        length = (size_t)written;
+      }
+      if (length == 0) return false;  // valid 段的正文不得因复制失败变为空串。
+      if (pass == 0) {
+        if (length > UINT_MAX - totalLen) return false;
+        totalLen += length;
+      } else if (!result.concat(content, length)) {
+        return false;
+      }
     }
   }
+  return result.length() == totalLen;
+}
 
+// 合并失败返回空串，绝不把部分结果交给转发/去重提交路径。
+String assembleConcatSms(int slot) {
+  if (slot < 0 || slot >= MAX_CONCAT_MESSAGES || !concatBuffer[slot].inUse ||
+      concatBuffer[slot].totalParts < 2 || concatBuffer[slot].totalParts > MAX_CONCAT_PARTS ||
+      concatBuffer[slot].receivedParts == 0) return "";
   String result;
-  result.reserve(totalLen + 16);
-  for (int i = 0; i < partsToAssemble; i++) {
-    if (concatBuffer[slot].parts[i].valid) {
-      result += concatBuffer[slot].parts[i].text;
-    } else {
-      result += "[缺失分段";
-      result += String(i + 1);
-      result += "]";
-    }
+  if (!appendPendingConcatContent(slot, result)) {
+    Serial.printf("[sms] ERROR: concat_assembly_allocation_failed ref=%d; retry pending\n", concatBuffer[slot].refNumber);
+    return "";
   }
   return result;
 }
@@ -264,6 +389,8 @@ String assembleConcatSms(int slot) {
 // 清空长短信槽位（增加边界安全检查）
 void clearConcatSlot(int slot) {
   if (slot < 0 || slot >= MAX_CONCAT_MESSAGES) return;
+  smsConcatState[slot] = SmsConcatReceiveState{};
+  smsConcatState[slot].recentSlot = -1;
   concatBuffer[slot].inUse = false;
   concatBuffer[slot].receivedParts = 0;
   concatBuffer[slot].sender = "";
@@ -276,27 +403,20 @@ void clearConcatSlot(int slot) {
 
 // 检查长短信超时并转发
 void checkConcatTimeout() {
-  unsigned long now = millis();
+  expireSmsPduWait();
+  expireRecentConcatSms();
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (concatBuffer[i].inUse) {
-      // 注释 (M1): 无符号整型差值 (now - firstPartTime) 在 32 位溢出回绕时依然正确
+      // 每槽重新取时钟：前一个转发回调可能耗时/重入；无符号差值仍保证回绕安全。
+      unsigned long now = millis();
       if (now - concatBuffer[i].firstPartTime >= CONCAT_TIMEOUT_MS) {
-        Serial.println("长短信超时，强制转发不完整消息");
+        Serial.println("长短信等待超时，检查待转发分段");
         Serial.printf("  参考号: %d, 已收到: %d/%d\n", 
                       concatBuffer[i].refNumber,
                       concatBuffer[i].receivedParts,
                       concatBuffer[i].totalParts);
         
-        // 合并已收到的分段
-        String fullText = assembleConcatSms(i);
-        
-        // 处理短信内容
-        processSmsContent(concatBuffer[i].sender.c_str(), 
-                         fullText.c_str(), 
-                         concatBuffer[i].timestamp.c_str());
-        
-        // 清空槽位
-        clearConcatSlot(i);
+        finishConcatSms(i);
       }
     }
   }
@@ -308,6 +428,12 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   Serial.print("目标号码: "); Serial.println(phoneNumber);
   Serial.print("短信内容: "); Serial.println(message);
 
+  ModemTransaction transaction;
+  if (!transaction.acquired()) {
+    Serial.println("modem忙，无法发送短信");
+    return false;
+  }
+
   // 使用 pdulib 编码 PDU
   pdu.setSCAnumber();  // 使用默认短信中心
   int pduLen = pdu.encodePDU(phoneNumber, message);
@@ -317,76 +443,68 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     Serial.println(pduLen);
     return false;
   }
-  
-  Serial.print("PDU数据: "); Serial.println(pdu.getSMS());
+
+  // begin/wait 会分流 URC 并覆写全局 pdu，必须在首次 poll 前保存独立快照。
+  String smsPdu(pdu.getSMS());
+  size_t hexLength = strlen(pdu.getSMS());
+  if (hexLength == 0 || smsPdu.length() != hexLength) {
+    Serial.println("PDU快照失败");
+    return false;
+  }
+  // pdulib 自带尾部 Ctrl+Z；只移除该终止符，由 submitPdu 统一发送一次。
+  if (smsPdu.charAt(hexLength - 1) == '\x1A') {
+    hexLength--;
+    smsPdu = smsPdu.substring(0, hexLength);
+  }
+  if (hexLength == 0 || hexLength >= SERIAL_BUFFER_SIZE || hexLength % 2 != 0 ||
+      smsPdu.length() != hexLength || !isHexString(smsPdu)) {
+    Serial.println("PDU快照无效");
+    return false;
+  }
+
+  Serial.print("PDU数据: "); Serial.println(smsPdu);
   Serial.print("PDU长度: "); Serial.println(pduLen);
   
   // 发送 AT+CMGS 命令
   String cmgsCmd = "AT+CMGS=";
   cmgsCmd += pduLen;
-  
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmgsCmd);
-  
-  // 等待 > 提示符
-  unsigned long start = millis();
-  bool gotPrompt = false;
-  while (millis() - start < 5000) {
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      Serial.print(c);
-      if (c == '>') {
-        gotPrompt = true;
-        break;
-      }
-    }
+
+  if (!transaction.begin(cmgsCmd.c_str(), "+CMGS:", true)) {
+    Serial.println("无法开始短信发送事务");
+    return false;
   }
-  
-  if (!gotPrompt) {
+
+  // 等待期间由 modem 持续分流 URC；失败时析构负责取消输入和收尾。
+  if (!transaction.waitForPrompt(5000)) {
     Serial.println("未收到>提示符");
     return false;
   }
   
-  // 发送 PDU 数据
-  Serial1.print(pdu.getSMS());
-  Serial1.write(0x1A);  // Ctrl+Z 结束
-  
-  // 等待响应
-  start = millis();
-  String resp = "";
-  while (millis() - start < 30000) {
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      resp += c;
-      Serial.print(c);
-      if (resp.indexOf("OK") >= 0) {
-        Serial.println("\n短信发送成功");
-        return true;
-      }
-      if (resp.indexOf("ERROR") >= 0) {
-        Serial.println("\n短信发送失败");
-        return false;
-      }
-    }
-    esp_task_wdt_reset();
-    yield();
-    delay(1);
+  if (!transaction.submitPdu(smsPdu.c_str())) {
+    Serial.println("PDU提交失败");
+    return false;
   }
-  Serial.println("短信发送超时");
+
+  // 成功必须同时收到有效 +CMGS: 回执及完整 OK 行，不能按响应子串猜测。
+  ModemResult result = transaction.waitForFinal(30000);
+  if (result == ModemResult::Ok) {
+    Serial.println("\n短信发送成功");
+    return true;
+  }
+  Serial.println(result == ModemResult::Timeout ? "短信发送超时" : "\n短信发送失败");
   return false;
 }
 
 // 处理最终的短信内容（管理员命令检查和转发）
 void processSmsContent(const char* sender, const char* text, const char* timestamp) {
-  // 清理短信内容和格式化时间
-  String cleanedText = sanitizeTextPayload(cleanSmsContent(String(text)));
+  // 保留正文（包括 CR/LF、OTP、URL）；JSON 等转义由各输出边界负责。
+  String cleanedText(text);
   String formattedTime = formatTimestamp(String(timestamp));
+  processPreparedSmsContent(sender, cleanedText, formattedTime);
+}
+
+// 调用方持有完整正文和已归一时间，直到所有同步回调返回；去重提交后不能再复制这些快照。
+static void processPreparedSmsContent(const char* sender, const String& cleanedText, const String& formattedTime) {
   String verifyCode = extractVerifyCode(cleanedText);
   
   Serial.println("=== 处理短信 ===");
@@ -438,6 +556,7 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
 
 // 读取串口一行（使用调用方提供的独立缓冲区和位置指针，彻底消除 static 缓冲区并发竞争）(H4)
 String readSerialLine(HardwareSerial& port, char* lineBuf, size_t bufSize, int& linePos) {
+  if (&port == &Serial1) return "";  // Serial1 只能由 pollModem 读取
   if (lineBuf == nullptr || bufSize == 0) return "";
 
   while (port.available()) {
@@ -459,6 +578,7 @@ String readSerialLine(HardwareSerial& port, char* lineBuf, size_t bufSize, int& 
 
 // 兼容单参版本：使用 FreeRTOS 互斥锁保护内部静态缓冲区，并在锁外构造 String，避免关中断与锁内 malloc (H4)
 String readSerialLine(HardwareSerial& port) {
+  if (&port == &Serial1) return "";  // 不创建另一份 Serial1 行缓冲或消费字节
   static char fallbackBuf[SERIAL_BUFFER_SIZE];
   static int fallbackPos = 0;
   static SemaphoreHandle_t lineMutex = nullptr;
@@ -563,21 +683,33 @@ bool isTimestampLikelyValidSms(const String& timestamp) {
     return false;
   }
 
-  int year = timestamp.substring(0, 4).toInt();
-  int month = timestamp.substring(5, 7).toInt();
-  int day = timestamp.substring(8, 10).toInt();
-  int hour = timestamp.substring(11, 13).toInt();
-  int minute = timestamp.substring(14, 16).toInt();
-  int second = timestamp.substring(17, 19).toInt();
+  int year, month, day, hour, minute, second;
+  if (!readSmsDecimal(timestamp, 0, 4, year) ||
+      !readSmsDecimal(timestamp, 5, 2, month) ||
+      !readSmsDecimal(timestamp, 8, 2, day) ||
+      !readSmsDecimal(timestamp, 11, 2, hour) ||
+      !readSmsDecimal(timestamp, 14, 2, minute) ||
+      !readSmsDecimal(timestamp, 17, 2, second)) return false;
 
   if (year < 2020 || year > 2099) return false;
   if (month < 1 || month > 12) return false;
-  if (day < 1 || day > 31) return false;
+  if (day < 1 || day > smsDaysInMonth(year, month)) return false;
   if (hour < 0 || hour > 23) return false;
   if (minute < 0 || minute > 59) return false;
   if (second < 0 || second > 59) return false;
 
   return true;
+}
+
+// 仅无分段标记的 [0,0,0] 归一为单段；真实 UDH 中的零段数/零序号必须先拒绝。
+bool normalizeSmsConcatInfo(int refNumber, int& partNumber, int& totalParts) {
+  if (refNumber == 0 && partNumber == 0 && totalParts == 0) {
+    partNumber = 1;
+    totalParts = 1;
+  }
+  return refNumber >= 0 && refNumber <= 0xFFFF &&
+         totalParts >= 1 && totalParts <= MAX_CONCAT_PARTS &&
+         partNumber >= 1 && partNumber <= totalParts;
 }
 
 bool isLikelyValidSmsSender(const String& sender) {
@@ -610,37 +742,6 @@ bool hasVisibleSmsText(const String& text) {
   return false;
 }
 
-bool isMostlyGsm7SymbolNoise(const String& text) {
-  if (text.length() < 24) return false;
-
-  const char* suspiciousChars[] = {
-    "Δ", "Φ", "Γ", "Λ", "Ω", "Π", "Ψ", "Σ", "Θ", "Ξ",
-    "Æ", "æ", "Ø", "ø", "Å", "å", "Ä", "Ö", "Ñ", "Ü",
-    "§", "¿", "à", "è", "é", "ù", "ì", "ò", "Ç", "¥", "£", "¤"
-  };
-
-  int suspiciousHits = 0;
-  for (unsigned int i = 0; i < sizeof(suspiciousChars) / sizeof(suspiciousChars[0]); i++) {
-    int pos = 0;
-    while ((pos = text.indexOf(suspiciousChars[i], pos)) >= 0) {
-      suspiciousHits++;
-      pos += strlen(suspiciousChars[i]);
-    }
-  }
-
-  int asciiLettersOrDigits = 0;
-  for (unsigned int i = 0; i < text.length(); i++) {
-    char c = text.charAt(i);
-    if ((c >= '0' && c <= '9') ||
-        (c >= 'A' && c <= 'Z') ||
-        (c >= 'a' && c <= 'z')) {
-      asciiLettersOrDigits++;
-    }
-  }
-
-  return suspiciousHits >= 6 && suspiciousHits > asciiLettersOrDigits / 2;
-}
-
 bool isPduLikelyStorableSms(const String& sender,
                             const String& timestamp,
                             const String& text,
@@ -655,9 +756,9 @@ bool isPduLikelyStorableSms(const String& sender,
   bool senderOk = isLikelyValidSmsSender(sender);
   bool timeOk = isTimestampLikelyValidSms(timestamp);
   bool textUtf8Ok = isLikelyValidUtf8(text) && !containsReplacementCharUtf8(text);
-  bool noisyText = isMostlyGsm7SymbolNoise(text);
 
-  if (senderOk && timeOk && textUtf8Ok && !noisyText) {
+  // GSM7 的重音、北欧和希腊字符都是合法正文；不能再按字符频次猜测乱码。
+  if (senderOk && timeOk && textUtf8Ok) {
     return true;
   }
 
@@ -666,8 +767,7 @@ bool isPduLikelyStorableSms(const String& sender,
     bool fbTimeOk = isTimestampLikelyValidSms(fallbackSms->timestamp);
     bool fbTextOk = hasVisibleSmsText(fallbackSms->text) &&
                     isLikelyValidUtf8(fallbackSms->text) &&
-                    !containsReplacementCharUtf8(fallbackSms->text) &&
-                    !isMostlyGsm7SymbolNoise(fallbackSms->text);
+                    !containsReplacementCharUtf8(fallbackSms->text);
 
     if (fallbackSms->isSmsDeliver && fallbackSms->hasUserData && fbSenderOk && fbTimeOk && fbTextOk) {
       return true;
@@ -821,6 +921,9 @@ String gsm7ExtToUtf8(uint8_t septet) {
 String decodeGsm7Bit(const String& hex, int septetCount, int skipSeptets) {
   String out = "";
   int totalBytes = hex.length() / 2;
+  if (hex.length() % 2 != 0 || septetCount < 0 || skipSeptets < 0 ||
+      skipSeptets > totalBytes * 8 / 7 ||
+      septetCount > totalBytes * 8 / 7 - skipSeptets) return "";
   int bitOffset = skipSeptets * 7;
   bool escapeNext = false;
 
@@ -854,37 +957,78 @@ String decodeGsm7Bit(const String& hex, int septetCount, int skipSeptets) {
 }
 
 String decodeScts(const String& sctsHex) {
-  if (sctsHex.length() < 14) return "";
-  String yy = swapSemiOctetsToDigits(sctsHex.substring(0, 2), 2);
-  String mm = swapSemiOctetsToDigits(sctsHex.substring(2, 4), 2);
-  String dd = swapSemiOctetsToDigits(sctsHex.substring(4, 6), 2);
-  String hh = swapSemiOctetsToDigits(sctsHex.substring(6, 8), 2);
-  String mi = swapSemiOctetsToDigits(sctsHex.substring(8, 10), 2);
-  String ss = swapSemiOctetsToDigits(sctsHex.substring(10, 12), 2);
-
-  return "20" + yy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss;
+  if (sctsHex.length() != 14 || !isHexString(sctsHex)) return "";
+  String timestamp;
+  timestamp.reserve(14);
+  for (int i = 0; i < 14; i += 2) {
+    uint8_t value = hexByteAt(sctsHex, i);
+    timestamp += (char)('0' + (value & 0x0F));
+    timestamp += (char)('0' + (value >> 4));
+  }
+  return formatTimestamp(timestamp);
 }
 
-// fallback 解析 SMS-DELIVER PDU（支持 DCS=00 / GSM7 及 DCS=08 / UCS2）
+// 按 DCS 编码组确定 TP-UDL 的单位，不能只看 alphabet 位（MWI 组含义不同）。
+// 返回 0x00 / GSM7、0x08 / UCS2；二进制、压缩和保留编码不作为文本短信接收。
+static int smsTextAlphabet(uint8_t dcs) {
+  if ((dcs & 0x80) == 0) {  // 通用编码及自动删除组
+    if (dcs & 0x20) return -1;
+    int alphabet = dcs & 0x0C;
+    return alphabet == 0x00 || alphabet == 0x08 ? alphabet : -1;
+  }
+  int group = dcs & 0xF0;
+  if (group == 0xC0 || group == 0xD0 || group == 0xE0) {
+    if (dcs & 0x04) return -1;  // MWI 的 bit 2 保留
+    return group == 0xE0 ? 0x08 : 0x00;
+  }
+  return (dcs & 0xFC) == 0xF0 ? 0x00 : -1;
+}
+
+// 仅接受已支持的数字地址；先检查字段范围，再读取 BCD 和末尾填充半字节。
+static bool isSmsNumericAddress(const String& pduHex, int pos, int digits, uint8_t type) {
+  int bytes = (digits + 1) / 2;
+  if (!(type & 0x80) || ((type >> 4) & 7) > 2 || digits < 1 || digits > 20 ||
+      pos < 0 || pos + bytes * 2 > (int)pduHex.length()) return false;
+  for (int i = 0; i < bytes; i++) {
+    uint8_t value = hexByteAt(pduHex, pos + i * 2);
+    if ((value & 0x0F) > 9) return false;
+    int high = value >> 4;
+    if (i == bytes - 1 && (digits & 1)) {
+      if (high != 0x0F) return false;
+    } else if (high > 9) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 有界解析 SMS-DELIVER：既用于 fallback，也在主入口调用 pdulib 前完成校验。
 bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   out.sender = "";
   out.timestamp = "";
   out.text = "";
   out.refNumber = 0;
-  out.partNumber = 0;
+  out.partNumber = 1;
   out.totalParts = 1;
   out.isSmsDeliver = false;
   out.hasUserData = false;
   out.dcs = 0;
   out.fo = 0;
+  out.tpduBytes = 0;
 
-  if (pduHex.length() < 20 || (pduHex.length() % 2 != 0)) return false;
+  if (pduHex.length() < 20 || (pduHex.length() % 2 != 0) || !isHexString(pduHex)) return false;
 
   int pos = 0;
 
   // SCA
   int scaLen = hexByteAt(pduHex, pos);
   pos += 2;
+  if (scaLen != 0) {
+    if (scaLen < 2 || scaLen > 11 || pos + scaLen * 2 > (int)pduHex.length()) return false;
+    int scaDigits = (scaLen - 1) * 2;
+    if ((hexByteAt(pduHex, pos + scaLen * 2 - 2) >> 4) == 0x0F) scaDigits--;
+    if (!isSmsNumericAddress(pduHex, pos + 2, scaDigits, hexByteAt(pduHex, pos))) return false;
+  }
   pos += scaLen * 2;
   if (pos + 2 > pduHex.length()) return false;
 
@@ -900,13 +1044,14 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   out.isSmsDeliver = true;
 
   // OA
+  if (pos + 4 > pduHex.length()) return false;
   int oaLen = hexByteAt(pduHex, pos);
   pos += 2;
   uint8_t oaType = hexByteAt(pduHex, pos);
   pos += 2;
 
   int oaByteLen = (oaLen + 1) / 2;
-  if (pos + oaByteLen * 2 > pduHex.length()) return false;
+  if (!isSmsNumericAddress(pduHex, pos, oaLen, oaType)) return false;
   String oaRaw = pduHex.substring(pos, pos + oaByteLen * 2);
   pos += oaByteLen * 2;
 
@@ -927,19 +1072,23 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   String sctsHex = pduHex.substring(pos, pos + 14);
   pos += 14;
   out.timestamp = decodeScts(sctsHex);
+  if (out.timestamp.length() == 0) return false;
 
   // UDL
   if (pos + 2 > pduHex.length()) return false;
   int udl = hexByteAt(pduHex, pos);
   pos += 2;
-  out.hasUserData = udl > 0;
 
-  if (dcs != 0x00 && dcs != 0x08) {
+  int alphabet = smsTextAlphabet(dcs);
+  if (alphabet < 0) {
     Serial.printf("fallback parser: 暂不支持 DCS=0x%02X\n", dcs);
     return false;
   }
 
-  int udHexLen = udl * 2;
+  // GSM7 的 TP-UDL 是 septet（含 UDH 和填充位）；UCS2 的 TP-UDL 才是字节。
+  int udBytes = alphabet == 0x00 ? (udl * 7 + 7) / 8 : udl;
+  if (udBytes > 140) return false;
+  int udHexLen = udBytes * 2;
   if (pos + udHexLen > pduHex.length()) return false;
   String udHex = pduHex.substring(pos, pos + udHexLen);
 
@@ -947,25 +1096,37 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   int textStart = 0;
 
   int udhTotalBytes = 0;
+  int skipSeptets = 0;
+  bool hasConcat = false;
   if (hasUdh) {
+    if (udBytes < 1) return false;
     int udhl = hexByteAt(udHex, 0);  // 不含自身长度字节
     udhTotalBytes = 1 + udhl;
+    if (udhTotalBytes > udBytes) return false;
     textStart = udhTotalBytes * 2;
+    if (alphabet == 0x00) {
+      skipSeptets = (udhTotalBytes * 8 + 6) / 7;
+      if (skipSeptets > udl) return false;
+    }
 
     int p = 2; // 跳过 UDHL
     while (p < textStart) {
-      if (p + 4 > udHex.length()) break;
+      if (p + 4 > textStart) return false;
       uint8_t iei = hexByteAt(udHex, p);
       p += 2;
       uint8_t iedl = hexByteAt(udHex, p);
       p += 2;
-      if (p + iedl * 2 > udHex.length()) break;
+      if (p + iedl * 2 > textStart) return false;
 
-      if (iei == 0x00 && iedl == 0x03) {
+      if (iei == 0x00 || iei == 0x08) {
+        if (hasConcat || iedl != (iei == 0x00 ? 3 : 4)) return false;
+        hasConcat = true;
+      }
+      if (iei == 0x00) {
         out.refNumber = hexByteAt(udHex, p);
         out.totalParts = hexByteAt(udHex, p + 2);
         out.partNumber = hexByteAt(udHex, p + 4);
-      } else if (iei == 0x08 && iedl == 0x04) {
+      } else if (iei == 0x08) {
         out.refNumber = ((int)hexByteAt(udHex, p) << 8) | hexByteAt(udHex, p + 2);
         out.totalParts = hexByteAt(udHex, p + 4);
         out.partNumber = hexByteAt(udHex, p + 6);
@@ -975,21 +1136,52 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
     }
   }
 
-  if (textStart > udHex.length()) return false;
+  if (hasConcat && (out.totalParts < 1 || out.partNumber < 1)) return false;
+  if (!normalizeSmsConcatInfo(out.refNumber, out.partNumber, out.totalParts)) return false;
 
-  if (dcs == 0x08) {
+  if (alphabet == 0x08) {
+    if ((udBytes - udhTotalBytes) % 2 != 0) return false;
     String textHex = udHex.substring(textStart);
     out.text = decodeUcs2Hex(textHex);
   } else {
-    int skipSeptets = 0;
-    if (hasUdh) {
-      skipSeptets = (udhTotalBytes * 8 + 6) / 7;
-    }
     int textSeptets = udl - skipSeptets;
-    if (textSeptets < 0) textSeptets = 0;
     out.text = decodeGsm7Bit(udHex, textSeptets, skipSeptets);
   }
+  out.hasUserData = out.text.length() > 0;
+  out.tpduBytes = pos / 2 + udBytes - scaLen - 1;
 
+  return true;
+}
+
+// 仅在有界解析成功且正文非空后调用。合法 PDU 也可能超出 pdulib 0.5.x 的能力。
+static bool canDecodeSmsWithPdulib(const String& pduHex, const DecodedPDU& checked) {
+  int scaLen = hexByteAt(pduHex, 0);
+  // 空 SCA 会令库偏移错误；最长 SCA / 带 '+' 的 OA 可能超出其 21 字节缓冲。
+  if (scaLen == 0 || scaLen == 11 || checked.sender.length() > 20) return false;
+  if (checked.dcs != 0x00 && checked.dcs != 0x08) return false;
+
+  int oaPos = 2 + scaLen * 2 + 2;
+  int oaBytes = (hexByteAt(pduHex, oaPos) + 1) / 2;
+  int udlPos = oaPos + 4 + oaBytes * 2 + 4 + 14;  // OA、PID/DCS、SCTS
+  int udPos = udlPos + 2;
+  if (checked.fo & 0x40) {
+    // 库对 16 位 UDH 固定少扣一个 septet；8 位 UDH 首字符 '@' 也会丢失。
+    // 不先调用库再裁尾，否则既可能越界，也会误删真实正文中的 '@' / 扩展字符。
+    if (checked.dcs == 0x00) return false;
+    int udhl = hexByteAt(pduHex, udPos);
+    // UCS2 仅单个标准 concat IE 可安全交给库；其它 IE 由有界解析器处理。
+    return (udhl == 5 && hexByteAt(pduHex, udPos + 2) == 0x00 && hexByteAt(pduHex, udPos + 4) == 3) ||
+           (udhl == 6 && hexByteAt(pduHex, udPos + 2) == 0x08 && hexByteAt(pduHex, udPos + 4) == 4);
+  }
+  if (checked.dcs == 0x00) {
+    int bit = (hexByteAt(pduHex, udlPos) - 1) * 7;
+    int pos = udPos + (bit / 8) * 2;
+    int shift = bit % 8;
+    uint16_t bits = hexByteAt(pduHex, pos);
+    if (shift > 1) bits |= (uint16_t)hexByteAt(pduHex, pos + 2) << 8;
+    // 库处理末尾 ESC 时不检查下一个 septet 是否存在。
+    if (((bits >> shift) & 0x7F) == 0x1B) return false;
+  }
   return true;
 }
 
@@ -1001,113 +1193,118 @@ bool shouldUseFallbackDecodedText(const String& pdulibText, const String& fallba
   return false;
 }
 
-// 处理 URC 和 PDU
+static bool smsWaitingPdu = false;
+static unsigned long smsPduStartedAt = 0;
+static int smsExpectedTpduBytes = 0;
+
+void resetModemUrc() {
+  smsWaitingPdu = false;
+  smsExpectedTpduBytes = 0;
+}
+
+static void expireSmsPduWait() {
+  if (smsWaitingPdu && millis() - smsPduStartedAt >= SMS_CMT_PDU_TIMEOUT_MS) {
+    resetModemUrc();
+    Serial.println("CMT等待PDU超时，已取消等待");
+  }
+}
+
+// PDU 模式 +CMT: [<alpha>],<length>；兼容省略 alpha 逗号的单长度形式。
+// 空/带逗号的引号 alpha 可用，但空长度、负数、溢出、额外字段均不是有效头。
+static int smsCmtTpduLength(const String& line) {
+  const char* p = line.c_str() + 5;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '"') {
+    p++;
+    while (*p && *p != '"') p++;
+    if (*p != '"') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ',') return 0;
+    p++;
+  } else if (*p == ',') {
+    p++;
+  }
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p < '0' || *p > '9') return 0;
+  int length = 0;
+  while (*p >= '0' && *p <= '9') {
+    int digit = *p++ - '0';
+    if (length > ((SERIAL_BUFFER_SIZE - 1) / 2 - digit) / 10) return 0;
+    length = length * 10 + digit;
+  }
+  while (*p == ' ' || *p == '\t') p++;
+  return *p == '\0' ? length : 0;
+}
+
+// 兼容原 loop 调用；所有 Serial1 字节和未完成行都归 modem 管理。
 void checkSerial1URC() {
-  static enum { IDLE,
-                WAIT_PDU } state = IDLE;
+  expireSmsPduWait();
+  pollModem();
+}
 
-  // 专属缓冲区，与其它串口调用上下文彻底隔离 (H4)
-  static char serial1LineBuf[SERIAL_BUFFER_SIZE];
-  static int serial1LinePos = 0;
-
-  String line = readSerialLine(Serial1, serial1LineBuf, sizeof(serial1LineBuf), serial1LinePos);
-  if (line.length() == 0) return;
-
-  // 打印到调试串口
-  Serial.println("Debug> " + line);
-
-  if (state == IDLE) {
-    
-    // 检测到短信上报 URC 头
-    if (line.startsWith("+CMT:")) {
-      Serial.println("检测到+CMT，等待PDU数据...");
-      state = WAIT_PDU;
-      return;
+// 仅解析 pollModem 提供的完整行，不自行读取串口，也不吞掉 AT 事务响应。
+bool handleModemUrc(const String& line) {
+  expireSmsPduWait();
+  if (line.length() == 0) return false;
+  if (line.startsWith("+CMT:")) {
+    resetModemUrc();
+    smsExpectedTpduBytes = smsCmtTpduLength(line);
+    if (smsExpectedTpduBytes > 0) {
+      Serial.println("检测到有效+CMT，等待PDU数据...");
+      smsPduStartedAt = millis();
+      smsWaitingPdu = true;
+    } else {
+      Serial.println("CMT头长度无效，已忽略");
     }
+    return true;
+  }
+  // 来电可以夹在 CMT 头与 PDU 之间，不能取消等待。
+  if (handleCallUrc(line)) return true;
 
-    if (handleCallUrc(line)) {
-      return;
-    }
-  } else if (state == WAIT_PDU) {
-    // 跳过空行
-    if (line.length() == 0) {
-      return;
-    }
-    
-    // 如果是十六进制字符串，认为是 PDU 数据
-    if (isHexString(line)) {
-      Serial.println("收到PDU数据: " + line);
-      Serial.println("PDU长度: " + String(line.length()) + " 字符");
-      
-      bool decoded = false;
-      String sender;
-      String timestamp;
-      String text;
-      int refNumber = 0;
-      int partNumber = 0;
-      int totalParts = 1;
-      bool isSmsDeliver = true;
-      bool hasUserData = true;
-
-      bool fallbackDecoded = false;
+  if (smsWaitingPdu) {
+    if (line.length() >= 2 && line.length() % 2 == 0 && isHexString(line)) {
+      // AT+CIMI/IMEI 等数字响应也是 hex；只有声明长度及完整 SMS 结构都匹配才认领。
+      // 非 PDU 行留给事务且不续期/清除等待；坏/缺失 PDU 最迟在绝对期限失效。
+      int scaBytes = hexByteAt(line, 0);
+      if ((int)line.length() / 2 != 1 + scaBytes + smsExpectedTpduBytes) return false;
       DecodedPDU fallbackSms;
+      // pdulib 不接收长度参数；必须先验证完整字段、TP-UDL 和 UDH，不能失败后才校验。
+      if (!decodeDeliverPDUFallback(line, fallbackSms) || fallbackSms.tpduBytes != smsExpectedTpduBytes) return false;
+      resetModemUrc();  // 归属已确认；在进入解码器/转发回调前消费等待状态。
+      Serial.println("收到PDU数据: " + line);
+      if (!fallbackSms.hasUserData) {
+        Serial.println("PDU正文为空，已跳过解码与转发");
+        return true;
+      }
 
-      // 先尝试 pdulib
-      if (pdu.decodePDU(line.c_str())) {
-        decoded = true;
-        sender = String(pdu.getSender());
-        timestamp = String(pdu.getTimeStamp());
-        text = String(pdu.getText());
+      bool fallbackDecoded = true;
+      String sender = fallbackSms.sender;
+      String timestamp = fallbackSms.timestamp;
+      String text = fallbackSms.text;
+      int refNumber = fallbackSms.refNumber;
+      int partNumber = fallbackSms.partNumber;
+      int totalParts = fallbackSms.totalParts;
+      bool isSmsDeliver = fallbackSms.isSmsDeliver;
+      bool hasUserData = fallbackSms.hasUserData;
 
-        int* concatInfo = pdu.getConcatInfo();
-        refNumber = concatInfo[0];
-        partNumber = concatInfo[1];
-        totalParts = concatInfo[2];
-
-        Serial.println("✓ pdulib PDU解析成功");
-        if (!isLikelyValidUtf8(text) || containsReplacementCharUtf8(text)) {
-          Serial.println("⚠️ pdulib文本疑似乱码，尝试fallback复核...");
-          if (decodeDeliverPDUFallback(line, fallbackSms)) {
-            fallbackDecoded = true;
-            if (shouldUseFallbackDecodedText(text, fallbackSms.text)) {
-              sender = fallbackSms.sender.length() > 0 ? fallbackSms.sender : sender;
-              timestamp = fallbackSms.timestamp.length() > 0 ? fallbackSms.timestamp : timestamp;
-              text = fallbackSms.text;
-              refNumber = fallbackSms.refNumber;
-              partNumber = fallbackSms.partNumber;
-              totalParts = fallbackSms.totalParts;
-              isSmsDeliver = fallbackSms.isSmsDeliver;
-              hasUserData = fallbackSms.hasUserData;
-              Serial.println("✓ 使用fallback文本替换pdulib结果");
-            }
-          }
+      if (canDecodeSmsWithPdulib(line, fallbackSms) && pdu.decodePDU(line.c_str())) {
+        String pdulibText(pdu.getText());
+        if (shouldUseFallbackDecodedText(pdulibText, fallbackSms.text)) {
+          Serial.println("✓ 使用已校验的fallback文本替换pdulib结果");
+        } else {
+          fallbackDecoded = false;
+          sender = String(pdu.getSender());
+          timestamp = formatTimestamp(String(pdu.getTimeStamp()));
+          text = pdulibText;
+          int* concatInfo = pdu.getConcatInfo();
+          refNumber = concatInfo[0];
+          partNumber = concatInfo[1];
+          totalParts = concatInfo[2];
+          Serial.println("✓ pdulib PDU解析成功");
         }
       } else {
-        // fallback
-        Serial.println("⚠️ pdulib解析失败，尝试fallback解析...");
-        if (decodeDeliverPDUFallback(line, fallbackSms)) {
-          fallbackDecoded = true;
-          decoded = true;
-          sender = fallbackSms.sender;
-          timestamp = fallbackSms.timestamp;
-          text = fallbackSms.text;
-          refNumber = fallbackSms.refNumber;
-          partNumber = fallbackSms.partNumber;
-          totalParts = fallbackSms.totalParts;
-          isSmsDeliver = fallbackSms.isSmsDeliver;
-          hasUserData = fallbackSms.hasUserData;
-          Serial.println("✓ fallback PDU解析成功");
-        }
-      }
-
-      if (decoded && !fallbackDecoded && (!isLikelyValidUtf8(text) || containsReplacementCharUtf8(text))) {
-        Serial.println("⚠️ 当前解码文本仍疑似包含乱码，请关注模块编码设置或补充更多 DCS fallback 支持");
-      }
-
-      if (!decoded) {
-        Serial.println("❌ PDU解析失败！");
-        state = IDLE;
-        return;
+        Serial.println("✓ 使用有界fallback PDU解析结果");
       }
 
       if (!isPduLikelyStorableSms(sender,
@@ -1126,8 +1323,7 @@ void checkSerial1URC() {
                       hasUserData ? "true" : "false",
                       fallbackDecoded ? "true" : "false");
         Serial.println("  - text=" + text);
-        state = IDLE;
-        return;
+        return true;
       }
 
       Serial.println("=== 短信内容 ===");
@@ -1137,31 +1333,70 @@ void checkSerial1URC() {
       Serial.printf("长短信信息: 参考号=%d, 当前=%d, 总计=%d\n", refNumber, partNumber, totalParts);
       Serial.println("===============");
 
+      // [0,0,0] 仅表示无分段标记，不能把含非法 concat UDH 的 PDU 当普通短信。
+      if (refNumber == 0 && partNumber == 0 && totalParts == 0 &&
+          (fallbackSms.fo & 0x40)) {
+        refNumber = fallbackSms.refNumber;
+        partNumber = fallbackSms.partNumber;
+        totalParts = fallbackSms.totalParts;
+      }
       // 判断是否为长短信，拒绝越界分段，避免写入固定大小缓存。
-      if (totalParts < 1 || totalParts > MAX_CONCAT_PARTS ||
-          (totalParts > 1 && (partNumber < 1 || partNumber > totalParts))) {
+      if (!normalizeSmsConcatInfo(refNumber, partNumber, totalParts)) {
         Serial.printf("异常长短信分段信息，已丢弃: part=%d total=%d\n", partNumber, totalParts);
-        state = IDLE;
-        return;
+        return true;
       }
       if (totalParts > 1 && partNumber > 0) {
         Serial.printf("收到长短信分段 %d/%d\n", partNumber, totalParts);
 
+        uint64_t timeSignature = smsConcatFingerprint(timestamp);
+        uint64_t signature = smsConcatFingerprint(text, (timeSignature ^ 0xFF) * 0x100000001B3ULL);
+        // 尚未转发的疑似重放不能挡住同参考号的新总段数/同序号新正文或新 SCTS。
+        for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
+          if (concatBuffer[i].inUse && smsConcatState[i].replayOnly &&
+              concatBuffer[i].refNumber == refNumber && concatBuffer[i].sender == sender) {
+            int index = partNumber - 1;
+            if (concatBuffer[i].totalParts != totalParts ||
+                ((smsConcatState[i].forwardedMask & (1U << index)) && smsConcatState[i].timestamps[index] != timeSignature)) {
+              clearConcatSlot(i);
+            } else if (concatBuffer[i].parts[index].valid && smsConcatState[i].signatures[index] != signature) {
+              // 同时间的新正文可能只改一段；其它已收到的共享段仍属于候选新短信。
+              concatBuffer[i].parts[index].valid = false;
+              concatBuffer[i].parts[index].text = "";
+              concatBuffer[i].receivedParts--;
+              concatBuffer[i].firstPartTime = millis();
+            }
+          }
+        }
         // 查找或创建缓存槽位
         int slot = findOrCreateConcatSlot(refNumber, sender.c_str(), totalParts);
+        if (slot < 0) {
+          Serial.println("长短信缓存不可用或总段数不一致，已丢弃当前分段（可重投）");
+          return true;
+        }
 
         // 存储该分段（partNumber 从 1 开始，数组从 0 开始）
         int partIndex = partNumber - 1;
         if (partIndex >= 0 && partIndex < MAX_CONCAT_PARTS) {
           if (!concatBuffer[slot].parts[partIndex].valid) {
-            concatBuffer[slot].parts[partIndex].valid = true;
-            concatBuffer[slot].parts[partIndex].text = text;
-            concatBuffer[slot].receivedParts++;
-
-            // 如果是第一个收到的分段，保存时间戳
-            if (concatBuffer[slot].receivedParts == 1) {
+            auto& part = concatBuffer[slot].parts[partIndex];
+            part.text = text;
+            bool copied = text.length() > 0 && part.text.length() == text.length();
+            // 首段时间戳和正文均复制完整后，才提交 valid、计数及签名。
+            if (copied && concatBuffer[slot].receivedParts == 0) {
               concatBuffer[slot].timestamp = timestamp;
+              copied = timestamp.length() > 0 && concatBuffer[slot].timestamp.length() == timestamp.length();
             }
+            if (!copied) {
+              part.text = "";
+              Serial.printf("[sms] ERROR: concat_cache_allocation_failed ref=%d part=%d; awaiting retransmission\n",
+                            refNumber, partNumber);
+              if (concatBuffer[slot].receivedParts == 0) clearConcatSlot(slot);
+              return true;  // 不重新分类/登记失败段，已缓存的其它段仍可用于重投恢复。
+            }
+            part.valid = true;
+            smsConcatState[slot].signatures[partIndex] = signature;
+            smsConcatState[slot].timestamps[partIndex] = timeSignature;
+            concatBuffer[slot].receivedParts++;
 
             Serial.printf("  已缓存分段 %d，当前已收到 %d/%d\n",
                          partNumber,
@@ -1172,36 +1407,23 @@ void checkSerial1URC() {
           }
         }
 
-        // 检查是否已收齐所有分段
+        bool wasReplayOnly = smsConcatState[slot].replayOnly;
+        classifyConcatReplay(slot);
+        if (wasReplayOnly && !smsConcatState[slot].replayOnly) concatBuffer[slot].firstPartTime = millis();
+        // 即使剩余缺段已在旧组发过，也等本轮收齐或 30s 超时；新组可能逆序到达。
+        // 超时补充只带未转发的段，纯重放不通知；相同 key/SCTS 的未见段无法绝对判别。
         if (concatBuffer[slot].receivedParts >= totalParts) {
           Serial.println("长短信已收齐，开始合并转发");
-
-          // 合并所有分段
-          String fullText = assembleConcatSms(slot);
-
-          // 处理完整短信
-          processSmsContent(concatBuffer[slot].sender.c_str(),
-                           fullText.c_str(),
-                           concatBuffer[slot].timestamp.c_str());
-
-          // 清空槽位
-          clearConcatSlot(slot);
+          finishConcatSms(slot);
         }
       } else {
         // 普通短信，直接处理
-        processSmsContent(sender.c_str(), text.c_str(), timestamp.c_str());
+        processPreparedSmsContent(sender.c_str(), text, timestamp);
       }
-      
-      // 返回 IDLE 状态
-      state = IDLE;
-    } 
-    // 如果是其他内容（OK、ERROR 等），也返回 IDLE
-    else {
-      Serial.println("收到非PDU数据，返回IDLE状态");
-      state = IDLE;
 
-      // 在 WAIT_PDU 期间也兼容来电 URC
-      handleCallUrc(line);
+      return true;
     }
   }
+  // OK、ERROR、+CMGS 等交回事务；插入的响应不应丢失随后到来的 PDU。
+  return false;
 }

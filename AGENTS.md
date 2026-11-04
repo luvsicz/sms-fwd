@@ -52,7 +52,7 @@
 - Hardware serial mapping is in `config.h`: ESP32 GPIO3 (`TXD`) -> ML307 RX, GPIO4 (`RXD`) -> ML307 TX; `Serial` is USB debug, `Serial1` talks to the modem and supports local AT passthrough.
 - Watchdog configuration: uses ESP32 Arduino Core v3.0+ API (`esp_task_wdt_config_t`), checking `esp_task_wdt_status()` before calling `esp_task_wdt_init()` and `esp_task_wdt_add(NULL)` to avoid double-initialization panics.
 - Local debug simulation commands: `handleDebugSerialCommand()` intercepts `TESTPUSH` on `Serial` (USB) to simulate receiving a verification code SMS and triggers Bark, MQTT, and SMTP notifications for end-to-end push verification. All other serial input is passed directly to `Serial1` for AT communication.
-- There are no checked-in automated tests or build scripts; verify firmware changes by compiling the `code/` sketch in Arduino IDE and watching serial logs for WiFi, AT, MQTT, and watchdog messages.
+- Offline regression tests and host-test compile/run scripts are in `tests/` (see [tests/README.md](tests/README.md)); these do not replace compiling the complete `code/` sketch in Arduino IDE or checking hardware serial logs for WiFi, AT, MQTT, and watchdog messages. Pure firmware compile steps and measured limits are in [docs/BUILD_VALIDATION.md](docs/BUILD_VALIDATION.md).
 
 ## Integration details to preserve
 - MQTT command payloads are simple JSON strings: `.../sms/send` expects `{"phone":"...","message":"..."}`, `.../ping` may include `{"host":"..."}`, and `.../cmd` handles actions such as restart.

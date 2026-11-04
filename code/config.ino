@@ -3,6 +3,8 @@
  */
 
 #include "push_service.h"
+#include "history_json.h"
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -43,6 +45,23 @@ static String makeNvsWifiKey(const char* prefix, int index) {
     key = key.substring(0, 15);
   }
   return key;
+}
+
+uint64_t monotonicMillis() {
+  return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+}
+
+void resetTimerSchedule() {
+  // 保持 UI 的 1 天最小值；先确保为正，再以 64 位换算，包含 INT_MAX 天也不溢出。
+  if (config.timerInterval < 1) config.timerInterval = 1;
+  timerIntervalSec = static_cast<uint64_t>(config.timerInterval) * 86400ULL;
+  lastTimerExec = monotonicMillis();
+}
+
+uint64_t timerRemainingSeconds() {
+  if (!config.timerEnabled || timerIntervalSec == 0) return 0;
+  const uint64_t elapsedSec = (monotonicMillis() - lastTimerExec) / 1000ULL;
+  return elapsedSec < timerIntervalSec ? timerIntervalSec - elapsedSec : 0;
 }
 
 String resetReasonToString(esp_reset_reason_t reason) {
@@ -127,15 +146,77 @@ static void loadInterruptedOperationDiagnostic() {
   }
 }
 
-// 保存配置到 NVS
-void saveConfig() {
-  if (statsMutex == nullptr) initStatsLock();
-  if (statsMutex != nullptr &&
-      xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-    Serial.println("配置锁获取超时，跳过本次配置保存");
-    return;
+bool configStringFitsNvs(const String& value) {
+  // 不按字符数计算，也不截断；嵌入 NUL 会被 Preferences::putString 静默截短。
+  return value && value.length() <= CONFIG_NVS_MAX_STRING_BYTES &&
+         memchr(value.c_str(), '\0', value.length()) == nullptr;
+}
+
+bool configFitsNvs(const Config& value) {
+  const String* strings[] = {
+    &value.smtpServer, &value.smtpUser, &value.smtpPass, &value.smtpSendTo,
+    &value.webUser, &value.webPass, &value.timerPhone, &value.timerMessage,
+    &value.mqttServer, &value.mqttUser, &value.mqttPass, &value.mqttPrefix,
+    &value.mqttHaPrefix, &value.filterList, &value.contentFilterList
+  };
+  for (const String* text : strings) if (!configStringFitsNvs(*text)) return false;
+  for (const WifiNetwork& wifi : value.wifiNetworks) {
+    if (!configStringFitsNvs(wifi.ssid) || !configStringFitsNvs(wifi.password)) return false;
   }
-  preferences.begin("sms_config", false);
+  for (const PushChannel& channel : value.pushChannels) {
+    if (!configStringFitsNvs(channel.name) || !configStringFitsNvs(channel.url) ||
+        !configStringFitsNvs(channel.key1) || !configStringFitsNvs(channel.key2) ||
+        !configStringFitsNvs(channel.customBody)) return false;
+  }
+  return true;
+}
+
+static bool putConfigString(const char* key, const String& value) {
+  // 使用 const char* 重载，避免 Preferences 按值复制 String 时发生静默 OOM。
+  if (value.length()) return preferences.putString(key, value.c_str()) == value.length();
+  // 空字符串成功/失败都返回 0；用单字节缓冲确认该键实际存储了空串。
+  // 不能以删除键代替空串，否则 loadConfig 的非空默认值会重新出现。
+  char empty[1] = {'x'};
+  if (preferences.getString(key, empty, sizeof(empty)) == 1 && empty[0] == '\0') return true;
+  preferences.putString(key, "");
+  empty[0] = 'x';
+  return preferences.getString(key, empty, sizeof(empty)) == 1 && empty[0] == '\0';
+}
+
+static bool configSaveFailure(const char** error, const char* reason) {
+  if (error) *error = reason;
+  Serial.println(reason);  // 只记录原因，不输出配置值/密码。
+  return false;
+}
+
+// 保存配置到 NVS；多键写入不是掉电原子事务，失败时明确返回并停止后续写入。
+bool saveConfig(const char** error) {
+  if (error) *error = nullptr;
+  if (!configFitsNvs(config)) {
+    return configSaveFailure(error, "配置字符串无效或超过3999个UTF-8字节，未保存");
+  }
+  if (statsMutex == nullptr) initStatsLock();
+  if (statsMutex == nullptr || xSemaphoreTake(statsMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    return configSaveFailure(error, "配置存储锁不可用或获取超时，未保存，请重试");
+  }
+  if (!preferences.begin("sms_config", false)) {
+    xSemaphoreGive(statsMutex);
+    return configSaveFailure(error, "无法打开配置存储，未保存，请重试");
+  }
+
+  bool ok = true;
+  auto putString = [&ok](const char* key, const String& value) {
+    if (ok) ok = putConfigString(key, value);
+  };
+  auto putBool = [&ok](const char* key, bool value) {
+    if (ok) ok = preferences.putBool(key, value) == sizeof(uint8_t);
+  };
+  auto putInt = [&ok](const char* key, int value) {
+    if (ok) ok = preferences.putInt(key, value) == sizeof(int32_t);
+  };
+  auto putUChar = [&ok](const char* key, uint8_t value) {
+    if (ok) ok = preferences.putUChar(key, value) == sizeof(uint8_t);
+  };
   
   // 喂狗防止超时
   esp_task_wdt_reset();
@@ -143,89 +224,94 @@ void saveConfig() {
   
   // 保存 WiFi 配置（使用紧凑前缀确保不超过 15 字符，即使 MAX_WIFI_NETWORKS 增大也不会超限）
   for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    String newKeySsid = makeNvsWifiKey("w_s_", i);
-    String newKeyPass = makeNvsWifiKey("w_p_", i);
-    String newKeyEn   = makeNvsWifiKey("w_e_", i);
-
-    preferences.putString(newKeySsid.c_str(), config.wifiNetworks[i].ssid);
-    preferences.putString(newKeyPass.c_str(), config.wifiNetworks[i].password);
-    preferences.putBool(newKeyEn.c_str(), config.wifiNetworks[i].enabled);
-
-    // 平滑迁移：移除旧键名以节约 NVS 空间
-    String oldPrefix = "wifi" + String(i);
-    preferences.remove((oldPrefix + "ssid").c_str());
-    preferences.remove((oldPrefix + "pass").c_str());
-    preferences.remove((oldPrefix + "en").c_str());
+    char key[16];
+    snprintf(key, sizeof(key), "w_s_%d", i); putString(key, config.wifiNetworks[i].ssid);
+    snprintf(key, sizeof(key), "w_p_%d", i); putString(key, config.wifiNetworks[i].password);
+    snprintf(key, sizeof(key), "w_e_%d", i); putBool(key, config.wifiNetworks[i].enabled);
     yield();  // 让出 CPU
   }
   
   esp_task_wdt_reset();
   
-  preferences.putString("smtpServer", config.smtpServer);
-  preferences.putInt("smtpPort", config.smtpPort);
-  preferences.putString("smtpUser", config.smtpUser);
-  preferences.putString("smtpPass", config.smtpPass);
-  preferences.putString("smtpSendTo", config.smtpSendTo);
-  preferences.putBool("smtpEn", config.emailEnabled);
-  preferences.putString("webUser", config.webUser);
-  preferences.putString("webPass", config.webPass);
+  putString("smtpServer", config.smtpServer);
+  putInt("smtpPort", config.smtpPort);
+  putString("smtpUser", config.smtpUser);
+  putString("smtpPass", config.smtpPass);
+  putString("smtpSendTo", config.smtpSendTo);
+  putBool("smtpEn", config.emailEnabled);
+  putString("webUser", config.webUser);
+  putString("webPass", config.webPass);
   
   esp_task_wdt_reset();
   yield();
   
   // 保存推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    String prefix = "push" + String(i);
-    preferences.putBool((prefix + "en").c_str(), config.pushChannels[i].enabled);
-    preferences.putUChar((prefix + "type").c_str(), (uint8_t)config.pushChannels[i].type);
-    preferences.putString((prefix + "url").c_str(), config.pushChannels[i].url);
-    preferences.putString((prefix + "name").c_str(), config.pushChannels[i].name);
-    preferences.putString((prefix + "k1").c_str(), config.pushChannels[i].key1);
-    preferences.putString((prefix + "k2").c_str(), config.pushChannels[i].key2);
-    preferences.putString((prefix + "body").c_str(), config.pushChannels[i].customBody);
+    char key[16];
+    const PushChannel& channel = config.pushChannels[i];
+    snprintf(key, sizeof(key), "push%den", i); putBool(key, channel.enabled);
+    snprintf(key, sizeof(key), "push%dtype", i); putUChar(key, (uint8_t)channel.type);
+    snprintf(key, sizeof(key), "push%durl", i); putString(key, channel.url);
+    snprintf(key, sizeof(key), "push%dname", i); putString(key, channel.name);
+    snprintf(key, sizeof(key), "push%dk1", i); putString(key, channel.key1);
+    snprintf(key, sizeof(key), "push%dk2", i); putString(key, channel.key2);
+    snprintf(key, sizeof(key), "push%dbody", i); putString(key, channel.customBody);
     esp_task_wdt_reset();
     yield();  // 让出 CPU
   }
   
   // 保存定时任务配置
-  preferences.putBool("timerEn", config.timerEnabled);
-  preferences.putInt("timerType", config.timerType);
-  preferences.putInt("timerInt", config.timerInterval);
-  preferences.putString("timerPhone", config.timerPhone);
-  preferences.putString("timerMsg", config.timerMessage);
+  putBool("timerEn", config.timerEnabled);
+  putInt("timerType", config.timerType);
+  putInt("timerInt", config.timerInterval);
+  putString("timerPhone", config.timerPhone);
+  putString("timerMsg", config.timerMessage);
   
   esp_task_wdt_reset();
   yield();
   
   // 保存 MQTT 配置
-  preferences.putBool("mqttEn", config.mqttEnabled);
-  preferences.putBool("mqttCtrlOnly", config.mqttControlOnly);
-  preferences.putString("mqttServer", config.mqttServer);
-  preferences.putInt("mqttPort", config.mqttPort);
-  preferences.putString("mqttUser", config.mqttUser);
-  preferences.putString("mqttPass", config.mqttPass);
-  preferences.putString("mqttPrefix", config.mqttPrefix);
+  putBool("mqttEn", config.mqttEnabled);
+  putBool("mqttCtrlOnly", config.mqttControlOnly);
+  putString("mqttServer", config.mqttServer);
+  putInt("mqttPort", config.mqttPort);
+  putString("mqttUser", config.mqttUser);
+  putString("mqttPass", config.mqttPass);
+  putString("mqttPrefix", config.mqttPrefix);
   
   // 保存 HA 自动发现配置
-  preferences.putBool("mqttHaDisc", config.mqttHaDiscovery);
-  preferences.putString("mqttHaPre", config.mqttHaPrefix);
+  putBool("mqttHaDisc", config.mqttHaDiscovery);
+  putString("mqttHaPre", config.mqttHaPrefix);
   
   esp_task_wdt_reset();
   
   // 保存黑白名单配置（号码过滤）
-  preferences.putBool("filterEn", config.filterEnabled);
-  preferences.putBool("filterWL", config.filterIsWhitelist);
-  preferences.putString("filterList", config.filterList);
+  putBool("filterEn", config.filterEnabled);
+  putBool("filterWL", config.filterIsWhitelist);
+  putString("filterList", config.filterList);
   
   // 保存内容关键词过滤配置
-  preferences.putBool("cfEn", config.contentFilterEnabled);
-  preferences.putBool("cfWL", config.contentFilterIsWhitelist);
-  preferences.putString("cfList", config.contentFilterList);
-  
+  putBool("cfEn", config.contentFilterEnabled);
+  putBool("cfWL", config.contentFilterIsWhitelist);
+  putString("cfList", config.contentFilterList);
+
+  // 全部写入成功后才清理旧 WiFi 键；清理失败不影响新键的读取。
+  if (ok) {
+    for (int i = 0; i < MAX_WIFI_NETWORKS; ++i) {
+      char key[20];  // 旧键可能超 15 字节，此时 remove 自行拒绝，不能截成其他有效键。
+      snprintf(key, sizeof(key), "wifi%dssid", i); preferences.remove(key);
+      snprintf(key, sizeof(key), "wifi%dpass", i); preferences.remove(key);
+      snprintf(key, sizeof(key), "wifi%den", i); preferences.remove(key);
+    }
+  }
   preferences.end();
-  if (statsMutex != nullptr) xSemaphoreGive(statsMutex);
+  xSemaphoreGive(statsMutex);
   esp_task_wdt_reset();
+  if (!ok) {
+    return configSaveFailure(error, "NVS写入失败，配置未完整保存；请在重启前重试保存");
+  }
   Serial.println("配置已保存");
+  return true;
 }
 
 // 从 NVS 加载配置
@@ -313,7 +399,7 @@ void loadConfig() {
   config.timerInterval = preferences.getInt("timerInt", 30);
   config.timerPhone = preferences.getString("timerPhone", "");
   config.timerMessage = preferences.getString("timerMsg", "保号短信");
-  timerIntervalSec = (unsigned long)config.timerInterval * 24UL * 60UL * 60UL;
+  resetTimerSchedule();  // 启动后按完整周期重计，不恢复关机前的起点
   
   // 加载 MQTT 配置
   config.mqttEnabled = preferences.getBool("mqttEn", false);
@@ -521,6 +607,7 @@ bool safeTrimHistoryFile(const char* path, size_t maxSize, size_t targetSize) {
   bool foundNewline = false;
   while (src.available()) {
     char c = (char)src.read();
+    ++startOffset;
     if (c == '\n') {
       foundNewline = true;
       break;
@@ -565,8 +652,8 @@ bool safeTrimHistoryFile(const char* path, size_t maxSize, size_t targetSize) {
   dst.close();
 
   // 空内容防护：若复制字节为 0，说明未获取到有效内容，绝不覆盖原文件！ (M2)
-  if (copiedBytes == 0) {
-    Serial.println("历史修剪有效数据为空，取消替换，保护原历史记录");
+  if (copiedBytes == 0 || copiedBytes != fileSize - startOffset) {
+    Serial.println("历史修剪读取不完整，取消替换，保护原历史记录");
     SPIFFS.remove(tempPath);
     return false;
   }
@@ -582,91 +669,120 @@ bool safeTrimHistoryFile(const char* path, size_t maxSize, size_t targetSize) {
   return true;
 }
 
-// 添加短信到历史记录（SPIFFS 存储）
-void addSmsToHistory(const char* sender, const char* message, const char* timestamp) {
-  stats.smsReceived++;
-  
-  // 构建 JSON 行，预分配空间消除 String 碎片化 (M5)
-  String safeTimestamp = jsonEscape(String(timestamp));
-  String safeSender = jsonEscape(String(sender));
-  String safeMessage = jsonEscape(String(message).substring(0, 200));
-
-  String line;
-  line.reserve(safeTimestamp.length() + safeSender.length() + safeMessage.length() + 32);
-  line += "{\"t\":\"";
-  line += safeTimestamp;
-  line += "\",\"s\":\"";
-  line += safeSender;
-  line += "\",\"m\":\"";
-  line += safeMessage;
-  line += "\"}\n";
-
-  // 检查文件大小并安全修剪（超过 50KB 则修剪保留约 25KB，低内存下安全放弃修剪，绝不清空历史）(M2, M3)
-  safeTrimHistoryFile("/sms.txt", 50000, 25000);
-
-  // 追加新短信
-  File f = SPIFFS.open("/sms.txt", "a");
-  if (f) {
-    f.print(line);
-    f.close();
+static bool appendHistoryRecord(const char* path, const char* number, const char* message,
+                                const char* timestamp, bool sms) {
+  const auto fail = [path](const char* reason) {
+    Serial.printf("历史写入失败: %s (%s)\n", path, reason);
+    return false;
+  };
+  size_t timeBytes, numberBytes, messageBytes = 0;
+  if (!historyQuotedSize(timestamp, HISTORY_MAX_TIMESTAMP_BYTES, timeBytes) ||
+      !historyQuotedSize(number, HISTORY_MAX_NUMBER_BYTES, numberBytes) ||
+      (sms && !historyQuotedSize(message, SMS_HISTORY_MAX_MESSAGE_BYTES, messageBytes))) {
+    return fail("字段超限或UTF-8无效，未截断正文");
   }
-  
-  // 保存统计数据
+  const size_t expected = timeBytes + numberBytes + messageBytes + (sms ? 17U : 12U);
+  if (ESP.getFreeHeap() < expected + HISTORY_MIN_FREE_HEAP || ESP.getMaxAllocHeap() <= expected + 32) {
+    return fail("内存不足");
+  }
+  String line;
+  if (!line.reserve(expected) || !line.concat("{\"t\":", 5) || !historyAppendQuoted(line, timestamp) ||
+      !line.concat(sms ? ",\"s\":" : ",\"n\":", 5) || !historyAppendQuoted(line, number) ||
+      (sms && (!line.concat(",\"m\":", 5) || !historyAppendQuoted(line, message))) ||
+      !line.concat("}\n", 2) || line.length() != expected) return fail("JSON构造失败");
+
+  const size_t maxSize = sms ? SMS_HISTORY_MAX_FILE_BYTES : CALL_HISTORY_MAX_FILE_BYTES;
+  const size_t target = sms ? SMS_HISTORY_TRIM_BYTES : CALL_HISTORY_TRIM_BYTES;
+  // 为本条记录及分隔符留空间；修剪失败则拒绝追加，不能让文件无限增长。
+  if (SPIFFS.exists(path) && !safeTrimHistoryFile(path, maxSize - line.length() - 1, target)) return fail("修剪失败");
+  File file = SPIFFS.open(path, "a");
+  if (!file) return fail("无法打开文件");
+  // 独立 LF 隔开上次短写的残行，保证下一条完整记录仍可读取。
+  const bool written = file.write(reinterpret_cast<const uint8_t*>("\n"), 1) == 1 &&
+    file.write(reinterpret_cast<const uint8_t*>(line.c_str()), line.length()) == line.length();
+  file.close();
+  return written || fail("短写，保留旧记录");
+}
+
+// 接收统计仍记录实际收到的短信；持久化失败单独诊断，不伪造成功记录。
+void addSmsToHistory(const char* sender, const char* message, const char* timestamp) {
+  statsIncrementSmsReceived();
+  appendHistoryRecord("/sms.txt", sender, message, timestamp, true);
   saveStats();
 }
 
-// 获取短信历史（返回 JSON 数组字符串，使用固定容量环形缓冲区避免一次性把整个文件读入内存）(M6, M5)
-String getSmsHistory() {
-  File f = SPIFFS.open("/sms.txt", "r");
-  if (!f) return "[]";
-  
-  // 堆上分配环形缓冲区，避免在栈上直接占用 1.6KB+ 栈空间导致栈溢出 (M6)
-  std::unique_ptr<String[]> ringBuffer(new (std::nothrow) String[MAX_SMS_HISTORY]);
-  if (!ringBuffer) {
-    Serial.println("内存不足，无法分配短信历史缓冲区");
-    f.close();
-    return "[]";
+static String readHistoryJson(const char* path, bool sms) {
+  const auto fail = [path]() -> String {
+    Serial.printf("历史读取失败: %s，内存不足或文件读取异常\n", path);
+    return String();  // 空串为错误；有效空历史为 []，Web 可区分后返回 503。
+  };
+  File file = SPIFFS.open(path, "r");
+  if (!file) return SPIFFS.exists(path) ? fail() : String("[]");
+  struct Record { size_t offset; size_t length; };
+  std::unique_ptr<Record[]> records(new (std::nothrow) Record[MAX_SMS_HISTORY]);
+  if (!records) return fail();
+  const size_t maxLine = sms ? SMS_HISTORY_MAX_LINE_BYTES : CALL_HISTORY_MAX_LINE_BYTES;
+  size_t head = 0, count = 0, position = 0, lineStart = 0;
+  const size_t fileSize = file.size();
+  uint8_t chunk[256];
+  HistoryJsonLine validator(sms);
+  while (position < fileSize) {
+    const size_t remaining = fileSize - position;
+    const size_t amount = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+    if (file.read(chunk, amount) != static_cast<int>(amount)) return fail();
+    for (size_t i = 0; i < amount; ++i) {
+      if (chunk[i] == '\n') {
+        const size_t length = position + i - lineStart;
+        if (length <= maxLine && validator.complete()) {
+          records[head] = {lineStart, length};
+          head = (head + 1) % MAX_SMS_HISTORY;
+          if (count < MAX_SMS_HISTORY) ++count;
+        }
+        lineStart = position + i + 1;
+        validator = HistoryJsonLine(sms);
+      } else {
+        validator.consume(chunk[i]);
+      }
+    }
+    position += amount;
+    if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
+    yield();
   }
-
-  int head = 0;
-  int count = 0;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 10 && isLikelyValidHistoryJsonLine(line)) {
-      ringBuffer[head] = line;
-      head = (head + 1) % MAX_SMS_HISTORY;
-      if (count < MAX_SMS_HISTORY) count++;
-    } else if (line.length() > 0) {
-      Serial.println("跳过损坏的短信历史行");
+  // 只认以 LF 提交的完整行，损坏/超长/短写尾部不当作合法记录。
+  if (!count) return "[]";
+  size_t budget = sms ? SMS_HISTORY_MAX_RESPONSE_BYTES : CALL_HISTORY_MAX_RESPONSE_BYTES;
+  const size_t freeHeap = ESP.getFreeHeap(), maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap <= HISTORY_MIN_FREE_HEAP + 32 || maxAlloc <= 32) return fail();
+  if (budget > freeHeap - HISTORY_MIN_FREE_HEAP - 32) budget = freeHeap - HISTORY_MIN_FREE_HEAP - 32;
+  if (budget > maxAlloc - 32) budget = maxAlloc - 32;
+  size_t selected = 0, total = 2;
+  while (selected < count) {
+    const size_t index = (head + MAX_SMS_HISTORY - 1 - selected) % MAX_SMS_HISTORY;
+    const size_t extra = records[index].length + (selected ? 1U : 0U);
+    if (total > budget || extra > budget - total) break;
+    total += extra;
+    ++selected;
+  }
+  if (!selected) return fail();
+  if (selected < count) Serial.printf("历史响应仅包含容量内最新 %u 条完整记录\n", (unsigned int)selected);
+  String result;
+  if (!result.reserve(total) || !result.concat("[", 1)) return fail();
+  for (size_t i = 0; i < selected; ++i) {
+    const Record& record = records[(head + MAX_SMS_HISTORY - 1 - i) % MAX_SMS_HISTORY];
+    if ((i && !result.concat(",", 1)) || !file.seek(record.offset)) return fail();
+    size_t left = record.length;
+    while (left) {
+      const size_t amount = left < sizeof(chunk) ? left : sizeof(chunk);
+      if (file.read(chunk, amount) != static_cast<int>(amount) ||
+          !result.concat(reinterpret_cast<const char*>(chunk), amount)) return fail();
+      left -= amount;
     }
   }
-  f.close();
-
-  if (count == 0) return "[]";
-
-  // 预估输出大小并调用 reserve 消除堆碎片 (M5)
-  size_t totalBytes = 2; // "[" + "]"
-  for (int i = 0; i < count; i++) {
-    totalBytes += ringBuffer[i].length() + 1;
-  }
-
-  String result;
-  result.reserve(totalBytes + 16);
-  result = "[";
-  bool first = true;
-
-  // 倒序输出最近记录（从最新到最旧）
-  for (int i = 0; i < count; i++) {
-    int idx = (head - 1 - i + MAX_SMS_HISTORY) % MAX_SMS_HISTORY;
-    if (!first) result += ",";
-    first = false;
-    result += ringBuffer[idx];
-  }
-  result += "]";
+  if (!result.concat("]", 1) || result.length() != total) return fail();
   return result;
 }
+
+String getSmsHistory() { return readHistoryJson("/sms.txt", true); }
 
 // 清空短信历史记录
 void clearSmsHistory() {
@@ -690,81 +806,13 @@ void clearSmsHistory() {
 
 // 添加来电到历史记录（SPIFFS 存储）
 void addCallToHistory(const char* caller, const char* timestamp) {
-  stats.callsReceived++;
-
-  String safeTimestamp = jsonEscape(String(timestamp));
-  String safeCaller = jsonEscape(String(caller));
-
-  String line;
-  line.reserve(safeTimestamp.length() + safeCaller.length() + 24);
-  line += "{\"t\":\"";
-  line += safeTimestamp;
-  line += "\",\"n\":\"";
-  line += safeCaller;
-  line += "\"}\n";
-
-  // 检查文件大小并安全修剪（超过 30KB 则修剪保留约 15KB）(M2, M3)
-  safeTrimHistoryFile("/calls.txt", 30000, 15000);
-
-  File f = SPIFFS.open("/calls.txt", "a");
-  if (f) {
-    f.print(line);
-    f.close();
-  }
-
+  statsIncrementCallsReceived();
+  appendHistoryRecord("/calls.txt", caller, nullptr, timestamp, false);
   saveStats();
 }
 
 // 获取来电历史（返回 JSON 数组字符串，使用固定容量环形缓冲区避免一次性把整个文件读入内存）(M6, M5)
-String getCallHistory() {
-  File f = SPIFFS.open("/calls.txt", "r");
-  if (!f) return "[]";
-
-  // 堆上分配环形缓冲区，避免在栈上直接占用 1.6KB+ 栈空间导致栈溢出 (M6)
-  std::unique_ptr<String[]> ringBuffer(new (std::nothrow) String[MAX_SMS_HISTORY]);
-  if (!ringBuffer) {
-    Serial.println("内存不足，无法分配来电历史缓冲区");
-    f.close();
-    return "[]";
-  }
-
-  int head = 0;
-  int count = 0;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 8 && isLikelyValidHistoryJsonLine(line)) {
-      ringBuffer[head] = line;
-      head = (head + 1) % MAX_SMS_HISTORY;
-      if (count < MAX_SMS_HISTORY) count++;
-    } else if (line.length() > 0) {
-      Serial.println("跳过损坏的来电历史行");
-    }
-  }
-  f.close();
-
-  if (count == 0) return "[]";
-
-  size_t totalBytes = 2;
-  for (int i = 0; i < count; i++) {
-    totalBytes += ringBuffer[i].length() + 1;
-  }
-
-  String result;
-  result.reserve(totalBytes + 16);
-  result = "[";
-  bool first = true;
-
-  for (int i = 0; i < count; i++) {
-    int idx = (head - 1 - i + MAX_SMS_HISTORY) % MAX_SMS_HISTORY;
-    if (!first) result += ",";
-    first = false;
-    result += ringBuffer[idx];
-  }
-  result += "]";
-  return result;
-}
+String getCallHistory() { return readHistoryJson("/calls.txt", false); }
 
 HistoryCleanupResult cleanupSmsHistory() {
   return cleanupHistoryFile("/sms.txt");
@@ -811,6 +859,9 @@ bool phoneNumbersMatch(const String& senderNum, const String& filterNum) {
   // 标准化两个号码
   String sender = normalizePhoneNumber(senderNum);
   String filter = normalizePhoneNumber(filterNum);
+
+  // 空输入或仅含 +、-、括号等的条目不是有效号码；endsWith("") 会误匹配全部。
+  if (sender.length() == 0 || filter.length() == 0) return false;
   
   // 精确匹配
   if (sender == filter) return true;
@@ -826,10 +877,9 @@ bool phoneNumbersMatch(const String& senderNum, const String& filterNum) {
   return false;
 }
 
-// 检查号码是否被过滤
+// 检查号码是否被过滤；仅控制转发，短信仍由调用者先入历史再过滤。
 bool isNumberFiltered(const char* number) {
   if (!config.filterEnabled) return false;
-  if (config.filterList.length() == 0) return false;
   
   String senderNum = String(number);
   senderNum.trim();
@@ -865,7 +915,6 @@ bool isNumberFiltered(const char* number) {
 // 检查短信内容是否被过滤（关键词匹配）
 bool isContentFiltered(const char* content) {
   if (!config.contentFilterEnabled) return false;
-  if (config.contentFilterList.length() == 0) return false;
   
   String text = String(content);
   text.toLowerCase();  // 转为小写进行不区分大小写匹配

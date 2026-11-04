@@ -12,6 +12,8 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <ctype.h>
+#include <new>
 
 // 全局 TLS/SMTP 互斥锁，确保后台邮件任务与外部并发调用时的独占安全 (C4)
 static SemaphoreHandle_t smtpMutex = nullptr;
@@ -66,6 +68,17 @@ struct HttpPushJob {
 struct EmailJob {
   String subject;
   String body;
+  // 独立持有 SMTP 配置快照，避免后台任务与 Web 更新共享 String。
+  String smtpServer;
+  String smtpUser;
+  String smtpPass;
+  String smtpSendTo;
+  int smtpPort;
+
+  // 队列仅转移指针所有权；禁止绕过 copyEmailString 的隐式 String 复制。
+  EmailJob() = default;
+  EmailJob(const EmailJob&) = delete;
+  EmailJob& operator=(const EmailJob&) = delete;
 };
 
 static QueueHandle_t httpPushQueue = nullptr;
@@ -74,7 +87,7 @@ static QueueHandle_t emailQueue = nullptr;
 static TaskHandle_t emailTaskHandle = nullptr;
 
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
-static void sendEmailNotificationNow(const char* subject, const char* body);
+static void sendEmailNotificationNow(const EmailJob& job);
 
 static void feedPushWatchdog() {
   if (esp_task_wdt_status(NULL) == ESP_OK) {
@@ -163,7 +176,7 @@ static void emailWorkerTask(void* parameter) {
 
   for (;;) {
     if (xQueueReceive(emailQueue, &job, portMAX_DELAY) == pdTRUE && job != nullptr) {
-      sendEmailNotificationNow(job->subject.c_str(), job->body.c_str());
+      sendEmailNotificationNow(*job);
       saveStats();
       delete job;
       job = nullptr;
@@ -229,21 +242,49 @@ static bool ensureEmailWorker() {
   return true;
 }
 
+static bool copyEmailString(String& target, const char* source, size_t length) {
+  // String 的复制/拼接可能静默失败；不构造临时 String，并核对完整字节数。
+  target.remove(0);
+  return source != nullptr && target.reserve(length) &&
+         target.concat(source, length) && target.length() == length;
+}
+
 static bool enqueueEmail(const char* subject, const char* body) {
+  // 仅主任务调用，与 Web 更新串行；入队后配置变更或禁用不影响已排队邮件。
+  if (!config.emailEnabled) return true;
+
   if (!ensureEmailWorker()) {
     stats.pushFailed++;
     return false;
   }
 
-  EmailJob* job = new EmailJob();
+  EmailJob* job = new (std::nothrow) EmailJob();
   if (job == nullptr) {
     Serial.println("邮件任务分配内存失败");
     stats.pushFailed++;
     return false;
   }
 
-  job->subject = String(subject);
-  job->body = String(body);
+  const bool copied =
+    copyEmailString(job->subject, subject, subject ? strlen(subject) : 0) &&
+    copyEmailString(job->body, body, body ? strlen(body) : 0) &&
+    copyEmailString(job->smtpServer, config.smtpServer.c_str(), config.smtpServer.length()) &&
+    copyEmailString(job->smtpUser, config.smtpUser.c_str(), config.smtpUser.length()) &&
+    copyEmailString(job->smtpPass, config.smtpPass.c_str(), config.smtpPass.length()) &&
+    copyEmailString(job->smtpSendTo, config.smtpSendTo.c_str(), config.smtpSendTo.length());
+  if (!copied) {
+    Serial.println("邮件快照复制失败，丢弃本次邮件通知");
+    delete job;
+    stats.pushFailed++;
+    return false;
+  }
+
+  // 完整复制后就地 trim，不修改 config，也不让 worker 再复制整份快照。
+  job->smtpServer.trim();
+  job->smtpUser.trim();
+  job->smtpPass.trim();
+  job->smtpSendTo.trim();
+  job->smtpPort = config.smtpPort;
 
   if (xQueueSend(emailQueue, &job, 0) != pdTRUE) {
     Serial.println("邮件队列已满，丢弃本次邮件通知");
@@ -342,8 +383,9 @@ String hmacSha256Base64(const String& secret, const String& data) {
 
 // 发送 HTTP/HTTPS 请求的通用函数
 int sendHttpRequest(const String& url, const String& method, const String& contentType, const String& body) {
-  HTTPClient http;
+  // 局部对象按声明逆序析构，确保 http 先释放其引用的 TLS 客户端。
   WiFiClientSecure localSslClient;
+  HTTPClient http;
   bool beginOk = false;
 
   feedPushWatchdog();
@@ -503,7 +545,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       String senderTg = telegramEscape(String(sender));
       String messageTg = telegramEscape(String(message));
       String timestampTg = telegramEscape(String(timestamp));
-      String text = "📱 *来自: " + senderTg + "*\n" + messageTg + "\n\n_" + timestampTg + "_";
+      String text = "\xF0\x9F\x93\xB1 *来自: " + senderTg + "*\n" + messageTg + "\n\n_" + timestampTg + "_";
       String jsonData = "{";
       jsonData += "\"chat_id\":\"" + channel.key1 + "\",";
       jsonData += "\"text\":\"" + jsonEscape(text) + "\",";
@@ -517,7 +559,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
     case PUSH_TYPE_WECOM: {
       // 企业微信机器人 (Webhook)
       // URL格式: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
-      String content = "📱 来自: " + String(sender) + "\n" + String(message) + "\n\n" + String(timestamp);
+      String content = "\xF0\x9F\x93\xB1 来自: " + String(sender) + "\n" + String(message) + "\n\n" + String(timestamp);
       String jsonData = "{";
       jsonData += "\"msgtype\":\"text\",";
       jsonData += "\"text\":{\"content\":\"" + jsonEscape(content) + "\"}";
@@ -562,7 +604,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         Serial.println("钉钉加签URL: " + requestUrl);
       }
       
-      String content = "📱 来自: " + String(sender) + "\n" + String(message) + "\n\n" + String(timestamp);
+      String content = "\xF0\x9F\x93\xB1 来自: " + String(sender) + "\n" + String(message) + "\n\n" + String(timestamp);
       String jsonData = "{";
       jsonData += "\"msgtype\":\"text\",";
       jsonData += "\"text\":{\"content\":\"" + jsonEscape(content) + "\"}";
@@ -632,35 +674,35 @@ String getCurrentTimeString() {
 
 // 发送邮件通知函数
 void sendEmailNotification(const char* subject, const char* body) {
-  if (!config.emailEnabled) return;
-
   if (!enqueueEmail(subject, body)) {
     saveStats();
   }
 }
 
-static void sendEmailNotificationNow(const char* subject, const char* body) {
-  if (!config.emailEnabled) return;
+static bool buildEmailAddressHeader(String& header, const char* prefix, const char* address, size_t length) {
+  const size_t expectedLength = strlen(prefix) + length + 1;  // 末尾的 '>'
+  header.remove(0);
+  return header.reserve(expectedLength) && header.concat(prefix) &&
+         header.concat(address, length) && header.concat(">") && header.length() == expectedLength;
+}
 
+static void sendEmailNotificationNow(const EmailJob& job) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi未连接，跳过邮件发送");
     stats.pushFailed++;
     return;
   }
 
-  String smtpServer = config.smtpServer;
-  smtpServer.trim();
-  String smtpUser = config.smtpUser;
-  smtpUser.trim();
-  String smtpPass = config.smtpPass;
-  smtpPass.trim();
-  String smtpSendTo = config.smtpSendTo;
-  smtpSendTo.trim();
-  int smtpPort = config.smtpPort > 0 ? config.smtpPort : 465;
+  const String& smtpServer = job.smtpServer;
+  const String& smtpUser = job.smtpUser;
+  const String& smtpPass = job.smtpPass;
+  const String& smtpSendTo = job.smtpSendTo;
+  const int smtpPort = job.smtpPort > 0 ? job.smtpPort : 465;
 
   if (smtpServer.length() == 0 || smtpUser.length() == 0 ||
       smtpPass.length() == 0 || smtpSendTo.length() == 0) {
     Serial.println("邮件配置不完整，跳过发送");
+    stats.pushFailed++;
     return;
   }
 
@@ -713,7 +755,7 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
 
   recordOperationDiagnostic("smtp", "connect");
   unsigned long stageStart = millis();
-  bool started = smtp.connect(smtpServer.c_str(), smtpPort, statusCallback, useSsl, false);
+  bool started = smtp.connect(smtpServer, smtpPort, statusCallback, useSsl, false);
   if (!started || !waitForSmtpProgress("connect", stageStart) || !smtp.isConnected()) {
     SMTPStatus st = smtp.status();
     Serial.printf("邮件服务器连接失败 (error=%d, status=%d)\n", st.errorCode, st.statusCode);
@@ -726,7 +768,7 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
 
   recordOperationDiagnostic("smtp", "authenticate");
   stageStart = millis();
-  started = smtp.authenticate(smtpUser.c_str(), smtpPass.c_str(), readymail_auth_password, false);
+  started = smtp.authenticate(smtpUser, smtpPass, readymail_auth_password, false);
   if (!started || !waitForSmtpProgress("authenticate", stageStart) || !smtp.isAuthenticated()) {
     SMTPStatus st = smtp.status();
     Serial.printf("SMTP认证失败 (error=%d, status=%d)\n", st.errorCode, st.statusCode);
@@ -742,31 +784,41 @@ static void sendEmailNotificationNow(const char* subject, const char* body) {
   SMTPMessage &msg = smtp.getMessage();
   msg.clear();
 
-  String from;
-  from.reserve(smtpUser.length() + 32);
-  from = "sms notify <"; from += smtpUser; from += ">";
-  msg.headers.add(rfc822_from, from.c_str());
+  String addressHeader;
+  bool headersOk = buildEmailAddressHeader(addressHeader, "sms notify <", smtpUser.c_str(), smtpUser.length());
+  if (headersOk) msg.headers.add(rfc822_from, addressHeader);
 
-  // 支持单个或多个收件人（逗号/分号分隔）
-  String recipients = smtpSendTo;
-  recipients.replace(";", ",");
-  int startIdx = 0;
-  while (startIdx < (int)recipients.length()) {
-    int commaIdx = recipients.indexOf(',', startIdx);
-    if (commaIdx < 0) commaIdx = recipients.length();
-    String rcpt = recipients.substring(startIdx, commaIdx);
-    rcpt.trim();
-    if (rcpt.length() > 0) {
-      String to;
-      to.reserve(rcpt.length() + 32);
-      to = "your_email <"; to += rcpt; to += ">";
-      msg.headers.add(rfc822_to, to.c_str());
+  // 直接遍历 const 快照中的逗号/分号分隔项，复用地址头，不复制整串或 substring。
+  const char* recipients = smtpSendTo.c_str();
+  const size_t recipientsLength = smtpSendTo.length();
+  size_t startIdx = 0;
+  while (headersOk && startIdx < recipientsLength) {
+    size_t endIdx = startIdx;
+    while (endIdx < recipientsLength && recipients[endIdx] != ',' && recipients[endIdx] != ';') endIdx++;
+    size_t first = startIdx;
+    size_t last = endIdx;
+    while (first < last && isspace((unsigned char)recipients[first])) first++;
+    while (last > first && isspace((unsigned char)recipients[last - 1])) last--;
+    if (first < last) {
+      headersOk = buildEmailAddressHeader(addressHeader, "your_email <", recipients + first, last - first);
+      if (headersOk) msg.headers.add(rfc822_to, addressHeader);
     }
-    startIdx = commaIdx + 1;
+    startIdx = endIdx + 1;
+  }
+  if (!headersOk) {
+    Serial.println("邮件地址头分配内存失败");
+    msg.clear();
+    smtp.stop();
+    ssl_client.stop();
+    clearOperationDiagnostic();
+    stats.pushFailed++;
+    return;
   }
 
-  msg.headers.add(rfc822_subject, subject);
-  msg.text.body(body);
+  // ReadyMail 的 String 形参直接引用已校验快照，不通过 c_str() 隐式分配临时 String。
+  msg.headers.add(rfc822_subject, job.subject);
+  // 静态正文重载不复制；worker 在发送结束并 clear/stop 后才释放 job。
+  msg.text.body(job.body.c_str(), job.body.length());
 
   time_t now = time(nullptr);
   msg.timestamp = (now >= 100000) ? (uint32_t)now : 0;

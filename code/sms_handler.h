@@ -9,10 +9,15 @@
 // 前向声明 (PDU 类型在 code.ino 中通过 pdulib.h 定义)
 class PDU;
 
+// 仅主任务使用；重复段不续期，容量淘汰/重启后不承诺跨窗口去重。
+static constexpr unsigned long SMS_CMT_PDU_TIMEOUT_MS = 5000;
+static constexpr unsigned long SMS_CONCAT_RECENT_MS = 120000;
+static constexpr int SMS_CONCAT_RECENT_CAPACITY = MAX_CONCAT_MESSAGES;
+
 // fallback PDU解析结构
 struct DecodedPDU {
   String sender;
-  String timestamp;
+  String timestamp;  // UTC+8，YYYY-MM-DD HH:MM:SS
   String text;
   int refNumber;
   int partNumber;
@@ -21,6 +26,7 @@ struct DecodedPDU {
   bool hasUserData;
   uint8_t dcs;
   uint8_t fo;
+  int tpduBytes;  // 实际解析至 TP-UDL 末尾的字节数，不含 SCA 长度字节及 SCA
 };
 
 // 外部依赖变量声明
@@ -28,6 +34,10 @@ extern PDU pdu;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 
 // 函数声明
+String cleanSmsContent(const String& text);
+String formatTimestamp(const String& pduTimestamp);
+bool isTimestampLikelyValidSms(const String& timestamp);
+bool normalizeSmsConcatInfo(int refNumber, int& partNumber, int& totalParts);
 void initConcatBuffer();
 int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts);
 String assembleConcatSms(int slot);
@@ -36,6 +46,9 @@ void checkConcatTimeout();
 bool sendSMS(const char* phoneNumber, const char* message);
 void processSmsContent(const char* sender, const char* text, const char* timestamp);
 void checkSerial1URC();
+bool handleModemUrc(const String& line);  // 长度/结构匹配有效 CMT 才认领 PDU；AT 响应返回 false
+void resetModemUrc();  // 接收行丢失时取消等待 PDU，不清空长短信缓存
+// 仅兼容其它串口；Serial1 由 pollModem 独占，这两个重载均拒绝读取它。
 String readSerialLine(HardwareSerial& port);
 String readSerialLine(HardwareSerial& port, char* lineBuf, size_t bufSize, int& linePos);
 bool isHexString(const String& str);

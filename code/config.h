@@ -29,6 +29,10 @@ enum PushType {
 
 // 最大推送通道数
 #define MAX_PUSH_CHANNELS 3
+static_assert(MAX_PUSH_CHANNELS < 10000000, "Push NVS keys must fit 15 characters");
+
+// NVS string 的 4000 字节限制包含结尾 NUL；String::length() 是 UTF-8 字节数。
+static constexpr size_t CONFIG_NVS_MAX_STRING_BYTES = 3999;
 
 // 短信历史记录设置
 #define MAX_SMS_HISTORY 100
@@ -146,7 +150,7 @@ struct Config {
   // 定时任务配置
   bool timerEnabled;
   int timerType;
-  int timerInterval;
+  int timerInterval;  // 天；加载/应用计划时至少为 1，NVS 默认仍为 30
   String timerPhone;
   String timerMessage;
   
@@ -184,7 +188,31 @@ struct Config {
 #define CONCAT_TIMEOUT_MS 30000
 #define MAX_CONCAT_MESSAGES 5
 
-#define SERIAL_BUFFER_SIZE 500
+// 历史按 UTF-8 字节计：每段保守预留 160 septet * 3 字节，覆盖 GSM7/UCS2 及缺段标记。
+// 超限/非法 UTF-8/OOM 拒绝整条并记录错误，不截断正文或尾部 OTP/URL。
+static constexpr size_t SMS_HISTORY_MAX_MESSAGE_BYTES = MAX_CONCAT_PARTS * 160U * 3U; // 4800
+static constexpr size_t HISTORY_MAX_NUMBER_BYTES = 64;
+static constexpr size_t HISTORY_MAX_TIMESTAMP_BYTES = 32;
+// 含 JSON 最坏 6 倍转义与结构/LF；读取使用固定块 + 偏移索引，不缓存 100 条正文。
+static constexpr size_t SMS_HISTORY_MAX_LINE_BYTES =
+  6 * (SMS_HISTORY_MAX_MESSAGE_BYTES + HISTORY_MAX_NUMBER_BYTES + HISTORY_MAX_TIMESTAMP_BYTES) + 32;
+static constexpr size_t CALL_HISTORY_MAX_LINE_BYTES =
+  6 * (HISTORY_MAX_NUMBER_BYTES + HISTORY_MAX_TIMESTAMP_BYTES) + 24;
+static constexpr size_t SMS_HISTORY_MAX_RESPONSE_BYTES = 32 * 1024;
+static constexpr size_t CALL_HISTORY_MAX_RESPONSE_BYTES = 8 * 1024;
+static constexpr size_t SMS_HISTORY_MAX_FILE_BYTES = 128 * 1024;
+static constexpr size_t SMS_HISTORY_TRIM_BYTES = 64 * 1024;
+static constexpr size_t CALL_HISTORY_MAX_FILE_BYTES = 30000;
+static constexpr size_t CALL_HISTORY_TRIM_BYTES = 15000;
+static constexpr size_t HISTORY_MIN_FREE_HEAP = 16 * 1024;
+static_assert(SMS_HISTORY_MAX_LINE_BYTES + 2 <= SMS_HISTORY_MAX_RESPONSE_BYTES,
+              "History response must fit one complete maximum SMS");
+static_assert(SMS_HISTORY_TRIM_BYTES + SMS_HISTORY_MAX_LINE_BYTES + 2 < SMS_HISTORY_MAX_FILE_BYTES,
+              "History trim must leave room for a complete maximum SMS");
+
+#define SERIAL_BUFFER_SIZE 500  // 单行解析上限，不是 UART RX 环形缓冲容量
+#define SERIAL_RX_BUFFER_SIZE 2048  // 独立接收缓冲，容纳连续 PDU/URC 突发
+static_assert(SERIAL_RX_BUFFER_SIZE >= SERIAL_BUFFER_SIZE, "UART RX buffer must hold at least one serial line");
 #define MAX_PDU_LENGTH 300
 
 // 长短信分段结构
@@ -210,8 +238,8 @@ extern Config config;
 extern Preferences preferences;
 extern bool configValid;
 extern unsigned long lastPrintTime;
-extern unsigned long lastTimerExec;
-extern unsigned long timerIntervalSec;
+extern uint64_t lastTimerExec;     // 本次启动的单调毫秒，不持久化
+extern uint64_t timerIntervalSec;  // 完整周期（秒），不能降为 32 位
 extern String lastCallNumber;
 extern unsigned long lastCallNotifyTime;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
@@ -230,8 +258,19 @@ extern bool lastResetPowerSuspected;
 extern InterruptedOperationDiagnostic lastInterruptedOperation;
 
 // 函数声明
-void saveConfig();
+bool configStringFitsNvs(const String& value);
+bool configFitsNvs(const Config& value);  // 全部持久化字符串，包含未启用的字段
+// 主任务调用；检查每个写入结果，error 为静态文本，不含配置值。
+// 保留 saveConfig() 调用形式；忽略 bool 返回值的旧调用仍可编译。
+// 多键写入非掉电原子事务；失败可能留下部分 NVS 写入，调用者须保留/恢复 RAM。
+bool saveConfig(const char** error = nullptr);
 void loadConfig();
+// 定时 API（主循环任务）：应用所有 timer 字段后重置；仅保存无关配置不重置。
+// loadConfig() 也重置起点，重启不恢复上次剩余时间；非正天数统一按 UI 下限 1 天处理。
+uint64_t monotonicMillis();
+void resetTimerSchedule();
+uint64_t timerRemainingSeconds();  // 禁用/到期为 0，其余向上取整到秒
+void processTimerTask();           // 到期先推进起点，再执行一次；失败不立即重试
 bool isPushChannelValid(const PushChannel& ch);
 bool isConfigValid();
 String getDeviceUrl();

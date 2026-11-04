@@ -103,6 +103,7 @@ details[open] summary{border-bottom:1px solid var(--border)}
 .chat-day span{position:relative;background:#fff;padding:4px 12px;font-size:0.75em;color:#cbd5e1;border:1px solid #f1f5f9;border-radius:99px;z-index:1}
 .msg-bubble{max-width:80%;padding:10px 14px;margin-bottom:12px;border-radius:18px;position:relative;font-size:0.95em;line-height:1.6;word-break:break-word;box-shadow:0 1px 2px rgba(0,0,0,0.02)}
 .msg-in{background:#f1f5f9;color:#334155;border-bottom-left-radius:4px;margin-right:auto}
+.msg-text{white-space:pre-wrap}
 .msg-time{font-size:0.7em;color:rgba(0,0,0,0.3);margin-top:4px;display:block;text-align:right}
 
 /* 消息提示 */
@@ -129,13 +130,21 @@ details[open] summary{border-bottom:1px solid var(--border)}
 <script>
 const $=id=>document.getElementById(id);
 const $s=sel=>document.querySelector(sel);
-const postJ=(u,d,cb)=>{
-  fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
-  .then(r=>r.json()).then(cb).catch(e=>toast('请求失败: '+e))
+const checkedJson=async r=>{
+  let d;
+  try{d=await r.json()}catch(e){throw new Error('HTTP '+r.status+'：服务器未返回有效JSON')}
+  if(!r.ok||!d||d.success!==true){
+    throw new Error(d&&typeof d.message==='string'&&d.message?d.message:'请求失败 (HTTP '+r.status+')');
+  }
+  return d;
 };
+const postJ=(u,d,cb,onError)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+  .then(checkedJson).then(d=>{if(cb)cb(d);return d}).catch(e=>{
+    const message=e.message||'请求失败，请检查网络';toast(message);if(onError)onError(message);
+  });
 let toastTimer;
 function toast(msg){
-  let t=$('toast');t.innerText=msg;t.className='toast show';
+  let t=$('toast');t.textContent=msg;t.className='toast show';
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.className='toast',2000);
 }
 </script>)";
@@ -280,16 +289,17 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
         <div class="chat-header" id="chatHeader" style="display:none">
           <div>
             <div class="chat-title" id="chatTitle">
-               <div class="chat-back" onclick="backToList()">
-                 <svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/></svg>
+               <div class="chat-back" id="chatBack">
+                 <svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="#64748b"/></svg>
                </div>
+               <div class="contact-avatar" id="chatAvatar" style="display:none;width:28px;height:28px;font-size:0.8em"></div>
                <span id="chatName">选择联系人</span>
             </div>
             <div class="chat-msg-count" id="chatCount" style="margin-left:36px"></div>
           </div>
         </div>
         <div class="chat-messages" id="chatMessages">
-          <div class="chat-empty">👈 选择左侧号码查看短信</div>
+          <div class="chat-empty"> 选择左侧号码查看短信</div>
         </div>
       </div>
     </div>
@@ -305,7 +315,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
     <div class="det-body">
       %WIFI_NETWORKS%
       <div style="font-size:0.85em;color:var(--text-light);margin-top:8px">
-        💡 可配置多个WiFi，设备会自动连接信号最强的网络。修改后需重启生效。
+         可配置多个WiFi，设备会自动连接信号最强的网络。修改后需重启生效。
       </div>
     </div>
   </details>
@@ -368,7 +378,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
            <div id="mqHaBox" style="display:%MQTT_HA_DISP%">
              <div class="fg"><label>HA 发现前缀</label><input name="mqttHaPrefix" value="%MQTT_HA_PREFIX%" placeholder="homeassistant"></div>
              <div style="font-size:0.85em;color:var(--text-light);margin-top:4px">
-               💡 启用后设备将自动注册到 Home Assistant，无需手动配置 YAML 文件。
+                启用后设备将自动注册到 Home Assistant，无需手动配置 YAML 文件。
              </div>
            </div>
          </div>
@@ -395,7 +405,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
         <label style="margin-bottom:8px">过滤模式</label>
         <div class="mode-toggle">
           <div class="mode-btn" id="modeBl" onclick="setFtMode(false)">
-            <div class="mode-icon">🚫</div>
+            <div class="mode-icon"></div>
             <div class="mode-title">黑名单模式</div>
             <div class="mode-desc">拦截列表中的号码</div>
           </div>
@@ -428,12 +438,12 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
         <label style="margin-bottom:8px">过滤模式</label>
         <div class="mode-toggle">
           <div class="mode-btn" id="cfModeBl" onclick="setCfMode(false)">
-            <div class="mode-icon">🚫</div>
+            <div class="mode-icon"></div>
             <div class="mode-title">黑名单模式</div>
             <div class="mode-desc">拦截包含关键词的短信</div>
           </div>
           <div class="mode-btn" id="cfModeWl" onclick="setCfMode(true)">
-            <div class="mode-icon">🔍</div>
+            <div class="mode-icon"></div>
             <div class="mode-title">仅白名单</div>
             <div class="mode-desc">只转发包含关键词的短信</div>
           </div>
@@ -445,7 +455,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
           <textarea id="cfList" name="contentFilterList" rows="4" placeholder="输入关键词，多个关键词用逗号分隔，例如: 验证码,快递,银行"></textarea>
         </div>
         <div style="font-size:0.85em;color:var(--text-light);margin-bottom:12px">
-          💡 关键词匹配不区分大小写。可用于过滤广告短信或只接收重要短信。
+           关键词匹配不区分大小写。可用于过滤广告短信或只接收重要短信。
         </div>
       </div>
       <button type="button" class="btn btn-w" onclick="saveContentFilter()">仅保存关键词设置</button>
@@ -468,7 +478,7 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
       </div>
       <div id="tmSms" style="display:none">
         <div class="fg"><label>对方号码</label><input id="tmPh" name="timerPhone"></div>
-        <div class="fg"><label>短信内容</label><input id="tmMsg" name="timerMessage"></div>
+        <div class="fg"><label>短信内容</label><textarea id="tmMsg" name="timerMessage" rows="1" style="resize:vertical"></textarea></div>
       </div>
       <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:12px;margin-bottom:12px" id="tmInfo"></div>
       <button type="button" class="btn btn-w" onclick="saveTimer()">仅保存任务设置</button>
@@ -485,9 +495,9 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
 
 <script>
 // 初始化数据
-var ft={en:%FILTER_EN_BOOL%,wl:%FILTER_WL_BOOL%,ls:'%FILTER_LIST%'};
-var cf={en:%CF_EN_BOOL%,wl:%CF_WL_BOOL%,ls:'%CF_LIST%'};
-var tm={en:%TIMER_EN_BOOL%,tp:%TIMER_TP%,int:%TIMER_INT%,ph:'%TIMER_PH%',ms:'%TIMER_MS%',rm:%TIMER_RM%};
+var ft={en:%FILTER_EN_BOOL%,wl:%FILTER_WL_BOOL%,ls:%FILTER_LIST%};
+var cf={en:%CF_EN_BOOL%,wl:%CF_WL_BOOL%,ls:%CF_LIST%};
+var tm={en:%TIMER_EN_BOOL%,tp:%TIMER_TP%,int:%TIMER_INT%,ph:%TIMER_PH%,ms:%TIMER_MS%,rm:%TIMER_RM%};
 
 // 状态初始化 - 号码过滤
 if(ft.en){$('ftEnSw').className='sw on';$('ftEn').value='true'}
@@ -511,13 +521,16 @@ function updTmInfo(){
   var badge=$('tmBadge');
   var info=$('tmInfo');
   var typeName=tp===0?'Ping保活':'发送短信';
+  info.textContent='';
   
   if(!en){
-    badge.className='badge b-wait';badge.innerText='未启用';
-    info.innerHTML='<div style="color:#64748b">⏸ 定时任务已禁用</div>';
+    badge.className='badge b-wait';badge.textContent='未启用';
+    var disabled=document.createElement('div');
+    disabled.style.color='#64748b';disabled.textContent='⏸ 定时任务已禁用';
+    info.appendChild(disabled);
     return;
   }
-  badge.className='badge b-ok';badge.innerText=typeName;
+  badge.className='badge b-ok';badge.textContent=typeName;
   
   // 计算剩余时间（天+小时）
   var rmSec=tm.rm;
@@ -526,14 +539,19 @@ function updTmInfo(){
   var rmStr=rmDays>0?(rmDays+'天'):'';rmStr+=(rmHours>0?(rmHours+'小时'):'');
   if(!rmStr)rmStr='即将执行';
   
-  var html='<div style="font-weight:600;color:#0369a1;margin-bottom:6px">✅ 定时任务已启用</div>';
-  html+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.9em">';
-  html+='<div><span style="color:#64748b">任务类型:</span> <b>'+typeName+'</b></div>';
-  html+='<div><span style="color:#64748b">执行间隔:</span> <b>每 '+days+' 天</b></div>';
-  html+='<div><span style="color:#64748b">下次执行:</span> <b>'+rmStr+'后</b></div>';
-  if(tp===1){html+='<div><span style="color:#64748b">发送至:</span> <b>'+($('tmPh').value||'未设置')+'</b></div>';}
-  html+='</div>';
-  info.innerHTML=html;
+  var title=document.createElement('div');
+  title.style.cssText='font-weight:600;color:#0369a1;margin-bottom:6px';
+  title.textContent='✅ 定时任务已启用';info.appendChild(title);
+  var grid=document.createElement('div');
+  grid.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.9em';
+  var rows=[['任务类型:',typeName],['执行间隔:','每 '+days+' 天'],['下次执行:',rmStr+'后']];
+  if(tp===1)rows.push(['发送至:',$('tmPh').value||'未设置']);
+  rows.forEach(row=>{
+    var cell=document.createElement('div'),label=document.createElement('span'),value=document.createElement('b');
+    label.style.color='#64748b';label.textContent=row[0]+' ';value.textContent=row[1];
+    cell.appendChild(label);cell.appendChild(value);grid.appendChild(cell);
+  });
+  info.appendChild(grid);
 }
 updTmInfo();
 
@@ -557,24 +575,24 @@ function updFtMode(){
   
   // 更新徽章
   if(!en){
-    badge.className='badge b-wait';badge.innerText='未启用';
+    badge.className='badge b-wait';badge.textContent='未启用';
     modeBox.style.opacity='0.5';
   }else{
     modeBox.style.opacity='1';
     if(wl){
-      badge.className='badge b-ok';badge.innerText='仅白名单';
+      badge.className='badge b-ok';badge.textContent='仅白名单';
     }else{
-      badge.className='badge b-err';badge.innerText='黑名单';
+      badge.className='badge b-err';badge.textContent='黑名单';
     }
   }
   
   // 更新提示文字和标签
   if(wl){
     hint.innerHTML='<span style="color:#0369a1">✅ 仅白名单模式</span>：只有列表中的号码发送的短信会被转发，其他号码将被<b>拦截</b>。';
-    $('ftListLabel').innerText='允许的号码 (只接收这些)';
+    $('ftListLabel').textContent='允许的号码 (只接收这些)';
   }else{
-    hint.innerHTML='<span style="color:#b91c1c">🚫 黑名单模式</span>：列表中的号码发送的短信会被<b>拦截</b>，其他号码正常转发。';
-    $('ftListLabel').innerText='拦截的号码 (屏蔽这些)';
+    hint.innerHTML='<span style="color:#b91c1c"> 黑名单模式</span>：列表中的号码发送的短信会被<b>拦截</b>，其他号码正常转发。';
+    $('ftListLabel').textContent='拦截的号码 (屏蔽这些)';
   }
 }
 updFtMode();
@@ -599,24 +617,24 @@ function updCfMode(){
   
   // 更新徽章
   if(!en){
-    badge.className='badge b-wait';badge.innerText='未启用';
+    badge.className='badge b-wait';badge.textContent='未启用';
     modeBox.style.opacity='0.5';
   }else{
     modeBox.style.opacity='1';
     if(wl){
-      badge.className='badge b-ok';badge.innerText='仅白名单';
+      badge.className='badge b-ok';badge.textContent='仅白名单';
     }else{
-      badge.className='badge b-warn';badge.innerText='黑名单';
+      badge.className='badge b-warn';badge.textContent='黑名单';
     }
   }
   
   // 更新提示文字和标签
   if(wl){
-    hint.innerHTML='<span style="color:#0369a1">🔍 仅白名单模式</span>：只有包含关键词的短信会被转发，其他短信将被<b>拦截</b>。适合只接收验证码等重要短信。';
-    $('cfListLabel').innerText='必须包含的关键词 (只转发这些)';
+    hint.innerHTML='<span style="color:#0369a1"> 仅白名单模式</span>：只有包含关键词的短信会被转发，其他短信将被<b>拦截</b>。适合只接收验证码等重要短信。';
+    $('cfListLabel').textContent='必须包含的关键词 (只转发这些)';
   }else{
-    hint.innerHTML='<span style="color:#a16207">🚫 黑名单模式</span>：包含关键词的短信会被<b>拦截</b>，其他短信正常转发。适合过滤广告短信。';
-    $('cfListLabel').innerText='拦截的关键词 (屏蔽这些)';
+    hint.innerHTML='<span style="color:#a16207"> 黑名单模式</span>：包含关键词的短信会被<b>拦截</b>，其他短信正常转发。适合过滤广告短信。';
+    $('cfListLabel').textContent='拦截的关键词 (屏蔽这些)';
   }
 }
 updCfMode();
@@ -662,47 +680,73 @@ function upd(i){
   $('k2'+i).style.display=(t=='2')?'block':'none'; // Bark group
   // 动态更新标签
   var lbl=$('k1l'+i);
-  if(lbl){lbl.innerText=(t=='5')?'Chat ID':'加签密钥 (可选)';}
+  if(lbl){lbl.textContent=(t=='5')?'Chat ID':'加签密钥 (可选)';}
 }
 
 // 自动加载函数
+// 兼容旧 /query 的固定表格包装，但不让浏览器解析动态 HTML。
+// 只拆 firmware 固定分隔符；单元格内容（含恶意标签/实体）始终以文本写入。
+function queryMessage(node,message){
+  var text=String(message??''),prefix="<table class='info-table'>",suffix='</table>';
+  node.textContent='';
+  if(text.startsWith(prefix)&&text.endsWith(suffix)){
+    var rest=text.slice(prefix.length,-suffix.length),rows=[],valid=true;
+    while(rest){
+      if(!rest.startsWith('<tr><td>')){valid=false;break}
+      var split=rest.indexOf('</td><td>',8),end=rest.indexOf('</td></tr>',split+9);
+      if(split<0||end<0){valid=false;break}
+      rows.push([rest.slice(8,split),rest.slice(split+9,end)]);rest=rest.slice(end+10);
+    }
+    if(valid&&rows.length){
+      var table=document.createElement('table');table.className='info-table';
+      rows.forEach(row=>{
+        var tr=document.createElement('tr');
+        row.forEach(value=>{var td=document.createElement('td');td.textContent=value;tr.appendChild(td)});
+        table.appendChild(tr);
+      });
+      node.appendChild(table);return;
+    }
+  }
+  node.textContent=text;
+}
+
 function autoLoad(){
   fetch('/stats').then(r=>r.json()).then(d=>{
-    $('ssRecv').innerText=d.received;
-    $('ssSent').innerText=d.sent;
-    $('ssCall').innerText=d.calls||0;
-    $('ssBoot').innerText=d.boots;
-    $('ssBrownout').innerText=d.brownoutResets||0;
-    $('ssPwrSus').innerText=d.powerSuspected ? '是' : '否';
-    $('ssPushOk').innerText=d.pushOk||0;
-    $('ssPushFail').innerText=d.pushFail||0;
-    $('wifiS').innerText=d.wifiRssi+' dBm';
-    $('rstReason').innerText=d.lastResetReason||'未知';
-    $('rstPwr').innerText=d.powerSuspected ? '是' : '否';
+    $('ssRecv').textContent=d.received;
+    $('ssSent').textContent=d.sent;
+    $('ssCall').textContent=d.calls||0;
+    $('ssBoot').textContent=d.boots;
+    $('ssBrownout').textContent=d.brownoutResets||0;
+    $('ssPwrSus').textContent=d.powerSuspected ? '是' : '否';
+    $('ssPushOk').textContent=d.pushOk||0;
+    $('ssPushFail').textContent=d.pushFail||0;
+    $('wifiS').textContent=d.wifiRssi+' dBm';
+    $('rstReason').textContent=d.lastResetReason||'未知';
+    $('rstPwr').textContent=d.powerSuspected ? '是' : '否';
     $('rstPwr').className='badge ' + (d.powerSuspected ? 'b-err' : 'b-ok');
     var h=Math.floor(d.uptime/3600);
-    $('upT').innerText='运行 '+h+' 小时 / 内存 '+(d.freeHeap/1024).toFixed(0)+'K';
-    $('resetInfo').innerText='上次复位：'+(d.lastResetReason||'未知')+'；复位代码：'+(d.lastResetReasonCode ?? '-');
+    $('upT').textContent='运行 '+h+' 小时 / 内存 '+(d.freeHeap/1024).toFixed(0)+'K';
+    $('resetInfo').textContent='上次复位：'+(d.lastResetReason||'未知')+'；复位代码：'+(d.lastResetReasonCode ?? '-');
     if(d.hasInterruptedOperation){
       var diag='；复位前操作：'+(d.interruptedOperation||'未知')+'/'+(d.interruptedStage||'未知');
       diag+='（运行 '+(d.interruptedUptime||0)+' 秒，堆 '+Math.floor((d.interruptedFreeHeap||0)/1024)+'K';
       diag+='，历史最低 '+Math.floor((d.interruptedMinFreeHeap||0)/1024)+'K';
       diag+='，最大连续块 '+Math.floor((d.interruptedMaxAllocHeap||0)/1024)+'K）';
-      $('resetInfo').innerText+=diag;
+      $('resetInfo').textContent+=diag;
     }
   }).catch(e=>{console.log('stats error',e)});
   
   // 自动查询模组信息
   fetch('/query?type=network').then(r=>r.json()).then(d=>{
-    if(d.success){$('modNet').innerHTML=d.message;$('modNet').style.color='#15803d'}
-    else{$('modNet').innerText='未注册网络';$('modNet').style.color='#b91c1c'}
-  }).catch(e=>{$('modNet').innerText='查询失败';console.log('network error',e)});
+    if(d.success){queryMessage($('modNet'),d.message);$('modNet').style.color='#15803d'}
+    else{$('modNet').textContent='未注册网络';$('modNet').style.color='#b91c1c'}
+  }).catch(e=>{$('modNet').textContent='查询失败';console.log('network error',e)});
   
   setTimeout(()=>{
-    fetch('/query?type=signal').then(r=>r.json()).then(d=>{$('modSig').innerHTML=d.message}).catch(e=>{});
+    fetch('/query?type=signal').then(r=>r.json()).then(d=>{queryMessage($('modSig'),d.message)}).catch(e=>{});
     fetch('/query?type=siminfo').then(r=>r.json()).then(d=>{
         var s=$('modSim');
-        if(d.success){s.innerText='SIM OK';s.className='badge b-ok'}else{s.innerText='SIM ERR';s.className='badge b-err'}
+        if(d.success){s.textContent='SIM OK';s.className='badge b-ok'}else{s.textContent='SIM ERR';s.className='badge b-err'}
     }).catch(e=>{});
   },2000);
 }
@@ -720,10 +764,10 @@ function act(t){
     postJ('/sendsms',{phone:p,content:x},d=>toast(d.message));
   }
   if(t==='ping'){
-    var l=$('pLog');l.style.display='block';l.innerText='正在 Ping 8.8.8.8 ...';
+    var l=$('pLog');l.style.display='block';l.textContent='正在 Ping 8.8.8.8 ...';
     postJ('/ping',{},d=>{
-        l.innerText=d.message;l.style.color=d.success?'#15803d':'#b91c1c';
-    });
+        l.textContent=d.message;l.style.color=d.success?'#15803d':'#b91c1c';
+    },message=>{l.textContent=message;l.style.color='#b91c1c'});
   }
 }
 
@@ -750,7 +794,7 @@ function cleanupHistory(type){
   var targetText=isCall?'来电记录':'短信记录';
   if(!confirm('确定要清洗'+targetText+'中的损坏历史行吗？\n会保留看起来合法的记录，删除无法解析的旧脏数据。')) return;
   fetch('/cleanhistory?type='+encodeURIComponent(type),{method:'POST'})
-  .then(r=>r.json())
+  .then(checkedJson)
   .then(d=>{
     toast((d.message||('已清洗'+targetText))+'，保留'+(d.kept||0)+'条，删除'+(d.removed||0)+'条');
     loadHist();
@@ -773,20 +817,60 @@ function getAvatarColor(name){
   return colors[Math.abs(hash)%colors.length];
 }
 
+// 历史字段只作为文本写入，布局和事件不由历史数据生成。
+function histNode(tag,className,text){
+  var node=document.createElement(tag);
+  if(className)node.className=className;
+  if(text!==undefined)node.textContent=text;
+  return node;
+}
+
+function histListStatus(text,padding,color){
+  var list=$('contactList');
+  list.textContent='';
+  var status=histNode('div','',text);
+  status.style.textAlign='center';
+  status.style.padding=padding;
+  status.style.color=color||'#94a3b8';
+  status.style.fontSize='0.85em';
+  list.appendChild(status);
+}
+
+function histChatStatus(text,icon){
+  var chat=$('chatMessages');
+  chat.textContent='';
+  var status=histNode('div','chat-empty');
+  if(icon){
+    var image=histNode('div','',icon);
+    image.style.cssText='font-size:2em;margin-bottom:10px';
+    status.appendChild(image);
+    status.appendChild(histNode('div','',text));
+  }else{
+    status.textContent=text;
+  }
+  chat.appendChild(status);
+}
+
+$('chatBack').addEventListener('click',backToList);
+
 function loadHist(){
-  $('contactList').innerHTML='<div style="text-align:center;padding:20px;color:#94a3b8;font-size:0.85em">加载中...</div>';
-  $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">💬</div><div>加载中...</div></div>';
-  fetch('/history').then(r=>r.json()).then(d=>{
+  histListStatus('加载中...','20px');
+  histChatStatus('加载中...','\uD83D\uDCAC');
+  fetch('/history').then(r=>{
+    if(!r.ok)throw new Error('历史请求失败');
+    return r.json();
+  }).then(d=>{
+    if(d.success===false)throw new Error('历史读取失败');
     smsData=d.smsHistory||d.history||[];
     callData=d.callHistory||[];
     var data=(histMode==='call') ? callData : smsData;
     if(data.length==0){
-      $('contactList').innerHTML='<div style="text-align:center;padding:30px 10px;color:#94a3b8;font-size:0.85em">'+(histMode==='call'?'暂无来电':'暂无短信')+'</div>';
-      $('chatMessages').innerHTML='<div class="chat-empty"><div style="font-size:2em;margin-bottom:10px">📭</div><div>'+(histMode==='call'?'暂无来电记录':'暂无短信记录')+'</div></div>';
+      histListStatus(histMode==='call'?'暂无来电':'暂无短信','30px 10px');
+      histChatStatus(histMode==='call'?'暂无来电记录':'暂无短信记录','\uD83D\uDCED');
       return;
     }
     // 按号码分组
-    var contacts={};
+    var contacts=Object.create(null);
     data.forEach(i=>{
       var key=(histMode==='call') ? i.n : i.s;
       if(!contacts[key])contacts[key]={name:key,msgs:[],lastTime:i.t};
@@ -796,34 +880,38 @@ function loadHist(){
     // 按最新消息时间排序联系人
     var sortedContacts=Object.values(contacts).sort((a,b)=>b.lastTime.localeCompare(a.lastTime));
     // 渲染联系人列表
-    var h='';
-    sortedContacts.forEach((c,idx)=>{
+    var list=document.createDocumentFragment();
+    sortedContacts.forEach(c=>{
       var preview=(histMode==='call') ? ('来电 '+c.msgs.length+' 次') : (c.msgs[0].m.substring(0,20)+(c.msgs[0].m.length>20?'...':''));
       var shortTime=c.lastTime.substring(5,16);
       var avColor=getAvatarColor(c.name);
-      var avText=c.name.replace('+','').substring(0,1);
-      avText = c.name.length > 2 ? c.name.substring(0,1) : c.name;
-
-      h+=`<div class="contact-item${idx===0?' active':''}" onclick="selContact('${c.name.replace(/'/g,"\\'")}')" data-name="${c.name}">
-        <div class="contact-avatar" style="background:${avColor}">${avText}</div>
-        <div class="contact-info">
-          <div class="contact-name-row">
-             <div class="contact-name">${c.name}</div>
-             <div class="contact-time">${shortTime}</div>
-          </div>
-          <div class="contact-preview-row">
-             <div class="contact-preview">${preview}</div>
-             ${c.msgs.length>1 ? '<div class="contact-badge">'+c.msgs.length+'</div>' : ''}
-          </div>
-        </div>
-      </div>`;
+      var avText=c.name.length > 2 ? c.name.substring(0,1) : c.name;
+      var item=histNode('div','contact-item');
+      item.dataset.name=c.name;
+      item.addEventListener('click',()=>selContact(c.name));
+      var avatar=histNode('div','contact-avatar',avText);
+      avatar.style.background=avColor;
+      item.appendChild(avatar);
+      var info=histNode('div','contact-info');
+      var nameRow=histNode('div','contact-name-row');
+      nameRow.appendChild(histNode('div','contact-name',c.name));
+      nameRow.appendChild(histNode('div','contact-time',shortTime));
+      info.appendChild(nameRow);
+      var previewRow=histNode('div','contact-preview-row');
+      previewRow.appendChild(histNode('div','contact-preview',preview));
+      if(c.msgs.length>1)previewRow.appendChild(histNode('div','contact-badge',c.msgs.length));
+      info.appendChild(previewRow);
+      item.appendChild(info);
+      list.appendChild(item);
     });
-    $('contactList').innerHTML=h;
+    $('contactList').textContent='';
+    $('contactList').appendChild(list);
     // 默认选中第一个联系人
     if(sortedContacts.length>0)selContact(sortedContacts[0].name);
   }).catch(e=>{
     console.error('加载短信失败',e);
-    $('contactList').innerHTML='<div style="text-align:center;padding:20px;color:#b91c1c;font-size:0.85em">加载失败</div>';
+    histListStatus('加载失败','20px','#b91c1c');
+    histChatStatus('加载失败','⚠');
   });
 }
 
@@ -844,7 +932,7 @@ function selContact(name){
   // 过滤该联系人的消息
   var msgs=(histMode==='call') ? callData.filter(i=>i.n===name) : smsData.filter(i=>i.s===name);
   if(msgs.length===0){
-    $('chatMessages').innerHTML='<div class="chat-empty">无消息</div>';
+    histChatStatus('无消息');
     return;
   }
   // 按时间正序排列（旧的在上）
@@ -856,9 +944,12 @@ function selContact(name){
   var avText=name.length > 2 ? name.substring(0,1) : name;
   
   // 移动端显示返回按钮和名字
-  var backBtn='<div class="chat-back" onclick="backToList()"><svg viewBox="0 0 24 24" width="24" height="24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="#64748b"/></svg></div>';
-  $('chatTitle').innerHTML=`${backBtn}<div class="contact-avatar" style="width:28px;height:28px;font-size:0.8em;background:${avColor}">${avText}</div> ${name}`;
-  $('chatCount').innerText=msgs.length + (histMode==='call' ? '次来电' : '条短信');
+  var avatar=$('chatAvatar');
+  avatar.style.display='flex';
+  avatar.style.background=avColor;
+  avatar.textContent=avText;
+  $('chatName').textContent=name;
+  $('chatCount').textContent=msgs.length + (histMode==='call' ? '次来电' : '条短信');
   $('chatCount').style.marginLeft='36px'; // 对齐调整
   
   // 移动端切换视图
@@ -868,30 +959,26 @@ function selContact(name){
   }
   
   // 渲染消息，按日期分组
-  var h='';
+  var messages=document.createDocumentFragment();
   var lastDay='';
   msgs.forEach(m=>{
     var day=m.t.substring(0,10);
     if(day!==lastDay){
-      h+='<div class="chat-day"><span>'+day+'</span></div>';
+      var divider=histNode('div','chat-day');
+      divider.appendChild(histNode('span','',day));
+      messages.appendChild(divider);
       lastDay=day;
     }
     var time=m.t.substring(11,16);
-    if(histMode==='call'){
-      h+=`<div class="msg-bubble msg-in">
-        <div>📞 来电记录</div>
-        <span class="msg-time">${time}</span>
-      </div>`;
-    }else{
-      h+=`<div class="msg-bubble msg-in">
-        <div>${m.m}</div>
-        <span class="msg-time">${time}</span>
-      </div>`;
-    }
+    var bubble=histNode('div','msg-bubble msg-in');
+    bubble.appendChild(histNode('div','msg-text',histMode==='call'?' 来电记录':m.m));
+    bubble.appendChild(histNode('span','msg-time',time));
+    messages.appendChild(bubble);
   });
-  $('chatMessages').innerHTML=h;
-  // 滚动到底部
   var chatBox=$('chatMessages');
+  chatBox.textContent='';
+  chatBox.appendChild(messages);
+  // 滚动到底部
   requestAnimationFrame(()=>chatBox.scrollTop=chatBox.scrollHeight);
 }
 
@@ -902,30 +989,30 @@ function backToList(){
 
 function saveFilter(){
   var ls=$('ftList').value.split(/[,，\n]/).map(s=>s.trim()).filter(s=>s).join(',');
-  postJ('/filter',{
+  return postJ('/filter',{
     enabled: $('ftEn').value==='true',
     whitelist: $('ftWl').value==='true',
     numbers: ls.split(',') //后端兼容数组格式
-  }, d=>toast('已保存号码过滤设置'));
+  }, d=>toast(d.message));
 }
 
 function saveContentFilter(){
   var ls=$('cfList').value.split(/[,，\n]/).map(s=>s.trim()).filter(s=>s).join(',');
-  postJ('/contentfilter',{
+  return postJ('/contentfilter',{
     enabled: $('cfEn').value==='true',
     whitelist: $('cfWl').value==='true',
     keywords: ls
-  }, d=>toast('已保存关键词过滤设置'));
+  }, d=>toast(d.message));
 }
 
 function saveTimer(){
-  postJ('/timer',{
+  return postJ('/timer',{
     enabled: $('tmEn').value==='true',
     type: +$('tmType').value,
     interval: +$('tmInt').value,
     phone: $('tmPh').value,
     message: $('tmMsg').value
-  }, d=>toast('已保存定时任务'));
+  }, d=>{toast(d.message);tm.rm=d.remain;updTmInfo()});
 }
 
 function saveAll(e){
@@ -940,18 +1027,15 @@ function saveAll(e){
     headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:params.toString()
   })
-  .then(r=>r.json()).then(d=>{
-    if(d.success){
-      toast('配置已保存');
-      if(d.needRestart && confirm('配置已保存成功！\n\n是否立即重启设备使配置生效？')){
-        toast('设备重启中...');
-        postJ('/restart',{},()=>{});
+  .then(checkedJson).then(d=>{
+    toast(d.message);
+    if(d.needRestart && confirm(d.message+'\n\n是否立即重启设备使配置生效？')){
+      postJ('/restart',{},r=>{
+        toast(r.message);
         setTimeout(()=>location.reload(),3000);
-      }
-    }else{
-      toast(d.message||'保存失败');
+      });
     }
-  }).catch(e=>{console.error(e);toast('保存失败，请检查网络')});
+  }).catch(e=>{toast(e.message||'保存失败，请检查网络')});
   return false;
 }
 
