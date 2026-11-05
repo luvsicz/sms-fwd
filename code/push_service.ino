@@ -48,8 +48,12 @@ struct SmtpLockGuard {
   bool isLocked() const { return locked; }
 };
 
-// HTTP 推送必须短超时，避免单个通道阻塞 loopTask 触发看门狗
-static const uint16_t HTTP_PUSH_TIMEOUT_MS = 1000;
+// 请求仅在后台 worker 执行；1 秒不足以完成公网 TLS/APNs 往返，不能沿用同步 loop 的预算。
+// TCP/响应为毫秒，TLS 握手 API 为秒；仍有界、单 worker，不重发结果不确定的 POST。
+static const uint16_t HTTP_PUSH_CONNECT_TIMEOUT_MS = 5000;
+static const uint16_t HTTP_PUSH_TIMEOUT_MS = 10000;
+static const uint8_t HTTP_PUSH_TLS_HANDSHAKE_TIMEOUT_SEC = 15;
+static const uint16_t HTTP_PUSH_PREVIEW_TIMEOUT_MS = 1000;
 static const uint8_t HTTP_PUSH_QUEUE_LENGTH = MAX_PUSH_CHANNELS * 2;
 static const uint32_t HTTP_PUSH_TASK_STACK_SIZE = 16384;  // HTTPS TLS 握手需 10-16KB 栈
 static const uint8_t HTTP_PUSH_WORKER_COUNT = 1;          // 单 Worker 串行消费，节约栈空间并消除多通道并发 TLS 内存暴击 (OOM)
@@ -63,6 +67,10 @@ struct HttpPushJob {
   String sender;
   String message;
   String timestamp;
+
+  HttpPushJob() = default;
+  HttpPushJob(const HttpPushJob&) = delete;
+  HttpPushJob& operator=(const HttpPushJob&) = delete;
 };
 
 struct EmailJob {
@@ -88,6 +96,8 @@ static TaskHandle_t emailTaskHandle = nullptr;
 
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
 static void sendEmailNotificationNow(const EmailJob& job);
+// HTTP/邮件快照共用完整复制检查；定义保留在邮件 producer 附近。
+static bool copyEmailString(String& target, const char* source, size_t length);
 
 static void feedPushWatchdog() {
   if (esp_task_wdt_status(NULL) == ESP_OK) {
@@ -149,17 +159,38 @@ static bool enqueueHttpPush(const PushChannel& channel, const char* sender, cons
     return false;
   }
 
-  HttpPushJob* job = new HttpPushJob();
+  HttpPushJob* job = new (std::nothrow) HttpPushJob();
   if (job == nullptr) {
     Serial.println("HTTP推送任务分配内存失败");
     stats.pushFailed++;
     return false;
   }
 
-  job->channel = channel;
-  job->sender = String(sender);
-  job->message = String(message);
-  job->timestamp = String(timestamp);
+  job->channel.enabled = channel.enabled;
+  job->channel.type = channel.type;
+  const bool copied =
+    copyEmailString(job->channel.name, channel.name.c_str(), channel.name.length()) &&
+    copyEmailString(job->channel.url, channel.url.c_str(), channel.url.length()) &&
+    copyEmailString(job->channel.key1, channel.key1.c_str(), channel.key1.length()) &&
+    copyEmailString(job->channel.key2, channel.key2.c_str(), channel.key2.length()) &&
+    copyEmailString(job->channel.customBody, channel.customBody.c_str(), channel.customBody.length()) &&
+    copyEmailString(job->sender, sender, sender ? strlen(sender) : 0) &&
+    copyEmailString(job->message, message, message ? strlen(message) : 0) &&
+    copyEmailString(job->timestamp, timestamp, timestamp ? strlen(timestamp) : 0);
+  if (!copied) {
+    Serial.println("HTTP推送快照复制失败，丢弃本次通道推送");
+    delete job;
+    stats.pushFailed++;
+    return false;
+  }
+  // 复制来的 URL 可能有粘贴空白；仅规范化任务副本，不修改持久化配置或短信正文。
+  job->channel.url.trim();
+  if (job->channel.url.length() == 0) {
+    Serial.println("HTTP推送URL为空，丢弃本次通道推送");
+    delete job;
+    stats.pushFailed++;
+    return false;
+  }
 
   if (xQueueSend(httpPushQueue, &job, 0) != pdTRUE) {
     Serial.println("HTTP推送队列已满，丢弃本次通道推送");
@@ -387,14 +418,15 @@ int sendHttpRequest(const String& url, const String& method, const String& conte
   WiFiClientSecure localSslClient;
   HTTPClient http;
   bool beginOk = false;
+  const unsigned long requestStart = millis();
 
   feedPushWatchdog();
 
   // 判断是否为 HTTPS
   if (url.startsWith("https://")) {
     localSslClient.setInsecure();
-    localSslClient.setTimeout(1);
-    localSslClient.setHandshakeTimeout(1);
+    localSslClient.setTimeout(HTTP_PUSH_TIMEOUT_MS);
+    localSslClient.setHandshakeTimeout(HTTP_PUSH_TLS_HANDSHAKE_TIMEOUT_SEC);
     beginOk = http.begin(localSslClient, url);
   } else {
     beginOk = http.begin(url);
@@ -407,7 +439,8 @@ int sendHttpRequest(const String& url, const String& method, const String& conte
     return -1;
   }
 
-  http.setConnectTimeout(HTTP_PUSH_TIMEOUT_MS);
+  http.setReuse(false);  // 每个任务独立连接；不为短响应空等 keep-alive。
+  http.setConnectTimeout(HTTP_PUSH_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_PUSH_TIMEOUT_MS);
 
   if (contentType.length() > 0) {
@@ -426,39 +459,53 @@ int sendHttpRequest(const String& url, const String& method, const String& conte
   feedPushWatchdog();
 
   if (httpCode > 0) {
-    Serial.printf("HTTP响应码: %d\n", httpCode);
-    // 所有 2xx 状态码都视为成功 (200 OK, 201 Created, 202 Accepted, 204 No Content 等)
-    if (httpCode >= 200 && httpCode < 300) {
-      // 只读取有限的响应预览，不把远端返回体整体复制到堆上。
-      NetworkClient* responseStream = http.getStreamPtr();
-      if (responseStream != nullptr) {
-        const size_t previewLimit = 256;
-        char preview[previewLimit + 1];
-        size_t previewLength = 0;
-        unsigned long previewStart = millis();
-        while (previewLength < previewLimit && millis() - previewStart < HTTP_PUSH_TIMEOUT_MS) {
-          int available = responseStream->available();
-          if (available <= 0) {
-            if (!responseStream->connected()) break;
-            yield();
-            delay(1);
-            continue;
-          }
-          size_t toRead = min((size_t)available, previewLimit - previewLength);
-          int readLength = responseStream->readBytes(preview + previewLength, toRead);
-          if (readLength <= 0) break;
-          previewLength += (size_t)readLength;
+    Serial.printf("HTTP响应码: %d，耗时: %lums\n", httpCode, millis() - requestStart);
+    // 错误响应同样读取有界诊断；不调用无界 getString()，不原样打印可能回显密钥的远端正文。
+    // chunked/未知长度仅作为原始预览，不把预览当作完整 JSON 或手机送达回执。
+    NetworkClient* responseStream = http.getStreamPtr();
+    if (responseStream != nullptr) {
+      const size_t previewLimit = 256;
+      const int responseLength = http.getSize();
+      const size_t toPreview = responseLength >= 0 ? min((size_t)responseLength, previewLimit) : previewLimit;
+      char preview[previewLimit + 1];
+      size_t previewLength = 0;
+      unsigned long previewStart = millis();
+      while (previewLength < toPreview && millis() - previewStart < HTTP_PUSH_PREVIEW_TIMEOUT_MS) {
+        int available = responseStream->available();
+        if (available <= 0) {
+          if (!responseStream->connected()) break;
+          yield();
+          delay(1);
+          continue;
         }
-        preview[previewLength] = '\0';
-        Serial.println("响应: " + String(preview));
+        size_t toRead = min((size_t)available, toPreview - previewLength);
+        int readLength = responseStream->readBytes(preview + previewLength, toRead);
+        if (readLength <= 0) break;
+        previewLength += (size_t)readLength;
       }
+      preview[previewLength] = '\0';
+      Serial.printf("HTTP响应预览: %u 字节（原文不写日志）\n", (unsigned int)previewLength);
+      // 仅输出固件内置的错误标记，不输出未知远端文本、URL、设备 Key 或短信内容。
+      const char* knownErrors[] = {"BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered",
+                                   "MissingDeviceToken", "TooManyRequests"};
+      for (const char* error : knownErrors) {
+        if (strstr(preview, error) != nullptr) {
+          Serial.printf("推送服务错误标记: %s\n", error);
+          break;
+        }
+      }
+    }
+    // 计数表示 HTTP 接受请求，不表示手机已经显示通知。
+    if (httpCode >= 200 && httpCode < 300) {
       stats.pushSuccess++;
     } else {
-      Serial.println("HTTP错误响应");
+      Serial.println(httpCode >= 300 && httpCode < 400
+        ? "HTTP重定向未跟随，请配置最终推送URL" : "HTTP错误响应，请检查状态码、错误标记及通道配置");
       stats.pushFailed++;
     }
   } else {
-    Serial.printf("HTTP请求失败: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("HTTP请求失败: %s，耗时: %lums（连接/TLS或响应失败，未自动重发）\n",
+                  http.errorToString(httpCode).c_str(), millis() - requestStart);
     stats.pushFailed++;
   }
   
@@ -502,8 +549,11 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         jsonData += ",\"group\":\"" + jsonEscape(channel.key2) + "\"";
       }
       jsonData += "}";
-      Serial.println("BARK: " + jsonData);
-      sendHttpRequest(channel.url, "POST", "application/json", jsonData);
+      Serial.println("Bark: 提交推送请求");
+      int code = sendHttpRequest(channel.url, "POST", "application/json", jsonData);
+      if (code >= 200 && code < 300) {
+        Serial.println("Bark: HTTP请求已接受；手机是否显示通知仍需在客户端确认");
+      }
       break;
     }
     

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -23,9 +24,12 @@ inline std::vector<std::string> pushEvents;
 struct PushJobHeap {
   size_t calls = 0, failAt = 0, faultHits = 0, frees = 0, live = 0;
   void* pointers[32]{};
+  size_t sizes[32]{};
   bool active = false;
-  void remember(void* p) noexcept {
-    for (auto& slot : pointers) if (!slot) { slot = p; ++live; return; }
+  void remember(void* p, size_t size = 0) noexcept {
+    for (size_t i = 0; i < 32; ++i) if (!pointers[i]) {
+      pointers[i] = p; sizes[i] = size; ++live; return;
+    }
     std::abort();
   }
   void release(void* p) noexcept {
@@ -88,6 +92,7 @@ class String {
 public:
   String() { ++PushStringHeap::instances; }
   String(const char* text) : String() { assign(text, text ? std::strlen(text) : 0); }
+  explicit String(int value) : String(std::to_string(value).c_str()) {}
   String(const String& text) : String() { ++PushStringHeap::copies; assign(text.c_str(), text.length()); }
   String(String&& text) noexcept : String() { std::swap(bytes, text.bytes); std::swap(size, text.size);
     std::swap(capacity, text.capacity); std::swap(valid, text.valid); }
@@ -127,6 +132,23 @@ public:
   }
   bool concat(const char* text) { return concat(text, text ? std::strlen(text) : 0); }
   bool concat(const String& text) { return concat(text.c_str(), text.length()); }
+  String& operator+=(const String& text) { concat(text); return *this; }
+  String& operator+=(const char* text) { concat(text); return *this; }
+  String& operator+=(char text) { concat(&text, 1); return *this; }
+  char charAt(unsigned int index) const { return index < size ? bytes[index] : 0; }
+  int indexOf(char value) const {
+    const char* found = bytes ? static_cast<const char*>(std::memchr(bytes, value, size)) : nullptr;
+    return found ? static_cast<int>(found - bytes) : -1;
+  }
+  void replace(const char* from, const String& to) {
+    std::string value(c_str() ? c_str() : "");
+    size_t at = 0, length = std::strlen(from);
+    if (!length) return;
+    while ((at = value.find(from, at)) != std::string::npos) {
+      value.replace(at, length, to.c_str() ? to.c_str() : ""); at += to.length();
+    }
+    assign(value.c_str(), static_cast<unsigned int>(value.size()));
+  }
   void remove(unsigned int first) {
     if (first < size) { size = first; bytes[size] = 0; }
   }
@@ -143,6 +165,11 @@ public:
     return count <= size && std::strncmp(c_str(), prefix, count) == 0;
   }
   bool operator==(const char* text) const { return c_str() && text && std::strcmp(c_str(), text) == 0; }
+  bool operator==(const String& text) const { return *this == text.c_str(); }
+  bool operator!=(const char* text) const { return !(*this == text); }
+  friend String operator+(const String& left, const String& right) {
+    String result(left); result.concat(right); return result;
+  }
   friend String operator+(const char* left, const String& right) {
     String result(left); result.concat(right); return result;
   }
@@ -150,10 +177,13 @@ public:
 
 class Preferences {};
 using esp_reset_reason_t = int;
+inline std::string pushSerialLog;
 struct PushSerial {
-  void println(const char*) {}
-  void println(const String&) {}
-  template<class... Args> void printf(const char*, Args...) {}
+  void println(const char* text) { pushSerialLog += text ? text : ""; pushSerialLog += '\n'; }
+  void println(const String& text) { println(text.c_str()); }
+  template<class... Args> void printf(const char* format, Args... args) {
+    char buffer[512]; std::snprintf(buffer, sizeof(buffer), format, args...); pushSerialLog += buffer;
+  }
 };
 inline PushSerial Serial;
 
@@ -390,7 +420,10 @@ struct NetworkClient {
 };
 struct PushHttpProbe {
   bool beginOk = true, nullStream = false;
+  bool reuse = true;
   int code = 200, connectTimeout = 0, timeout = 0, tlsTimeout = 0, tlsHandshake = 0;
+  int contentLength = -1;
+  unsigned long connectDelay = 0, handshakeDelay = 0, headerDelay = 0;
   size_t begins = 0, requests = 0, ends = 0, destructors = 0, lifetimeErrors = 0;
   std::string url, method, contentType, body;
   NetworkClient stream;
@@ -411,11 +444,23 @@ public:
     return begin(url); // Retain the reference even when begin fails: exercise early-return destruction.
   }
   bool begin(const String& url) { ++pushHttp.begins; pushHttp.url = url.c_str(); return pushHttp.beginOk; }
+  void setReuse(bool value) { pushHttp.reuse = value; }
   void setConnectTimeout(int value) { pushHttp.connectTimeout = value; }
   void setTimeout(int value) { pushHttp.timeout = value; }
   void addHeader(const char*, const String& value) { pushHttp.contentType = value.c_str(); }
-  int GET() { ++pushHttp.requests; pushHttp.method = "GET"; return pushHttp.code; }
-  int POST(const String& body) { ++pushHttp.requests; pushHttp.method = "POST"; pushHttp.body = body.c_str(); return pushHttp.code; }
+  int request(const char* method) {
+    ++pushHttp.requests; pushHttp.method = method;
+    auto stage = [](unsigned long needed, unsigned long budget) {
+      pushMillis += min(needed, budget); return needed <= budget;
+    };
+    if (!stage(pushHttp.connectDelay, pushHttp.connectTimeout)) return -1;
+    if (client && !stage(pushHttp.handshakeDelay, pushHttp.tlsHandshake * 1000UL)) return -1;
+    if (!stage(pushHttp.headerDelay, pushHttp.timeout)) return -11;
+    return pushHttp.code;
+  }
+  int GET() { return request("GET"); }
+  int POST(const String& body) { pushHttp.body = body.c_str(); return request("POST"); }
+  int getSize() const { return pushHttp.contentLength; }
   NetworkClient* getStreamPtr() { return pushHttp.nullStream ? nullptr : &pushHttp.stream; }
   String errorToString(int) { return "host HTTP error"; }
   void end() { ++pushHttp.ends; pushEvents.emplace_back("http.end"); }

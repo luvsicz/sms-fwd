@@ -46,7 +46,7 @@ function Get-PushDeclaration([string]$Pattern, [string]$Name) {
 }
 function Get-PushBlock([string]$Name, [switch]$Struct) {
     $pattern = if ($Struct) { '(?m)^[ \t]*struct\s+' + $Name + '\s*\{' }
-               else { '(?m)^[ \t]*(?:static\s+)?(?:void|bool|int)\s+' + $Name + '\s*\([^;{}]*\)\s*\{' }
+               else { '(?m)^[ \t]*(?:static\s+)?(?:void|bool|int|String)\s+' + $Name + '\s*\([^;{}]*\)\s*\{' }
     $headers = [regex]::Matches($masked, $pattern)
     if ($headers.Count -ne 1) { throw "Expected exactly one production definition: $Name" }
     $start = $headers[0].Index
@@ -102,21 +102,38 @@ try {
     }
     $actual = @(
         (Get-PushDeclaration '(?m)^static SemaphoreHandle_t smtpMutex\s*=\s*nullptr\s*;' 'smtpMutex'),
-        (Get-PushBlock 'SmtpLockGuard' -Struct), (Get-PushBlock 'EmailJob' -Struct)
+        (Get-PushBlock 'SmtpLockGuard' -Struct), (Get-PushBlock 'EmailJob' -Struct),
+        (Get-PushBlock 'HttpPushJob' -Struct)
     )
-    foreach ($name in @('HTTP_PUSH_TIMEOUT_MS', 'EMAIL_QUEUE_LENGTH', 'EMAIL_TASK_STACK_SIZE',
+    foreach ($name in @('HTTP_PUSH_TIMEOUT_MS', 'HTTP_PUSH_QUEUE_LENGTH', 'HTTP_PUSH_TASK_STACK_SIZE',
+                        'HTTP_PUSH_WORKER_COUNT', 'EMAIL_QUEUE_LENGTH', 'EMAIL_TASK_STACK_SIZE',
                         'SMTP_STAGE_TIMEOUT_MS', 'SMTP_PROGRESS_DELAY_TICKS')) {
         $actual += Get-PushDeclaration ('(?m)^static const \w+\s+' + $name + '\s*=\s*[^;]+;') $name
     }
-    foreach ($name in @('emailQueue', 'emailTaskHandle')) {
+    # Include any additional HTTP timeout budgets from the current implementation, also allowing
+    # this runner to prove failure against the original one-second implementation.
+    foreach ($name in @('HTTP_PUSH_CONNECT_TIMEOUT_MS', 'HTTP_PUSH_TLS_HANDSHAKE_TIMEOUT_SEC',
+                        'HTTP_PUSH_PREVIEW_TIMEOUT_MS')) {
+        if ($masked -match ('\b' + $name + '\s*=')) {
+            $actual += Get-PushDeclaration ('(?m)^static const \w+\s+' + $name + '\s*=\s*[^;]+;') $name
+        }
+    }
+    foreach ($name in @('emailQueue', 'emailTaskHandle', 'httpPushQueue')) {
         $actual += Get-PushDeclaration ('(?m)^static \w+\s+' + $name + '\s*=\s*nullptr\s*;') $name
     }
+    $actual += Get-PushDeclaration '(?m)^static TaskHandle_t httpPushTaskHandles\[[^;]+;' 'HTTP worker handles'
     $actual += Get-PushDeclaration '(?m)^static void sendEmailNotificationNow\s*\([^;{}]*\)\s*;' 'sender prototype'
     $functions = @('initSmtpLock', 'feedPushWatchdog', 'copyEmailString', 'emailWorkerTask', 'waitForSmtpProgress',
-        'ensureEmailWorker', 'enqueueEmail', 'sendHttpRequest', 'sendEmailNotification',
+        'ensureEmailWorker', 'enqueueEmail', 'httpPushWorkerTask', 'ensureHttpPushWorker', 'enqueueHttpPush',
+        'urlEncode', 'jsonEscape', 'telegramEscape', 'sendHttpRequest', 'sendToChannel', 'sendSMSToServer', 'sendEmailNotification',
         'buildEmailAddressHeader', 'sendEmailNotificationNow')
     foreach ($name in $functions) { $actual += Get-PushBlock $name }
     [IO.File]::WriteAllText((Join-Path $tempRoot 'push_actual.inc'), ($actual -join "`n`n"), $utf8)
+    $configPath = Join-Path $SourceDirectory 'config.ino'
+    $configSource = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    $validation = [regex]::Match($configSource, '(?ms)^bool isPushChannelValid\(const PushChannel& ch\) \{.*?^\}')
+    if (-not $validation.Success) { throw 'Missing real isPushChannelValid definition' }
+    [IO.File]::WriteAllText((Join-Path $tempRoot 'push_config_actual.inc'), $validation.Value, $utf8)
     Write-Output "Production: $($functions.Count) unmodified functions, actual EmailJob/lock/queue declarations and config/push headers."
     Write-Output "push_service.ino SHA256: $((Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash)"
     Write-Output "Host compiler: $CompilerPath"

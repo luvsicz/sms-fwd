@@ -344,7 +344,7 @@ void httpLifetimes() {
         CHECK(pushHttp.ends == (code ? 1U : 0U) && pushHttp.requests == (code ? 1U : 0U));
         CHECK(event("http.destroy") < event("tls.destroy"));
         if (code) CHECK(event("http.end") < event("http.destroy"));
-        CHECK(pushHttp.stream.cursor == (code == 204 ? 256U : 0U));
+        CHECK(pushHttp.stream.cursor == (code > 0 ? 256U : 0U));
         saved(code == 204 ? 1 : 0, code == 204 ? 0 : 1, 0);
         // A fresh request after any return path must still have a live TLS client at HTTP destruction.
         pushHttp = {}; pushEvents.clear();

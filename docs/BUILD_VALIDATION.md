@@ -1,8 +1,23 @@
-# 编译验证（2026-11-04）
+# 编译验证（2026-11-05）
 
 本记录为已确认的**纯编译**测量：未烧录、未擦除、未修改设备分区，也未更新仓库旧 `code/build/` 产物；不代表实板运行或长稳验证。
 
-## 环境与测量
+## 本次 Bark / 电信补修（2026-11-05）
+
+- 在原环境 **Arduino CLI 1.5.1 / ESP32 Core 3.3.10 / pdulib 0.5.11 / PubSubClient 2.8 / ReadyMail 0.4.2** 执行完整 `--clean --warnings all --jobs 4` 编译，退出 **0**；IDE 构建检查也通过。
+- FQBN 保持 `esp32:esp32:esp32c3:PartitionScheme=huge_app,FlashMode=dio,FlashFreq=80,FlashSize=4M`，未改分区或任务栈。**22 个已跟踪 sketch 源文件哈希与编译前记录完全一致**。
+
+| 指标（字节） | 上轮 `2dc3511` 对应测量 | 本次实测 | 差值 |
+|---|---:|---:|---:|
+| 程序统计 | 1,531,307 | 1,532,369 | +1,062 |
+| 应用镜像 `code.ino.bin` | 1,531,456 | 1,532,528 | +1,072 |
+| 静态 RAM | 54,132 | 54,132 | 0 |
+
+本次应用分区仍为 **3,145,728 字节**，镜像余量 **1,613,200 字节（约 1.54 MiB）**。测试和文档均在 sketch 外，不烧入固件；运行时堆/TLS 栈占用未因静态 RAM 不变而获得实机验证。构建记录 **51 条 warning**（包含既有源码/库警告），不是零警告构建。
+
+本机私有证据目录：`C:\Users\liu_r\AppData\Local\Temp\msg-forward-bark-af40ab4571ba450dbc8fff4bec6cc515`；`compile.exit` 为 0，`compile.log`、`source-before-build.json`、`build/partitions.csv` 和 `firmware/code.ino.bin` 分别保留编译、输入哈希、分区和镜像证据。**产物可能含 WiFi 配置，不公开或提交；未连接 COM3，未发送真实通知。** 当前测试结果见 [TODO.md](../TODO.md) 的 2026-11-05 补修记录。
+
+## 上轮环境与测量（2026-11-04 历史记录）
 
 - Arduino CLI **1.5.1**；ESP32 Arduino Core **3.3.10**。
 - pdulib **0.5.11**、PubSubClient **2.8**、ReadyMail **0.4.2**。

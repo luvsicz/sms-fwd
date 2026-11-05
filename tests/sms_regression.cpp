@@ -565,6 +565,52 @@ static void dcsAndAddressBoundaryTests() {
   resetState();
   receive("0B91" + std::string(20, '1') + valid.substr(16)); delivered("address bounds");
   require(pdu.decodeCalls == 0, "international SCA plus prefix cannot overflow pdulib's 21-byte buffer");
+
+  // 真实中国电信 SP 长号短信（OA 类型 0xC1 = TON 4），+CMT: ,125。曾被误判为非数字地址而丢失。
+  const std::string telecom =
+      "0891683109520000F02414C1019653330700000010100008621150910454236630106DD85B9D7F5130119A8C8BC1"
+      "78010036003300360032FF0C60A86B63572877ED4FE1767B5F55FF0C8BF75728003100355206949F518563099875"
+      "976263D0793A63D04EA49A8C8BC17801FF0C520752FF5C069A8C8BC178016CC497324E8E4ED64EBA3002";
+  const String telecomText = "【淘宝网】验证码6362，您正在短信登录，请在15分钟内按页面提示提交验证码，切勿将验证码泄露于他人。";
+  equal(String(cmtHeader(telecom).c_str()), "+CMT: ,125\r\n", "telecom fixture matches logged CMT length");
+  for (bool fallback : {false, true}) {
+    resetState(); pdu.forceFailure = fallback;
+    feed("+CMT: ,125\r\n" + telecom + "\r\n");
+    delivered(telecomText, "2026-11-05 19:40:45");
+    equal(history.back().sender, "10693533700000000101", "TON 4 sender digits preserved without '+'");
+    equal(httpMessages.back().sender, history.back().sender, "HTTP entry receives the complete telecom sender");
+    require(!smsWaitingPdu && smsExpectedTpduBytes == 0, "telecom PDU consumes the pending header immediately");
+    require(pdu.decodeCalls == 0, "TON 4 bypasses pdulib, which misaligns non-0/1/2 address types");
+    feed(telecom + "\r\n");
+    smsTestMillis += cmtWaitMs;
+    checkSerial1URC();
+    delivered(telecomText, "2026-11-05 19:40:45");
+    require(Serial.tx.find("CMT等待PDU超时") == std::string::npos,
+            "consumed telecom PDU neither repeats delivery nor later times out");
+  }
+  // SCA 与 OA 的数字 TON 都需保护；0/1/2 可用库，3/4/6 必须由有界解析器处理。
+  for (const auto& base : {valid, ucs2(u"address bounds")}) {
+    for (int scaType : {0x81, 0x91, 0xA1, 0xB1, 0xC1, 0xE1}) {
+      for (int oaType : {0x81, 0x91, 0xA1, 0xB1, 0xC1, 0xE1}) {
+        resetState();
+        receive(withByte(withByte(base, 1, scaType), 10, oaType));
+        delivered("address bounds");
+        equal(history.back().sender, oaType == 0x91 ? "+13800138000" : "13800138000",
+              "BCD sender and international prefix survive every SCA/OA TON combination");
+        const bool librarySafe = scaType <= 0xA1 && oaType <= 0xA1;
+        require(pdu.decodeCalls == (librarySafe ? 1 : 0), "unsupported numeric TON never reaches pdulib");
+      }
+    }
+  }
+  for (size_t index : {1U, 10U}) {
+    fallbackRejects(withByte(valid, index, 0xF1), "reserved TON 7 rejected");
+    fallbackRejects(withByte(valid, index, 0xD0), "TON 5 is not interpreted as a numeric address");
+  }
+  for (size_t length = 0; length < telecom.size(); ++length) {
+    fallbackRejects(telecom.substr(0, length), "truncated telecom PDU rejected before pdulib");
+  }
+  require(isLikelyValidSmsSender("10693533700000000101") && !isLikelyValidSmsSender("+Google") &&
+          !isLikelyValidSmsSender("<script>"), "telecom fix preserves the numeric sender gate");
 }
 
 static void concatTests() {

@@ -45,15 +45,15 @@ foreach ($entry in $entries) {
 | `test_modem_regression.ps1` | 实际 modem/SMS 事务、URC、分片/恢复、32 位回绕 | C++、pdulib |
 | `test_mqtt_regression.ps1` | 实际 PubSubClient 编码/keepalive、MQTT/HA/LWT 契约 | C++、PubSubClient 2.8 |
 | `test_push_contracts.ps1` | 邮件快照/所有权、TLS 生命周期的源码约束（不执行固件） | 无 |
-| `test_push_host.ps1` | 实际入队/worker、SMTP/HTTP 控制流，API 为替身 | C++ |
+| `test_push_host.ps1` | 实际 Bark JSON/HTTP 与邮件入队/worker、快照 OOM/队列恢复、5s/15s/10s 预算和边界、错误脱敏及其他渠道兼容；传输为替身 | C++ |
 | `test_push_snapshot_recovery.ps1` | 邮件快照失败、资源回收和后续恢复 | C++ |
-| `test_sms_regression.ps1` | 实际 SMS 源码与 pdulib 收发/拼接回归 | C++、pdulib |
+| `test_sms_regression.ps1` | 实际 SMS 源码与 pdulib 收发/拼接、电信 TON4 样本、数字 SCA/OA TON 组合与截断回归 | C++、pdulib |
 | `test_web_regression.ps1` | 实际根页面/后端响应到离线浏览器，STA/AP、桌面/移动 | C++、浏览器 |
 
 `sms_host_runner.ps1` 是复用辅助文件，不是第十一个入口；config/timer 和 Web 入口会复用其他测试。SMS/modem 细节见 [MODEM_REGRESSION.md](MODEM_REGRESSION.md)。
 
 ## 结果与边界
 
-2026-11-04 十个默认入口全量重跑均退出 0、零失败；逐项断言/场景数及修复前失败记录见 [TODO.md](../TODO.md)。结果针对该次源码快照，后续修改应重新运行。完整固件的编译测量另见 [BUILD_VALIDATION.md](../docs/BUILD_VALIDATION.md)。
+2026-11-05 十个默认入口全量重跑均退出 0、零失败：SMS **25,361 断言 / 28 套件**、modem **7,152 / 30**、push 主回归 **2,921 断言 / 161 用例**、push recovery **1,499 / 77**。新增慢网络用例在旧一秒实现上先复现失败；结果与其余套件计数、测试适配期间的失败记录见 [TODO.md](../TODO.md)。慢网络测试是可控时钟/API 模型，**不是公网 TLS/APNs 或手机送达实测**。结果针对该次源码，后续修改应重新运行。完整固件编译及容量另见 [BUILD_VALIDATION.md](../docs/BUILD_VALIDATION.md)。
 
 宿主测试包含实际源码/函数与部分真实库，但 String、FreeRTOS、NVS/SPIFFS、串口和多数传输均为替身；浏览器使用本地夹具/模拟请求。它们不证明实板 UART/SIM 时序、并发调度、运行时堆/TLS/ReadyMail 内部分配、真实 SMTP/HTTP 投递、broker LWT 投递、HA 界面或断电持久化可靠性，也不替代完整 Arduino 编译与硬件长稳验证。源码约束检查不是行为测试；未启用的 sanitizer、被跳过的浏览器和未执行的硬件验证不得计为通过。

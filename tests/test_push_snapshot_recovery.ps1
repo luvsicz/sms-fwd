@@ -101,7 +101,9 @@ try {
         (Get-Declaration '(?m)^static SemaphoreHandle_t smtpMutex\s*=\s*nullptr\s*;' 'smtpMutex'),
         (Get-Block 'SmtpLockGuard' -Struct), (Get-Block 'EmailJob' -Struct)
     )
-    foreach ($name in @('HTTP_PUSH_TIMEOUT_MS', 'EMAIL_QUEUE_LENGTH', 'EMAIL_TASK_STACK_SIZE',
+    foreach ($name in @('HTTP_PUSH_TIMEOUT_MS', 'HTTP_PUSH_CONNECT_TIMEOUT_MS',
+                        'HTTP_PUSH_TLS_HANDSHAKE_TIMEOUT_SEC', 'HTTP_PUSH_PREVIEW_TIMEOUT_MS',
+                        'EMAIL_QUEUE_LENGTH', 'EMAIL_TASK_STACK_SIZE',
                         'SMTP_STAGE_TIMEOUT_MS', 'SMTP_PROGRESS_DELAY_TICKS')) {
         $actual += Get-Declaration ('(?m)^static const \w+\s+' + $name + '\s*=\s*[^;]+;') $name
     }

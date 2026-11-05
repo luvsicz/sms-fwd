@@ -984,10 +984,15 @@ static int smsTextAlphabet(uint8_t dcs) {
   return (dcs & 0xFC) == 0xF0 ? 0x00 : -1;
 }
 
+// 地址类型 TON：0 未知、1 国际、2 国内、3 网络特定、4 用户号（运营商 SP 长号常用，
+// 如电信 0xC1 的 1069…）、6 缩位号均为 BCD；5 为 GSM7 字母数字；7 保留。
+static int smsAddressTon(uint8_t type) { return (type >> 4) & 7; }
+static bool isSmsBcdAddressTon(int ton) { return ton <= 4 || ton == 6; }
+
 // 仅接受已支持的数字地址；先检查字段范围，再读取 BCD 和末尾填充半字节。
 static bool isSmsNumericAddress(const String& pduHex, int pos, int digits, uint8_t type) {
   int bytes = (digits + 1) / 2;
-  if (!(type & 0x80) || ((type >> 4) & 7) > 2 || digits < 1 || digits > 20 ||
+  if (!(type & 0x80) || !isSmsBcdAddressTon(smsAddressTon(type)) || digits < 1 || digits > 20 ||
       pos < 0 || pos + bytes * 2 > (int)pduHex.length()) return false;
   for (int i = 0; i < bytes; i++) {
     uint8_t value = hexByteAt(pduHex, pos + i * 2);
@@ -1051,12 +1056,11 @@ bool decodeDeliverPDUFallback(const String& pduHex, DecodedPDU& out) {
   pos += 2;
 
   int oaByteLen = (oaLen + 1) / 2;
+  // 本次仅扩展运营商数字地址 TON，不把字母地址混入数字发送方校验。
   if (!isSmsNumericAddress(pduHex, pos, oaLen, oaType)) return false;
-  String oaRaw = pduHex.substring(pos, pos + oaByteLen * 2);
+  out.sender = swapSemiOctetsToDigits(pduHex.substring(pos, pos + oaByteLen * 2), oaLen);
+  if (smsAddressTon(oaType) == 1) out.sender = "+" + out.sender;
   pos += oaByteLen * 2;
-
-  out.sender = swapSemiOctetsToDigits(oaRaw, oaLen);
-  if ((oaType & 0xF0) == 0x90) out.sender = "+" + out.sender;
 
   // PID / DCS
   if (pos + 4 > pduHex.length()) return false;
@@ -1161,6 +1165,10 @@ static bool canDecodeSmsWithPdulib(const String& pduHex, const DecodedPDU& check
   if (checked.dcs != 0x00 && checked.dcs != 0x08) return false;
 
   int oaPos = 2 + scaLen * 2 + 2;
+  // pdulib 的数字地址分支只处理 TON 0/1/2；其余 BCD 类型会返回长度 0，导致错位。
+  // SCA 与 OA 都使用同一库分支，必须同时检查；其 TON5 分支不属于本项目支持的数字地址。
+  if (smsAddressTon(hexByteAt(pduHex, 2)) > 2 ||
+      smsAddressTon(hexByteAt(pduHex, oaPos + 2)) > 2) return false;
   int oaBytes = (hexByteAt(pduHex, oaPos) + 1) / 2;
   int udlPos = oaPos + 4 + oaBytes * 2 + 4 + 14;  // OA、PID/DCS、SCTS
   int udPos = udlPos + 2;
@@ -1270,7 +1278,11 @@ bool handleModemUrc(const String& line) {
       if ((int)line.length() / 2 != 1 + scaBytes + smsExpectedTpduBytes) return false;
       DecodedPDU fallbackSms;
       // pdulib 不接收长度参数；必须先验证完整字段、TP-UDL 和 UDH，不能失败后才校验。
-      if (!decodeDeliverPDUFallback(line, fallbackSms) || fallbackSms.tpduBytes != smsExpectedTpduBytes) return false;
+      if (!decodeDeliverPDUFallback(line, fallbackSms) || fallbackSms.tpduBytes != smsExpectedTpduBytes) {
+        // 长度已与 +CMT 吻合却结构校验失败：打印线索，便于定位新的运营商格式。
+        Serial.println("⚠️ PDU长度匹配但结构校验失败，未认领: " + line);
+        return false;
+      }
       resetModemUrc();  // 归属已确认；在进入解码器/转发回调前消费等待状态。
       Serial.println("收到PDU数据: " + line);
       if (!fallbackSms.hasUserData) {

@@ -19,6 +19,10 @@ void recordOperationDiagnostic(const char* operation, const char* stage) {
 }
 void clearOperationDiagnostic() { ++pushDiagnosticClears; pushDiagnosticActive = false; }
 
+// Crypto is outside these transport tests; no signing secret or real endpoint is used.
+String hmacSha256Base64(const String&, const String&) { return "offline-signature"; }
+#include "push_config_actual.inc"
+
 // Only the clock is redirected here; the extracted production code is not rewritten.
 #define time pushHostTime
 #pragma GCC diagnostic push
@@ -30,11 +34,11 @@ void clearOperationDiagnostic() { ++pushDiagnosticClears; pushDiagnosticActive =
 // Interpose allocation, not EmailJob or its constructor/destructor. Unrelated host STL allocations
 // are not faulted. Tracking remains active through production delete, even after producer scope ends.
 void* operator new(std::size_t size) {
-  const bool job = pushJobs.active && size == sizeof(EmailJob);
+  const bool job = pushJobs.active && (size == sizeof(EmailJob) || size == sizeof(HttpPushJob));
   if (job && ++pushJobs.calls == pushJobs.failAt) { ++pushJobs.faultHits; throw std::bad_alloc(); }
   void* p = std::malloc(size ? size : 1);
   if (!p) throw std::bad_alloc();
-  if (job) pushJobs.remember(p);
+  if (job) pushJobs.remember(p, size);
   return p;
 }
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
@@ -81,19 +85,27 @@ void cleanupFixture() {
     for (void* p : emailQueue->items) delete static_cast<EmailJob*>(p);
     delete emailQueue; emailQueue = nullptr;
   }
+  if (httpPushQueue) {
+    for (void* p : httpPushQueue->items) delete static_cast<HttpPushJob*>(p);
+    delete httpPushQueue; httpPushQueue = nullptr;
+  }
   // Failures are asserted BEFORE this recovery, so a regressed worker cannot hide a leak.
-  for (void* p : pushJobs.pointers) if (p) delete static_cast<EmailJob*>(p);
+  for (size_t i = 0; i < 32; ++i) if (void* p = pushJobs.pointers[i]) {
+    if (pushJobs.sizes[i] == sizeof(HttpPushJob)) delete static_cast<HttpPushJob*>(p);
+    else delete static_cast<EmailJob*>(p);
+  }
 }
 void resetFixture() {
   cleanupFixture();
   emailTaskHandle = nullptr; smtpMutex = nullptr;
+  for (auto& handle : httpPushTaskHandles) handle = nullptr;
   pushJobs = {}; pushRtos = {}; pushHttp = {}; smtp = PushSmtp{};
   ssl_client.plain = false; ssl_client.stops = ssl_client.upgrades = 0;
   config = Config{}; configureA(); stats = Statistics{};
   savedPushStats.clear(); pushDiagnostics.clear(); pushDiagnosticActive = false; pushDiagnosticClears = 0;
   pushMillis = 0; pushEpoch = 1700000000; pushNtpCalls = pushYields = pushWdtChecks = pushWdtResets = 0;
   pushWdtStatus = ESP_OK; WiFi.state = WL_CONNECTED;
-  PushStringHeap::resetProbe(); pushEvents.clear();
+  PushStringHeap::resetProbe(); pushEvents.clear(); pushSerialLog.clear();
 }
 template<class F> void runCase(const std::string& name, F body) {
   currentCase = name; ++cases;
@@ -103,6 +115,7 @@ template<class F> void runCase(const std::string& name, F body) {
   catch (...) { check(false, "unexpected exception", __LINE__); }
   CHECK(pushJobs.live == 0);
   CHECK(emailQueue == nullptr || emailQueue->items.empty());
+  CHECK(httpPushQueue == nullptr || httpPushQueue->items.empty());
   CHECK(!pushRtos.mutex.held && !pushDiagnosticActive);
   CHECK(smtp.message.headers.values.empty() && smtp.message.text.value.empty());
   CHECK(pushTlsAlive.size() == 1 && pushTlsAlive.count(&ssl_client) == 1);
@@ -384,10 +397,11 @@ void testHttpLifetime() {
         CHECK(eventIndex("http.destroy") < eventIndex("tls.destroy"));
         const bool success = code >= 200 && code < 300;
         CHECK(stats.pushSuccess.load() == (success ? 1U : 0U) && stats.pushFailed.load() == (success ? 0U : 1U));
-        CHECK(pushHttp.stream.cursor == (success ? 256U : 0U));
-        if (tls) CHECK(pushHttp.tlsTimeout == 1 && pushHttp.tlsHandshake == 1);
+        CHECK(pushHttp.stream.cursor == (code > 0 ? 256U : 0U));
+        if (tls) CHECK(pushHttp.tlsTimeout == 10000 && pushHttp.tlsHandshake == 15);
         if (code) {
-          CHECK(pushHttp.timeout == HTTP_PUSH_TIMEOUT_MS && pushHttp.connectTimeout == HTTP_PUSH_TIMEOUT_MS);
+          CHECK(pushHttp.timeout == 10000 && pushHttp.connectTimeout == 5000);
+          CHECK(!pushHttp.reuse);
           CHECK(pushHttp.method == (tls ? "POST" : "GET") && pushHttp.contentType == (tls ? "application/json" : ""));
           if (tls) CHECK(pushHttp.body == "{\"test\":true}");
         }
@@ -402,10 +416,191 @@ void testHttpLifetime() {
       if (mode == "read-zero") { pushHttp.stream.response = "x"; pushHttp.stream.failRead = true; }
       pushWdtStatus = -1;
       CHECK(sendHttpRequest("https://offline.invalid", "GET", "", "") == 200);
-      CHECK(pushMillis == (mode == "idle" ? HTTP_PUSH_TIMEOUT_MS : 0));
+      CHECK(mode == "idle" ? (pushMillis > 0 && pushMillis <= 1000) : pushMillis == 0);
       CHECK(pushHttp.stream.cursor == 0 && pushHttp.lifetimeErrors == 0 && pushWdtResets == 0);
       CHECK(stats.pushSuccess.load() == 1 && stats.pushFailed.load() == 0);
       CHECK(eventIndex("http.destroy") < eventIndex("tls.destroy"));
+    });
+  }
+}
+
+void configureBark() {
+  auto& channel = config.pushChannels[0];
+  channel.enabled = true; channel.type = PUSH_TYPE_BARK;
+  channel.name = "Bark offline"; channel.url = "https://bark.invalid/offline-device-key";
+  channel.key2 = u8"家庭短信";
+}
+void drainHttpWorker() {
+  CHECK(httpPushTaskHandles[0] && pushRtos.task.entry == httpPushWorkerTask);
+  try { httpPushWorkerTask(nullptr); }
+  catch (const PushQueueDrained&) { return; }
+  throw std::runtime_error("HTTP worker unexpectedly returned");
+}
+bool produceHttp(const char* sender = "10690000000", const char* message = "body A") {
+  pushJobs.active = true;
+  const bool ok = enqueueHttpPush(config.pushChannels[0], sender, message, "2026-11-05 19:40:45");
+  pushJobs.active = false;
+  return ok;
+}
+void testBarkDelivery() {
+  runCase("Bark-public-producer-queues-and-preserves-configuration-and-text", [] {
+    configureBark();
+    config.pushChannels[0].url = " \thttps://bark.invalid/offline-device-key\r\n";
+    const std::string message = u8"验证码\"6362\"\n第二行\\结束";
+    sendSMSToServer("10690000000", message.c_str(), "2026-11-05 19:40:45");
+    CHECK(pushHttp.requests == 0 && httpPushQueue && httpPushQueue->items.size() == 1);
+    CHECK(config.pushChannels[0].url == " \thttps://bark.invalid/offline-device-key\r\n");
+    config.pushChannels[0].url = "https://bark.invalid/different-key";
+    config.pushChannels[0].key2 = "different-group"; config.pushChannels[0].enabled = false;
+    pushHttp.stream.response = "{\"code\":200,\"message\":\"success\",\"timestamp\":1793900000}";
+    pushHttp.contentLength = static_cast<int>(pushHttp.stream.response.size());
+    pushHttp.stream.idleConnected = true;
+    const auto start = pushMillis;
+    drainHttpWorker();
+    CHECK(pushHttp.url == "https://bark.invalid/offline-device-key" && pushHttp.method == "POST");
+    CHECK(pushHttp.contentType == "application/json");
+    CHECK(pushHttp.body == u8"{\"title\":\"10690000000\",\"body\":\"验证码\\\"6362\\\"\\n第二行\\\\结束\",\"group\":\"家庭短信\"}");
+    CHECK(pushHttp.requests == 1 && pushMillis - start == 10); // no wait after the complete Content-Length.
+    checkSaved(1, 0, 2);
+  });
+  for (const std::string stage : {"connect", "handshake", "response"}) {
+    runCase("Bark-network-slower-than-one-second-" + stage, [=] {
+      configureBark(); CHECK(produceHttp());
+      if (stage == "connect") pushHttp.connectDelay = 1800;
+      if (stage == "handshake") pushHttp.handshakeDelay = 2500;
+      if (stage == "response") pushHttp.headerDelay = 2500;
+      drainHttpWorker();
+      CHECK(pushHttp.requests == 1 && pushMillis >= 1800 && pushMillis < 10000);
+      checkSaved(1, 0, 1);
+    });
+  }
+  for (const int code : {400, 401, 404, 418, 429, 500, 503}) {
+    runCase("Bark-server-error-diagnostic-" + std::to_string(code), [=] {
+      configureBark(); CHECK(produceHttp()); pushHttp.code = code;
+      pushHttp.stream.response = "{\"code\":500,\"message\":\"push failed: BadDeviceToken offline-device-key private-message\"}";
+      drainHttpWorker();
+      CHECK(pushHttp.requests == 1 && pushSerialLog.find("BadDeviceToken") != std::string::npos);
+      CHECK(pushSerialLog.find("offline-device-key") == std::string::npos);
+      CHECK(pushSerialLog.find("private-message") == std::string::npos);
+      checkSaved(0, 1, 1);
+    });
+  }
+  for (const std::string stage : {"connect", "handshake", "response"}) {
+    const unsigned long budget = stage == "connect" ? 5000 : (stage == "handshake" ? 15000 : 10000);
+    for (const unsigned long offset : {0UL, 1UL}) {
+      runCase("HTTP-timeout-boundary-" + stage + "-" + std::to_string(offset), [=] {
+        configureBark(); CHECK(produceHttp());
+        if (stage == "connect") pushHttp.connectDelay = budget + offset;
+        if (stage == "handshake") pushHttp.handshakeDelay = budget + offset;
+        if (stage == "response") pushHttp.headerDelay = budget + offset;
+        drainHttpWorker();
+        CHECK(pushMillis == budget + 10 && pushHttp.requests == 1);
+        checkSaved(offset == 0 ? 1 : 0, offset == 0 ? 0 : 1, 1);
+      });
+    }
+  }
+  for (const int length : {0, 16, 256, 4096}) {
+    runCase("HTTP-error-content-length-" + std::to_string(length), [=] {
+      configureBark(); CHECK(produceHttp()); pushHttp.code = 500;
+      pushHttp.stream.response.assign(length, 'x'); pushHttp.contentLength = length;
+      pushHttp.stream.idleConnected = true;
+      drainHttpWorker();
+      CHECK(pushHttp.stream.cursor == min(static_cast<size_t>(length), size_t(256)) && pushMillis == 10);
+      checkSaved(0, 1, 1);
+    });
+  }
+  runCase("HTTP-unknown-errors-never-log-echoed-secret", [] {
+    configureBark(); CHECK(produceHttp()); pushHttp.code = 404;
+    pushHttp.stream.response = "/offline-device-key/ private-message";
+    drainHttpWorker();
+    CHECK(pushSerialLog.find("offline-device-key") == std::string::npos &&
+          pushSerialLog.find("private-message") == std::string::npos);
+    checkSaved(0, 1, 1);
+  });
+  for (const std::string stage : {"connect", "handshake", "response"}) {
+    runCase("Bark-network-timeout-no-automatic-duplicate-" + stage, [=] {
+      configureBark(); CHECK(produceHttp());
+      if (stage == "connect") pushHttp.connectDelay = 60000;
+      if (stage == "handshake") pushHttp.handshakeDelay = 60000;
+      if (stage == "response") pushHttp.headerDelay = 60000;
+      drainHttpWorker();
+      CHECK(pushHttp.requests == 1 && pushMillis > 1000 && pushMillis <= 20010);
+      CHECK(pushHttp.lifetimeErrors == 0); checkSaved(0, 1, 1);
+      pushHttp.connectDelay = pushHttp.handshakeDelay = pushHttp.headerDelay = 0;
+      CHECK(produceHttp()); drainHttpWorker(); checkSaved(1, 1, 2);
+    });
+  }
+  runCase("Bark-empty-group-is-omitted", [] {
+    configureBark(); config.pushChannels[0].key2 = "";
+    CHECK(produceHttp()); drainHttpWorker();
+    CHECK(pushHttp.body == "{\"title\":\"10690000000\",\"body\":\"body A\"}");
+    checkSaved(1, 0, 1);
+  });
+  for (const std::string mode : {"reserve", "concat", "short-concat"}) {
+    for (size_t field = 1; field <= 8; ++field) {
+      runCase("HTTP-snapshot-" + mode + "-" + std::to_string(field), [=] {
+        configureBark(); config.pushChannels[0].key1 = "unused-key"; config.pushChannels[0].customBody = "unused-body";
+        CHECK(ensureHttpPushWorker()); PushStringHeap::resetProbe();
+        if (mode == "reserve") PushStringHeap::failAt = field;
+        if (mode == "concat") PushStringHeap::failConcat = field;
+        if (mode == "short-concat") PushStringHeap::shortConcat = field;
+        const bool ok = produceHttp();
+        CHECK(!ok && pushJobs.live == 0 && httpPushQueue->items.empty());
+        CHECK(stats.pushFailed.load() == 1 && pushHttp.requests == 0);
+        PushStringHeap::resetProbe();
+        if (ok) drainHttpWorker(); // permit cleanup when run against a regressed implementation.
+        CHECK(produceHttp()); drainHttpWorker();
+        CHECK(pushHttp.requests == 1 && stats.pushSuccess.load() == 1 && stats.pushFailed.load() == 1);
+      });
+    }
+  }
+  runCase("HTTP-full-queue-rejects-only-new-job", [] {
+    configureBark();
+    for (size_t i = 0; i < HTTP_PUSH_QUEUE_LENGTH; ++i) CHECK(produceHttp());
+    CHECK(!produceHttp() && pushJobs.live == HTTP_PUSH_QUEUE_LENGTH);
+    drainHttpWorker(); CHECK(pushHttp.requests == HTTP_PUSH_QUEUE_LENGTH);
+    checkSaved(HTTP_PUSH_QUEUE_LENGTH, 1, HTTP_PUSH_QUEUE_LENGTH);
+  });
+  runCase("HTTP-job-allocation-failure-then-recovers", [] {
+    configureBark(); CHECK(ensureHttpPushWorker()); pushJobs.failAt = 1;
+    CHECK(!produceHttp() && pushJobs.faultHits == 1 && pushJobs.live == 0);
+    pushJobs.failAt = 0; CHECK(produceHttp()); drainHttpWorker(); checkSaved(1, 1, 1);
+  });
+  for (const bool queueFailure : {true, false}) {
+    runCase(queueFailure ? "HTTP-queue-create-recovery" : "HTTP-worker-create-recovery", [=] {
+      configureBark(); pushRtos.failQueue = queueFailure; pushRtos.failTask = !queueFailure;
+      CHECK(!produceHttp() && pushJobs.calls == 0 && pushHttp.requests == 0);
+      pushRtos.failQueue = pushRtos.failTask = false;
+      CHECK(produceHttp()); drainHttpWorker(); checkSaved(1, 1, 1);
+    });
+  }
+  for (const bool nullSender : {false, true}) {
+    runCase(nullSender ? "HTTP-null-sender" : "HTTP-null-body", [=] {
+      configureBark();
+      CHECK(!produceHttp(nullSender ? nullptr : "10086", nullSender ? "text" : nullptr));
+      CHECK(pushJobs.live == 0 && httpPushQueue->items.empty() && pushHttp.requests == 0);
+      checkSaved(0, 1, 0);
+    });
+  }
+  runCase("HTTP-empty-url-after-trim-is-rejected", [] {
+    configureBark(); config.pushChannels[0].url = " \t\r\n";
+    CHECK(!produceHttp() && pushJobs.live == 0 && httpPushQueue->items.empty());
+    CHECK(pushHttp.requests == 0); checkSaved(0, 1, 0);
+  });
+  for (const PushType type : {PUSH_TYPE_POST_JSON, PUSH_TYPE_GET, PUSH_TYPE_CUSTOM,
+                              PUSH_TYPE_TELEGRAM, PUSH_TYPE_WECOM, PUSH_TYPE_DINGTALK}) {
+    runCase("HTTP-existing-channel-compatible-" + std::to_string(type), [=] {
+      configureBark(); auto& channel = config.pushChannels[0];
+      channel.type = type; channel.key1 = "12345"; channel.customBody = "{\"text\":\"{message}\"}";
+      CHECK(produceHttp("10086", "text")); drainHttpWorker();
+      CHECK(pushHttp.requests == 1 && pushHttp.method == (type == PUSH_TYPE_GET ? "GET" : "POST"));
+      if (type == PUSH_TYPE_POST_JSON) CHECK(pushHttp.body == "{\"sender\":\"10086\",\"message\":\"text\",\"timestamp\":\"2026-11-05 19:40:45\"}");
+      if (type == PUSH_TYPE_GET) CHECK(pushHttp.url.find("?sender=10086&message=text&timestamp=") != std::string::npos);
+      if (type == PUSH_TYPE_CUSTOM) CHECK(pushHttp.body == "{\"text\":\"text\"}");
+      if (type == PUSH_TYPE_TELEGRAM) CHECK(pushHttp.body.find("\"chat_id\":\"12345\"") != std::string::npos);
+      if (type == PUSH_TYPE_WECOM || type == PUSH_TYPE_DINGTALK) CHECK(pushHttp.body.find("\"msgtype\":\"text\"") != std::string::npos);
+      if (type == PUSH_TYPE_DINGTALK) CHECK(pushHttp.url.find("&sign=offline-signature") != std::string::npos);
+      checkSaved(1, 0, 1);
     });
   }
 }
@@ -418,6 +613,7 @@ int main() {
   testSenderExits();
   testWorkerStringFailures();
   testHttpLifetime();
+  testBarkDelivery();
   std::cout << "Push host: " << cases << " cases, " << assertions << " assertions, " << failures << " failures\n";
   return failures ? 1 : 0;
 }
