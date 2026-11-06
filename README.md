@@ -170,6 +170,11 @@ Arduino IDE 建议：
 
 > ⚠️ **升级前备份**：切换分区布局或烧录整片 merged 镜像可能覆盖 NVS 配置和 SPIFFS 短信/来电历史，请先备份并核对现有分区；默认不要 `erase-all`。仓库 `code/build/` 是旧产物，不能当作本轮新固件，建议在 Arduino IDE 中重新编译后上传。本轮验证未烧录、擦除或修改设备分区；纯编译步骤见 [编译验证记录](docs/BUILD_VALIDATION.md)，离线测试入口与边界见 [测试说明](tests/README.md)。
 
+> 📦 **产物与刷写细节**：四个可烧文件各自烧到哪个偏移、`boot_app0.bin` 从哪来、Windows 上
+> Arduino IDE 的逐项设置与常见报错处置（端口占用、No serial data received、两个 COM 口、
+> 分区表选错的后遗症等），见 [编译产物与刷写](docs/BUILD_AND_FLASH.md)。
+> 想一条命令产出全部产物：`ARDUINO_CLI=/path/to/arduino-cli scripts/build-firmware.sh`。
+
 ---
 
 ## 首次启动与访问方式
