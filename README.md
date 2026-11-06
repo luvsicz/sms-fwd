@@ -52,6 +52,7 @@
 - 🔄 WiFi 连接失败时自动进入 AP 模式，便于重新配置
 - 🐶 启用 30 秒看门狗，降低异常卡死风险
 - 🧹 支持在 Web 页面中重置统计数据、清空短信记录、清空来电记录
+- ⬆️ 支持在线升级固件：网页上传 `.bin`、从 URL 拉取、MQTT 远程触发（需双槽分区表，见 [OTA 说明](docs/OTA.md)）
 
 ---
 
@@ -153,10 +154,14 @@ https://espressif.github.io/arduino-esp32/package_esp32_index.json
 ### 2. 选择开发板与分区
 Arduino IDE 建议：
 1. 开发板选择：**MakerGO ESP32 C3 SuperMini**（或兼容 ESP32-C3 开发板）
-2. Partition Scheme 选择：**Huge App**
+2. Partition Scheme 选择：**Custom**（使用仓库内的 `code/partitions.csv`）
 3. 端口选择对应的 COM 口
 
-> ⚠️ **容量与分区**：最终 `precommit` 测量的 app 镜像为 `1,531,456` 字节，超过本机 `default.csv` 的单 app 槽 `0x140000`（`1,310,720` 字节）。实板需至少 **4MB 物理 Flash**，修改菜单不能扩容；本次 Huge App 的 app 槽为 `0x300000`（3MiB），只有一个 app 分区，**无双槽 OTA**。环境、布局和容量测量见 [编译验证记录](docs/BUILD_VALIDATION.md)。
+> ⚠️ **分区表与 OTA**：`code/partitions.csv` 是 **4MB Flash 双 app 槽**布局（app0/app1 各 1728KB，SPIFFS 512KB），
+> 只有双槽才能在线升级。旧的 `Huge App` 方案是单 app 槽（3MB），编译得下但**没有第二个槽，无法 OTA**。
+> 当前 `precommit` 测量的 app 镜像为 `1,548,032` 字节，双槽单槽容量 `1,769,472` 字节（余量 ~216KB）。
+> 从单槽切到双槽必须用 USB 刷一次；之后即可无线升级，详见 [OTA 说明](docs/OTA.md)。
+> 环境、布局和容量测量见 [编译验证记录](docs/BUILD_VALIDATION.md)。
 
 ### 3. 上传固件
 1. 使用 USB 连接 ESP32-C3
@@ -218,6 +223,9 @@ Arduino IDE 建议：
 | `/clearcallhistory` | POST | 清空来电历史，并将来电统计归零 |
 | `/filter` | POST | 保存号码过滤 |
 | `/contentfilter` | POST | 保存内容过滤 |
+| `/otainfo` | GET | 固件版本、运行分区、槽容量、是否支持 OTA |
+| `/update` | POST | 网页上传固件（`application/octet-stream` 原始 bin，流式写 Flash） |
+| `/updateurl` | POST | 从 URL 拉取固件并升级，body `{"url":"http://..."}` |
 
 ### 历史与统计管理说明
 - **重置统计数据**：可在“概览”页执行，当前会清零：收信数、发信数、来电数、推送成功数、推送失败数、启动次数。
@@ -608,7 +616,10 @@ code/
 ├── push_service.h       # 推送服务声明
 ├── push_service.ino     # 邮件 / Webhook / Telegram / 钉钉等
 ├── mqtt_handler.h       # MQTT 处理声明
-└── mqtt_handler.ino     # MQTT 上报、控制、HA 自动发现
+├── mqtt_handler.ino     # MQTT 上报、控制、HA 自动发现
+├── ota_handler.h        # 在线升级声明
+├── ota_handler.ino      # 网页/URL/MQTT 固件升级、试用确认与回滚
+└── partitions.csv       # 4MB Flash 双 app 槽分区表（OTA 必需）
 
 homeassistant/
 ├── README.md            # Home Assistant 集成说明

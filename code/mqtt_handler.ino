@@ -12,6 +12,7 @@
 #include "web_handlers.h"
 #include "modem_handler.h"
 #include "json_input.h"
+#include "ota_handler.h"
 #include <utility>
 
 static bool mqttBufferReady = false;
@@ -470,7 +471,7 @@ void publishHaDiscoveryConfig() {
   deviceInfo += "\"name\":\"短信转发器 " + jsonEscape(mqttDeviceId) + "\",";
   deviceInfo += "\"manufacturer\":\"DIY\",";
   deviceInfo += "\"model\":\"ESP32-C3 SMS Forwarder\",";
-  deviceInfo += "\"sw_version\":\"1.0\"";
+  deviceInfo += "\"sw_version\":\"" FW_VERSION "\"";
   deviceInfo += "}";
 
   publishHaStatusSensor(haPrefix, nodeId, "_status", "状态", "{{ value_json.status }}", "mdi:message-text", deviceInfo);
@@ -790,6 +791,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       mqttPendingRestart = true;
     } else if (action == "status") {
       publishMqttStatus("online");
+    } else if (action == "ota") {
+      String url;
+      if (!input.getString("url", url)) {
+        rejectCommand("ota_url_must_be_string");
+        return;
+      }
+      url.trim();
+      if (!otaQueueUrl(url)) {
+        rejectCommand("ota_url_invalid_or_single_slot");
+        return;
+      }
+      Serial.println("MQTT OTA 升级任务已排队，将在 loop 中下载并写入");
+      publishDeviceLog("info", "ota", "MQTT OTA 升级任务已排队");
     } else {
       Serial.print("未知命令: "); Serial.println(action);
       publishErrorLog("mqtt", "mqttCallback", "未知控制命令", "unknown_action");

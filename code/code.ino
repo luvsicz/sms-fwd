@@ -46,6 +46,7 @@
 #include "modem_handler.h"
 #include "push_service.h"
 #include "mqtt_handler.h"
+#include "ota_handler.h"
 
 // ========== 全局变量定义 ==========
 Config config;
@@ -126,6 +127,9 @@ void setup() {
   // 加载配置
   loadConfig();
   configValid = isConfigValid();
+  // OTA 试用确认/回滚必须尽早执行：坏固件要能在联网前被换回旧槽。
+  otaInit();
+
   Serial.printf("启动计数: %lu, 上次复位原因: %s (0x%02X)\n", (unsigned long)stats.bootCount.load(), lastResetReasonText.c_str(), (unsigned int)lastResetReasonCode);
   if (lastResetPowerSuspected) {
     Serial.println("提示: 上次复位属于供电/上电相关，优先排查电源、电缆和瞬时压降");
@@ -187,6 +191,9 @@ void setup() {
   }
   
   // 启动 HTTP 服务器
+  // OTA 需要按 Content-Type 区分 raw / multipart 请求体，单独登记该头。
+  static const char* otaHeaderKeys[] = {"Content-Type"};
+  server.collectHeaders(otaHeaderKeys, 1);
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/tools", handleToolsPage);
@@ -203,6 +210,9 @@ void setup() {
   server.on("/cleanhistory", HTTP_POST, handleCleanupHistory); // 清洗旧历史损坏记录
   server.on("/filter", HTTP_POST, handleFilterSave);   // 号码过滤保存
   server.on("/contentfilter", HTTP_POST, handleContentFilterSave);  // 内容过滤保存
+  server.on("/otainfo", handleOtaInfo);                 // 固件版本/分区信息
+  server.on("/update", HTTP_POST, handleOtaUpload, handleOtaUploadChunk);  // 网页上传固件
+  server.on("/updateurl", HTTP_POST, handleOtaUrl);     // 从 URL 拉取固件
   server.begin();
   Serial.println("HTTP服务器已启动");
   
@@ -426,6 +436,9 @@ void processTimerTask() {
 void loop() {
   // 处理 HTTP 请求
   server.handleClient();
+
+  // OTA：试用固件确认、延迟重启、待执行的 URL 升级
+  otaLoop();
   
   // 如果配置无效，每 30 秒打印一次提示
   // 注释 (M1): 无符号整型差值 (millis() - lastPrintTime) 在 32 位溢出回绕时依然正确

@@ -1,0 +1,16 @@
+# 短信转发器 4MB Flash 双 app 槽分区表（支持 OTA）
+# 用法：Arduino IDE / arduino-cli 选择 Partition Scheme = Custom（本文件即 code/partitions.csv）
+#
+# 名称      类型   子类型     偏移       大小        说明
+# nvs       data   nvs       0x9000     0x5000      配置/统计（与旧 huge_app 布局一致，升级不丢）
+# otadata   data   ota       0xe000     0x2000      记录当前启动槽
+# app0      app    ota_0     0x10000    0x1B0000    1,769,472 字节（当前固件约 1.53MB，余量 ~238KB）
+# app1      app    ota_1     0x1C0000   0x1B0000    OTA 目标槽
+# spiffs    data   spiffs    0x370000   0x80000     短信/来电历史（512KB）
+# coredump  data   coredump  0x3F0000   0x10000
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x1B0000,
+app1,     app,  ota_1,    0x1C0000, 0x1B0000,
+spiffs,   data, spiffs,   0x370000, 0x80000,
+coredump, data, coredump, 0x3F0000, 0x10000,

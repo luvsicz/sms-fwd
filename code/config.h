@@ -15,6 +15,10 @@
 // mDNS 主机名（访问地址为 http://sms.local）
 #define MDNS_HOSTNAME "sms"
 
+// 固件版本（OTA 页面、/otainfo、HA 设备信息共用；升级时请同步修改）
+#define FW_VERSION "1.1.0"
+
+
 // 推送通道类型
 enum PushType {
   PUSH_TYPE_NONE = 0,      // 未启用

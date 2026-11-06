@@ -261,6 +261,22 @@ const char* htmlPage = R"rawliteral(<!DOCTYPE html><html><head><meta charset="UT
 
 
   <div class="card">
+    <div class="card-t">固件升级 <span class="badge b-wait" id="otaVer">-</span></div>
+    <div id="otaInfo" style="font-size:0.85em;color:var(--text-light);margin-bottom:10px">正在读取分区信息...</div>
+    <div class="fg"><label>固件文件 (app.bin)</label><input id="otaFile" type="file" accept=".bin,application/octet-stream"></div>
+    <button class="btn" onclick="doOta()">上传并升级</button>
+    <div id="otaProg" style="display:none;margin-top:10px">
+      <div style="height:8px;background:#eef2f7;border-radius:99px;overflow:hidden">
+        <div id="otaBar" style="height:100%;width:0;background:var(--primary);transition:width .2s"></div>
+      </div>
+      <div id="otaPct" style="font-size:0.8em;color:#64748b;margin-top:6px">0%</div>
+    </div>
+    <div style="font-size:0.78em;color:var(--text-light);margin-top:8px;line-height:1.6">
+      写入另一个 app 槽后自动重启；写入失败会留在当前固件。升级过程请勿断电。
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-t" style="color:var(--danger)">危险操作</div>
     <button class="btn btn-d" onclick="if(confirm('确定重启?'))act('reboot')">重启设备 (Reboot)</button>
   </div>
@@ -771,6 +787,49 @@ function act(t){
   }
 }
 
+function otaInfo(){
+  fetch('/otainfo').then(checkedJson).then(d=>{
+    $('otaVer').textContent='v'+d.version;
+    $('otaVer').className='badge '+(d.dualSlot?'b-ok':'b-warn');
+    var text='运行分区：'+d.running+'（槽 '+Math.round(d.slotBytes/1024)+'K，已用 '+Math.round(d.sketchBytes/1024)+'K）';
+    text+='；'+(d.dualSlot?'支持在线升级':'单槽分区，需先用 USB 刷入双槽分区表');
+    if(d.lastError)text+='；上次错误：'+d.lastError;
+    $('otaInfo').textContent=text;
+  }).catch(e=>{$('otaInfo').textContent='分区信息读取失败：'+e.message});
+}
+
+function doOta(){
+  var f=$('otaFile').files[0];
+  if(!f)return toast('请先选择 .bin 固件文件');
+  if(!/\.bin$/i.test(f.name))return toast('仅支持 .bin 固件');
+  if(!confirm('确定升级到 '+f.name+'（'+(f.size/1048576).toFixed(2)+' MB）？\n升级期间不要断电，完成后设备会自动重启。'))return;
+  var bar=$('otaBar'),pct=$('otaPct');
+  $('otaProg').style.display='block';bar.style.width='0%';pct.textContent='准备上传...';
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/update');
+  xhr.setRequestHeader('Content-Type','application/octet-stream');
+  xhr.upload.onprogress=function(e){
+    if(!e.lengthComputable)return;
+    var p=Math.round(e.loaded*100/e.total);
+    bar.style.width=p+'%';
+    pct.textContent=p<100?('已上传 '+p+'%'):'上传完成，写入并校验中...';
+  };
+  xhr.onload=function(){
+    var d={};
+    try{d=JSON.parse(xhr.responseText)}catch(e){}
+    if(xhr.status===200&&d.success){
+      bar.style.width='100%';pct.textContent='升级成功，设备正在重启...';
+      toast(d.message||'升级成功');
+      setTimeout(()=>location.reload(),12000);
+    }else{
+      pct.textContent='升级失败：'+(d.message||('HTTP '+xhr.status));
+      toast(d.message||'升级失败');
+    }
+  };
+  xhr.onerror=function(){pct.textContent='上传中断，请检查网络后重试';toast('上传中断')};
+  xhr.send(f);
+}
+
 function clearHistory(type){
   var isCall=type==='call';
   var targetText=isCall?'来电记录':'短信记录';
@@ -1041,6 +1100,7 @@ function saveAll(e){
 
 // 启动加载
 autoLoad();
+otaInfo();
 </script></body></html>)rawliteral";
 
 // 旧兼容

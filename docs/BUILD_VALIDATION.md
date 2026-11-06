@@ -87,3 +87,19 @@ $app | Select-Object FullName, Length
 检查退出码为 0、应用镜像存在且长度不超过 app 槽；最终 `precommit` 测量 snapshot 的长度为 `1,531,456` 字节，源码/依赖/初始 WiFi 改变后应重新测量。新临时目录同样包含秘密，不公开产物。`tests/` 和仓库 Markdown 位于 sketch 外，不会编入/烧入固件。
 
 离线入口与验证边界见 [tests/README.md](../tests/README.md)。2026-11-04 十个默认回归入口已在相同 `precommit` 源码快照上全部退出 0，见上述证据目录的 `regressions.json`；逐项结果见 [TODO.md](../TODO.md)。代码/离线验收 14/14，硬件验收仍为 0/14。
+
+## 双槽 OTA 分区（2026-11-06）
+
+本轮为**纯编译**验证，未烧录、未擦除、未改动任何设备分区；不代表实板 OTA 成功。
+
+- 环境：Linux 主机，Arduino CLI **1.5.2**；ESP32 Arduino Core **3.3.10**；pdulib 0.5.11、PubSubClient 2.8、ReadyMail 0.4.2。
+- FQBN：`esp32:esp32:esp32c3:PartitionScheme=custom,FlashMode=dio,FlashFreq=80,FlashSize=4M`，
+  编译参数 `--clean --warnings all --jobs 4`，退出码 **0**。
+- 分区表来自 sketch 内的 `code/partitions.csv`（平台 prebuild hook 会优先复制它）：
+  app0 `0x10000`/`0x1B0000`、app1 `0x1C0000`/`0x1B0000`、spiffs `0x370000`/`0x80000`、coredump `0x3F0000`/`0x10000`。
+  `gen_esp32part.py` 校验通过，双 app 槽 SubType 分别为 `ota_0`/`ota_1`。
+- 结果：程序 **1,547,881** 字节 / 上限 16,777,216（菜单值，实际受 app 槽限制）；静态 RAM **56,532** 字节；
+  `code.ino.bin` **1,548,032** 字节，占单槽 `1,769,472` 字节的 87.5%，余量 **221,440** 字节。
+- 新增 `ota_handler.h/.ino` 与 `partitions.csv`；`code.ino` 注册 `/otainfo`、`/update`、`/updateurl` 并登记 `Content-Type` 头。
+- 本模块编译无告警；构建仍有既有 Core/format 告警。**未运行** `tests/` 十项回归（本机无 PowerShell 7/浏览器），
+  也未做真实 OTA 往返、断电中断与回滚实测，硬件验收仍为 0。
