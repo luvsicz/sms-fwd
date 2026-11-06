@@ -16,7 +16,8 @@
 #define MDNS_HOSTNAME "sms"
 
 // 固件版本（OTA 页面、/otainfo、HA 设备信息共用；升级时请同步修改）
-#define FW_VERSION "1.1.0"
+// 1.2.0 = 上游 2026-11-05 的电信短信 TON 修复 + Bark/HTTP 超时预算，叠加本仓库的双槽 OTA 能力
+#define FW_VERSION "1.2.0"
 
 
 // 推送通道类型
