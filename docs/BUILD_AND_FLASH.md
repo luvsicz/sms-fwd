@@ -64,15 +64,14 @@ arduino-cli compile \
 | `code.ino.bootloader.bin` | 18,672 | `0x0` | 二级引导 |
 | `code.ino.partitions.bin` | 3,072 | `0x8000` | 双槽分区表 |
 | `boot_app0.bin` | 8,192 | `0xe000` | 把 otadata 重置为“从 app0 启动”，**不在 output-dir** |
-| `code.ino.bin` | **1,548,032** | `0x10000` | 应用镜像，单槽上限 1,769,472（余量 221,440） |
+| `code.ino.bin` | **1,549,040** | `0x10000` | 应用镜像，单槽上限 1,769,472（余量 220,432） |
 | `code.ino.merged.bin` | 4,194,304 | — | **禁止烧**，整片覆盖 NVS + SPIFFS |
 | `code.ino.elf` / `.map` | — | — | 只用于调试与体积分析 |
 
-- 编译日志里的 `Sketch uses 1547881 bytes` 和 bin 的 `1548032` 是**两个口径**（bin 含对齐/校验尾部）。
+- 编译日志里的 `Sketch uses 1548883 bytes` 和 bin 的 `1549040` 是**两个口径**（bin 含对齐/校验尾部）。
   判断装不装得下要看 **bin 长度 vs 1,769,472**，别看 `Sketch uses`。
-- 本轮 SHA256（前 16 位，可用于比对产物是否同一份）：
-  `code.ino.bin` = `41ed6b750282021b`，`bootloader` = `aea44226a71db48d`，
-  `partitions` = `295240ef93436f57`，`boot_app0` = `f94c5d786a7a8fab`。
+- 本轮（固件 1.2.0）SHA256 前 16 位：`code.ino.bin` = `711d0dbc97b8d244`，
+  `bootloader` = `aea44226a71db48d`，`partitions` = `295240ef93436f57`，`boot_app0` = `f94c5d786a7a8fab`。
 
 ## 4. Windows + Arduino IDE 刷写（逐项）
 

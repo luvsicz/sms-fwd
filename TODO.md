@@ -1,6 +1,19 @@
-# 2026-11-05 Bark / 电信补修与硬件联调 TODO
+# 2026-11-06 双槽 OTA 重新落地 / 2026-11-05 Bark / 电信补修与硬件联调 TODO
 
-## 2026-11-05 用户反馈补修（本次最新记录）
+## 2026-11-06 双槽 OTA 在 2026-11-05 基线上重新落地（最新记录）
+
+远程 `main` 被 force-push 成 `e0e8a90`（电信短信 TON 修复 + Bark/HTTP 超时预算），原 OTA 提交与文档提交不在其上。
+本地先备份为分支 `hermes/ota-impl-b6fe8f7`、`hermes/docs-6fd2698`，再 `reset --hard origin/main` 强制对齐，
+然后 cherry-pick 两个提交（只有 `README.md` / `docs/BUILD_VALIDATION.md` 自动合并，其余无冲突）。
+
+- [x] 固件版本升到 **1.2.0**（`code/config.h`），标识“上游 11-05 修复 + 双槽 OTA”
+- [x] 编译：`code.ino.bin` **1,549,040** 字节，单槽 1,769,472，余量 **220,432**；静态 RAM 56,532
+- [x] 实板（.25，USB 经 PVE PCI 直通）：USB 刷入双槽 → 真实 OTA 往返（`app0 → app1`，`otherSlotValid:true`）
+- [x] 换槽后 `/history` 503 的坑已定位并修复：`erase-region 0x370000 0x80000` 后自动格式化（详见 `docs/OTA.md` §3.4）
+- [x] 文档：新增 `docs/BUILD_AND_FLASH.md`、`scripts/build-firmware.sh`；`docs/OTA.md` 补实测记录
+- [ ] 未做：断电/断网中断上传、`trial/boots` 自动回滚实测；`tests/` 十项回归未在本机运行（无 PowerShell 7/浏览器）
+
+## 2026-11-05 用户反馈补修（历史记录）
 
 范围限于“电信短信不解析 / 已配置 Bark 但手机未收到”反馈，不继续扩张全面审阅。用户已拔掉设备；本次未连接串口、未刷机、未擦除、未读取设备导出页面或真实推送配置、未发送真实网络通知。以下代码/离线结论不等于手机实测已送达。
 

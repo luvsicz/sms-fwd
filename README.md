@@ -159,7 +159,7 @@ Arduino IDE 建议：
 
 > ⚠️ **分区表与 OTA**：`code/partitions.csv` 是 **4MB Flash 双 app 槽**布局（app0/app1 各 1728KB，SPIFFS 512KB），
 > 只有双槽才能在线升级。旧的 `Huge App` 方案是单 app 槽（3MB），编译得下但**没有第二个槽，无法 OTA**。
-> 当前 `precommit` 测量的 app 镜像为 `1,548,032` 字节，双槽单槽容量 `1,769,472` 字节（余量 ~216KB）。
+> 当前（固件 1.2.0）app 镜像为 `1,549,040` 字节，双槽单槽容量 `1,769,472` 字节（余量 **220,432** 字节）。
 > 从单槽切到双槽必须用 USB 刷一次；之后即可无线升级，详见 [OTA 说明](docs/OTA.md)。
 > 环境、布局和容量测量见 [编译验证记录](docs/BUILD_VALIDATION.md)。
 

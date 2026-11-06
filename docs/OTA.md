@@ -24,11 +24,11 @@
 | spiffs | `0x370000` | 512KB | 短信/来电历史（原 896KB） |
 | coredump | `0x3F0000` | 64KB | 崩溃转储 |
 
-容量实测（arduino-cli 1.5.2 + ESP32 Core 3.3.10，2026-11-06）：
+容量实测（arduino-cli 1.5.2 + ESP32 Core 3.3.10，2026-11-06，固件 1.2.0）：
 
-- app 镜像 `code.ino.bin` = **1,548,032** 字节
-- 单槽容量 **1,769,472** 字节，余量 **221,632** 字节（已用 87.5%）
-- 也就是说固件还能再长 ~210KB；超过就要么砍功能，要么换 8MB Flash 的板子
+- app 镜像 `code.ino.bin` = **1,549,040** 字节
+- 单槽容量 **1,769,472** 字节，余量 **220,432** 字节（已用 87.5%）
+- 也就是说固件还能再长 ~215KB；超过就要么砍功能，要么换 8MB Flash 的板子
 
 > SPIFFS 从 896KB 缩到 512KB。历史文件上限仍是 128KB + 30KB，加修剪临时文件约 300KB，够用但不再宽裕。
 
@@ -72,6 +72,22 @@ python -m esptool --chip esp32c3 -p /dev/ttyACM0 -b 460800 \
   SPIFFS 偏移从 `0x310000` 移到 `0x370000`，首次启动会重新格式化，**短信/来电历史会清空**，
   需要的话先导出。
 
+### 3.4 刷完 `/history` 一直 503？擦一下 spiffs 区
+
+新布局的 spiffs 区（`0x370000`）正好落在**旧 spiffs 区（`0x310000` 起 896KB）的中段**，那块是旧文件数据、
+不是 SPIFFS 超级块。`SPIFFS.begin(true)` 有时没能干净格式化，表现为 `/history` 一直返回
+`{"success":false,"message":"历史读取失败，请稍后重试"}`，`/sms.txt` 404。
+
+判据（不用猜）：读 `0x370000` 起 512KB，SPIFFS 魔数 `0x20140501` 出现 **0** 次。
+
+```bash
+# 会清空短信/来电历史，先导 /history 再擦
+esptool --chip esp32c3 -p /dev/ttyACM0 erase-region 0x370000 0x80000
+# Windows: esptool.exe --chip esp32c3 -p COM5 erase-region 0x370000 0x80000
+```
+
+擦完重启，固件自动重新格式化，`/history` 恢复 200 且返回 `{"smsHistory":[],"callHistory":[]}`。
+
 ## 4. 之后怎么升级
 
 ### 4.1 网页（最常用）
@@ -111,9 +127,9 @@ curl -u admin:你的密码 http://sms.local/otainfo
 ```
 
 ```json
-{"success":true,"version":"1.1.0","running":"app0","slotBytes":1769472,
- "dualSlot":true,"otherSlotValid":true,"sketchBytes":1548032,
- "freeSketchBytes":1769472,"freeHeap":122712,"lastError":""}
+{"success":true,"version":"1.2.0","running":"app1","slotBytes":1769472,
+ "dualSlot":true,"otherSlotValid":true,"sketchBytes":1549040,
+ "freeSketchBytes":1769472,"freeHeap":120696,"lastError":""}
 ```
 
 `dualSlot:false` 说明还是单槽分区，需要先做第 3 步。
@@ -146,12 +162,23 @@ curl -u admin:你的密码 http://sms.local/otainfo
 
 ## 7. 验证记录
 
-- 2026-11-06：arduino-cli 1.5.2 + ESP32 Core 3.3.10 + ReadyMail 0.4.2 / pdulib 0.5.11 /
-  PubSubClient 2.8，FQBN `esp32:esp32:esp32c3:PartitionScheme=custom,FlashMode=dio,FlashFreq=80,FlashSize=4M`
-  编译通过（`--clean --warnings all`），无本模块告警；镜像 1,548,032 字节；
-  分区表经 `gen_esp32part.py` 校验为 app0/app1 双槽。
-- **未做**：实板烧录、真实 OTA 往返、断电/断网中断测试、回滚实测。
-  首次上线前建议按第 8 节做一次演练。
+**编译（2026-11-06，固件 1.2.0 = 上游电信/Bark 修复 + 双槽 OTA）**
+
+- arduino-cli 1.5.2 + ESP32 Core 3.3.10 + ReadyMail 0.4.2 / pdulib 0.5.11 / PubSubClient 2.8；
+  FQBN `esp32:esp32:esp32c3:PartitionScheme=custom,FlashMode=dio,FlashFreq=80,FlashSize=4M`，退出码 0；
+  程序 1,548,883 字节、`code.ino.bin` **1,549,040** 字节、静态 RAM 56,532 字节；
+  分区表 `gen_esp32part.py` 校验为 app0/app1 双槽。
+
+**实板（2026-11-06，同一台 .25 设备，USB 经 PVE PCI 直通到烧录机）**
+
+- USB 刷入双槽：回读 `0x8000` 确认 `app0 1728KB / app1 1728KB / spiffs 512KB@0x370000`；
+  刷前整片 4MB 已备份（回滚用）。
+- 真实 OTA 往返：`POST /update`（`Content-Type: application/octet-stream`，1.5MB，约 16 秒）
+  → `{"success":true}` → 重启后 `/otainfo` 报 `running:"app1", otherSlotValid:true, dualSlot:true`。
+- 配置保留：`/stats` 的 `calls/pushOk/boots` 沿用旧计数；MQTT discovery 主题
+  `homeassistant/sensor/sms_forwarder_7af874/...` 的 `sw_version` 随固件更新。
+
+**未做**：断电/断网中断上传、`trial/boots` 自动回滚（第 5 节）的实测。要验收这两条请按第 8 节演练。
 
 ## 8. 首次上线建议演练
 
